@@ -1,0 +1,2 @@
+"""Rotator control adapters."""
+

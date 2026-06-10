@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pi-Sat Controller</title>
+    <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
+    <link rel="stylesheet" href="/style.css?v=20260520-cat24">
+  </head>
+  <body>
+    <main class="container-fluid py-3 app-shell">
+      <section class="page-view" id="home-page" data-page-view="home">
+        <header class="card app-header mb-3">
+          <div class="card-body">
+            <div class="row align-items-center g-3">
+              <div class="col-12 col-lg-4">
+                <div class="brand-lockup">
+                  <img class="brand-satellite" src="/assets/pi-sat-satellite.png" alt="" aria-hidden="true">
+                  <div>
+                    <h1 class="h3 mb-0">Pi-Sat Controller</h1>
+                    <p id="station" class="text-body-secondary mb-0">Station loading</p>
+                  </div>
+                </div>
+              </div>
+              <div class="col-12 col-lg-4">
+                <nav class="nav nav-pills justify-content-lg-center gap-2" aria-label="Primary navigation">
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="home">Home</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="satellites">Satellites</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="monitor">Monitor</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="map">Map</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="settings">Settings</button>
+                </nav>
+              </div>
+              <div class="col-12 col-lg-4">
+                <div class="header-switches">
+                  <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="rx-control-toggle">
+                    <span class="form-check-label">RX control</span>
+                  </label>
+                  <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="tx-control-toggle">
+                    <span class="form-check-label">TX control</span>
+                  </label>
+                  <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="rotator-control-toggle">
+                    <span class="form-check-label">Rotator control</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <div class="row g-3 dashboard-row">
+          <section class="col-12 col-xl-4">
+            <div class="card h-100">
+              <div class="card-header d-flex align-items-center justify-content-between gap-3">
+                <h2 class="h5 mb-0" id="live-tracking-title">Live Tracking</h2>
+                <span class="small text-body-secondary">Map update <strong id="map-update" class="text-body">--</strong></span>
+              </div>
+              <div class="card-body">
+                <div class="map-wrap mb-3">
+                  <canvas id="satellite-map" width="450" height="225"></canvas>
+                  <canvas id="pass-arc-map" width="450" height="92"></canvas>
+                </div>
+
+                <details class="track-filter mb-3">
+                  <summary>Sats to Track</summary>
+                  <div id="track-filter-options" class="track-filter-options"></div>
+                </details>
+
+                <div class="pass-panel">
+                  <h3 class="h6 mb-2">Next 15 Passes at QTH <span id="pass-min-elevation-label" class="text-body-secondary">(min el --&deg;)</span></h3>
+                  <div class="pass-list-header" aria-hidden="true">
+                    <span>Satellite</span>
+                    <span>Date</span>
+                    <span>AOS - LOS</span>
+                    <span>AZ Path (deg)</span>
+                    <span>Max El</span>
+                  </div>
+                  <div id="pass-list" class="pass-list"></div>
+                  <label class="form-check form-switch auto-track-line mb-0">
+                    <span class="form-check-label">Auto-track next pass</span>
+                    <input class="form-check-input" type="checkbox" role="switch" id="auto-track-toggle" checked>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="col-12 col-xl-8">
+            <div class="card mb-3 control-panel-card">
+              <div class="card-header">
+                <h2 class="h5 mb-0">Control Panel</h2>
+              </div>
+              <div class="card-body">
+                <div class="row g-3 align-items-stretch mb-3 profile-row">
+                  <div class="col-12 col-lg-6">
+                    <div class="summary-box profile-select-box">
+                      <label class="summary-box-label" for="frequency-profile-select">Frequency profile</label>
+                      <select id="frequency-profile-select" class="form-select"></select>
+                    </div>
+                  </div>
+                  <div class="col-12 col-lg-6">
+                    <div id="frequency-profile-details" class="profile-summary">No frequency profile selected.</div>
+                  </div>
+                </div>
+
+                <div class="selection-summary-grid mb-3">
+                  <section class="summary-box">
+                    <div class="summary-box-label">Selected Satellite</div>
+                    <div class="selected-satellite-row">
+                      <strong id="selected-satellite">None</strong>
+                      <span id="selected-satellite-azimuth" class="text-body-secondary small">Az --</span>
+                      <span id="selected-satellite-elevation" class="text-body-secondary small">El --</span>
+                    </div>
+                  </section>
+                  <section class="summary-box summary-controls-box">
+                    <div class="summary-box-label">Offset Controls</div>
+                    <div class="summary-controls-row">
+                      <label class="form-check form-switch sync-toggle mb-0">
+                        <span class="form-check-label">Sync RX / TX Offsets</span>
+                        <input class="form-check-input" type="checkbox" role="switch" id="sync-rx-tx-toggle" checked>
+                      </label>
+                      <button type="button" class="btn btn-sm btn-outline-warning compact-action-button" id="reset-rx-offset">Reset Offset</button>
+                    </div>
+                  </section>
+                </div>
+
+                <div class="row g-3">
+                  <section class="col-12 col-lg-6">
+                    <div class="card link-panel h-100" id="rx-link-panel">
+                      <div class="card-header py-2 d-flex align-items-center justify-content-between">
+                        <h3 class="h6 mb-0">RX <span class="text-body-secondary">(Downlink)</span></h3>
+                      </div>
+                      <div class="card-body">
+                        <dl class="console-readouts">
+                          <div><dt>RX center</dt><dd id="tracking-rx-center">--</dd></div>
+                          <div><dt>RX Doppler</dt><dd id="tracking-rx-doppler">--</dd></div>
+                          <div><dt>Manual RX offset</dt><dd id="tracking-rx-offset">--</dd></div>
+                          <div><dt>Target RX</dt><dd id="tracking-target-rx">--</dd></div>
+                        </dl>
+                        <form id="rx-frequency-form" class="visually-hidden"></form>
+                        <div class="step-controls" aria-label="RX frequency step controls">
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="-1000">-1000 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="-100">-100 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="-10">-10 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="10">+10 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="100">+100 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="1000">+1000 kHz</button>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+
+                  <section class="col-12 col-lg-6">
+                    <div class="card link-panel h-100" id="tx-link-panel">
+                      <div class="card-header py-2 d-flex align-items-center justify-content-between">
+                        <h3 class="h6 mb-0">TX <span class="text-body-secondary">(Uplink)</span></h3>
+                      </div>
+                      <div class="card-body">
+                        <dl class="console-readouts">
+                          <div><dt>TX center</dt><dd id="tracking-tx-center">--</dd></div>
+                          <div><dt>TX Doppler</dt><dd id="tracking-tx-doppler">--</dd></div>
+                          <div><dt>Manual TX offset</dt><dd id="tracking-tx-offset">--</dd></div>
+                          <div><dt>Target TX</dt><dd id="tracking-calculated-tx">--</dd></div>
+                        </dl>
+                        <div class="step-controls" aria-label="TX frequency step controls">
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="-1000">-1000 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="-100">-100 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="-10">-10 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="10">+10 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="100">+100 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="1000">+1000 kHz</button>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+                </div>
+
+              </div>
+            </div>
+
+            <div class="row g-3">
+              <section class="col-12">
+                <div class="card h-100">
+                  <div class="card-header py-2 d-flex align-items-center justify-content-between gap-3">
+                    <h2 class="h6 mb-0">Rotator Status</h2>
+                    <span id="rotator-state-label" class="small text-body-secondary">Rotator control is off</span>
+                  </div>
+                  <div class="card-body">
+                    <div class="row g-3">
+                      <div class="col-12 col-lg-6">
+                        <dl class="console-readouts rotator-readouts">
+                          <div><dt>Connected</dt><dd id="rotator-connected">--</dd></div>
+                          <div><dt>Current az</dt><dd id="rotator-current-az">--</dd></div>
+                          <div><dt>Current el</dt><dd id="rotator-current-el">--</dd></div>
+                          <div><dt>Target az</dt><dd id="rotator-target-az">--</dd></div>
+                          <div><dt>Target el</dt><dd id="rotator-target-el">--</dd></div>
+                        </dl>
+                      </div>
+                      <div class="col-12 col-lg-6">
+                        <div class="rotator-manual-panel">
+                          <div class="summary-box-label">Manual Position</div>
+                          <div class="rotator-manual-controls">
+                            <label>
+                              <span>Azimuth</span>
+                              <input id="rotator-manual-az" class="form-control" type="number" min="0" max="359" step="1" value="0">
+                            </label>
+                            <label>
+                              <span>Elevation</span>
+                              <input id="rotator-manual-el" class="form-control" type="number" min="0" max="90" step="1" value="0">
+                            </label>
+                          </div>
+                          <div class="rotator-manual-actions">
+                            <button type="button" class="btn btn-outline-primary btn-sm" id="rotator-home-button">Send To Home</button>
+                            <button type="button" class="btn btn-primary btn-sm" id="rotator-send-button">Send Manual Position</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page-view" id="monitor-page" data-page-view="monitor" hidden>
+        <header class="card app-header mb-3">
+          <div class="card-body">
+            <div class="row align-items-center g-3">
+              <div class="col-12 col-lg-4">
+                <div class="brand-lockup">
+                  <img class="brand-satellite" src="/assets/pi-sat-satellite.png" alt="" aria-hidden="true">
+                  <div>
+                    <h1 class="h3 mb-0">Monitor</h1>
+                    <p class="text-body-secondary mb-0">Logs and debug controls</p>
+                  </div>
+                </div>
+              </div>
+              <div class="col-12 col-lg-4">
+                <nav class="nav nav-pills justify-content-lg-center gap-2" aria-label="Primary navigation">
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="home">Home</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="satellites">Satellites</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="monitor">Monitor</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="map">Map</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="settings">Settings</button>
+                </nav>
+              </div>
+              <div class="col-12 col-lg-4"></div>
+            </div>
+          </div>
+        </header>
+
+        <div class="row g-3">
+          <section class="col-12 col-lg-4">
+            <div class="card h-100">
+              <div class="card-header">
+                <h2 class="h5 mb-0">Debug Controls</h2>
+              </div>
+              <div class="card-body">
+                <div class="monitor-controls">
+                  <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-rx-cat-debug">
+                    <span class="form-check-label">RX CAT debug logging</span>
+                  </label>
+                  <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-tx-cat-debug">
+                    <span class="form-check-label">TX CAT debug logging</span>
+                  </label>
+                </div>
+                <p id="monitor-status" class="command-status mb-0"></p>
+              </div>
+            </div>
+          </section>
+
+          <section class="col-12 col-lg-8">
+            <div class="card h-100">
+              <div class="card-header py-2">
+                <h2 class="h6 mb-0">Logs <span class="text-body-secondary">(Last 100)</span></h2>
+              </div>
+              <div class="card-body">
+                <div id="log-list" class="log-list log-list-tall"></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page-view" id="satellites-page" data-page-view="satellites" hidden>
+        <header class="card app-header mb-3">
+          <div class="card-body">
+            <div class="row align-items-center g-3">
+              <div class="col-12 col-lg-4">
+                <div class="brand-lockup">
+                  <img class="brand-satellite" src="/assets/pi-sat-satellite.png" alt="" aria-hidden="true">
+                  <div>
+                    <h1 class="h3 mb-0">Satellites</h1>
+                    <p class="text-body-secondary mb-0">Manage tracked satellites and frequency profiles</p>
+                  </div>
+                </div>
+              </div>
+              <div class="col-12 col-lg-4">
+                <nav class="nav nav-pills justify-content-lg-center gap-2" aria-label="Primary navigation">
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="home">Home</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="satellites">Satellites</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="monitor">Monitor</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="map">Map</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="settings">Settings</button>
+                </nav>
+              </div>
+              <div class="col-12 col-lg-4"></div>
+            </div>
+          </div>
+        </header>
+
+        <div class="row g-3">
+          <section class="col-12">
+            <div class="card">
+              <div class="card-header">
+                <h2 class="h5 mb-0">My Satellites</h2>
+              </div>
+              <div class="card-body">
+                <form id="my-satellite-form" class="row g-2 align-items-end mb-3">
+                  <div class="col-12 col-sm-4 col-xl-3">
+                    <label class="form-label" for="my-satellite-norad">NORAD ID</label>
+                    <input id="my-satellite-norad" class="form-control" name="norad_id" inputmode="numeric" placeholder="44909">
+                  </div>
+                  <div class="col-12 col-sm-5 col-xl-5">
+                    <label class="form-label" for="my-satellite-name">Custom name</label>
+                    <input id="my-satellite-name" class="form-control" name="name" placeholder="Optional">
+                  </div>
+                  <div class="col-12 col-sm-3 col-xl-2 d-grid">
+                    <button type="submit" class="btn btn-primary">Add</button>
+                  </div>
+                  <div class="col-12 col-xl-2 d-grid">
+                    <button type="button" class="btn btn-outline-info" id="refresh-passes-btn">Refresh Satellite Passes</button>
+                  </div>
+                </form>
+
+                <form id="my-satellite-options" class="row g-2 align-items-end">
+                  <div class="col-12 col-lg-4 col-xl-3">
+                    <label class="form-label" for="min-pass-elevation">Minimum pass elevation</label>
+                    <div class="input-group">
+                      <input
+                        id="min-pass-elevation"
+                        class="form-control"
+                        name="min_pass_elevation_deg"
+                        type="number"
+                        min="0"
+                        max="90"
+                        step="0.1"
+                        inputmode="decimal"
+                        placeholder="10.0"
+                        aria-label="Minimum elevation in degrees for Next 15 Passes"
+                      >
+                      <span class="input-group-text">deg</span>
+                    </div>
+                  </div>
+                  <div class="col-12 col-lg-3 col-xl-2 d-grid">
+                    <button type="submit" class="btn btn-outline-primary">Save</button>
+                  </div>
+                  <div class="col-12 col-xl-7">
+                    <p class="source-note mb-0">Frequency profile updates use the public SatNOGS DB API.</p>
+                    <p id="my-satellite-status" class="command-status mb-0"></p>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </section>
+
+          <section class="col-12 col-xl-4">
+            <div class="card h-100">
+              <div class="card-header">
+                <h2 class="h5 mb-0">Tracked Satellites</h2>
+              </div>
+              <div class="card-body">
+                <div id="my-satellite-list" class="list-group my-satellite-list"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="col-12 col-xl-8">
+            <div class="card h-100">
+              <div class="card-header">
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                  <div>
+                    <h2 class="h5 mb-0">Satellite Details</h2>
+                    <p id="selected-my-satellite-meta" class="text-body-secondary mb-0 small"></p>
+                  </div>
+                  <div class="btn-group flex-wrap" role="group" aria-label="Satellite actions">
+                    <button type="button" class="btn btn-outline-primary btn-sm" id="selected-my-satellite-update-btn">Update Profiles</button>
+                    <button type="button" class="btn btn-outline-danger btn-sm" id="selected-my-satellite-remove-btn">Remove</button>
+                  </div>
+                </div>
+              </div>
+              <div class="card-body">
+                <div id="selected-my-satellite-name" class="h5 mb-2">Select a satellite to view its profiles.</div>
+                <div class="satellite-detail-grid">
+                  <section>
+                    <h3 class="h6 mb-2">Frequency Profiles</h3>
+                    <div id="selected-my-satellite-profiles" class="profile-list"></div>
+                  </section>
+                  <section>
+                    <h3 class="h6 mb-2">Known Passes <span class="text-body-secondary">(48h)</span></h3>
+                    <div id="selected-my-satellite-passes" class="satellite-pass-list"></div>
+                  </section>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page-view" id="settings-page" data-page-view="settings" hidden>
+        <header class="card app-header mb-3">
+          <div class="card-body">
+            <div class="row align-items-center g-3">
+              <div class="col-12 col-lg-4">
+                <div class="brand-lockup">
+                  <img class="brand-satellite" src="/assets/pi-sat-satellite.png" alt="" aria-hidden="true">
+                  <div>
+                    <h1 class="h3 mb-0">Settings</h1>
+                    <p class="text-body-secondary mb-0">Configuration is saved to pi-sat-controller.conf</p>
+                  </div>
+                </div>
+              </div>
+              <div class="col-12 col-lg-4">
+                <nav class="nav nav-pills justify-content-lg-center gap-2" aria-label="Primary navigation">
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="home">Home</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="satellites">Satellites</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="monitor">Monitor</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="map">Map</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="settings">Settings</button>
+                </nav>
+              </div>
+              <div class="col-12 col-lg-4"></div>
+            </div>
+          </div>
+        </header>
+
+        <div class="row g-3">
+          <section class="col-12">
+            <div class="card">
+              <div class="card-header">
+                <h2 class="h5 mb-0">Application Settings</h2>
+              </div>
+              <div class="card-body">
+                <form id="settings-form" class="settings-form"></form>
+                  <div class="d-flex justify-content-end gap-2 mt-3">
+                    <button type="button" class="btn btn-outline-info" id="refresh-tle-btn">Force Update TLE Data</button>
+                    <button type="submit" form="settings-form" class="btn btn-primary">Save Settings</button>
+                  </div>
+                <p id="settings-status" class="command-status mb-0"></p>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page-view" id="map-page" data-page-view="map" hidden>
+        <header class="card app-header mb-3">
+          <div class="card-body">
+            <div class="row align-items-center g-3">
+              <div class="col-12 col-lg-4">
+                <div class="brand-lockup">
+                  <img class="brand-satellite" src="/assets/pi-sat-satellite.png" alt="" aria-hidden="true">
+                  <div>
+                    <h1 class="h3 mb-0">Map</h1>
+                    <p class="text-body-secondary mb-0">Current tracked satellite locations</p>
+                  </div>
+                </div>
+              </div>
+              <div class="col-12 col-lg-4">
+                <nav class="nav nav-pills justify-content-lg-center gap-2" aria-label="Primary navigation">
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="home">Home</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="satellites">Satellites</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="monitor">Monitor</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="map">Map</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="settings">Settings</button>
+                </nav>
+              </div>
+              <div class="col-12 col-lg-4"></div>
+            </div>
+          </div>
+        </header>
+
+        <div class="row g-3">
+          <section class="col-12">
+            <div class="card">
+              <div class="card-header d-flex align-items-center justify-content-between gap-3">
+                <h2 class="h5 mb-0">Current Tracked Satellite Locations</h2>
+                <span class="small text-body-secondary">Map update <strong id="tracked-map-update" class="text-body">--</strong></span>
+              </div>
+              <div class="card-body">
+                <div class="tracked-map-wrap mx-auto">
+                  <canvas id="tracked-satellites-map" width="1400" height="700"></canvas>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+    <footer class="app-footer">
+      <span>Pi-Sat Controller</span>
+      <span class="footer-separator" aria-hidden="true">|</span>
+      <a href="https://w9ksb.com" target="_blank" rel="noopener noreferrer">w9ksb.com</a>
+      <span class="footer-separator" aria-hidden="true">|</span>
+      <a href="https://github.com/w9ksb" target="_blank" rel="noopener noreferrer">github.com/w9ksb</a>
+    </footer>
+    <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
+    <script src="/app.js?v=20260520-cat24"></script>
+  </body>
+</html>

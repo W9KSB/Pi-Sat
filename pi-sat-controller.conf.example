@@ -1,0 +1,74 @@
+[server]
+host = 0.0.0.0
+port = 80
+gui_resources_caching = false
+
+[station]
+name = Home
+latitude_deg = 40.0
+longitude_deg = 80.0
+elevation_m = 250.0
+
+[tle]
+source_url = https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=tle
+cache_dir = data/tle_cache
+stale_after_hours = 48
+
+[profiles]
+satellites_file = data/satellites.json
+
+[my_satellites]
+min_pass_elevation_deg = 10.0
+autotrack_next_pass = true
+satellite_25544 = ISS
+satellite_27607 = SO-50
+satellite_44909 = RS-44
+
+[rx]
+enabled = false
+connectivity = network
+host = 127.0.0.1
+port = 4532
+serial_port =
+baud =
+model_id =
+target_vfo = current
+cat_debug_logging = false
+write_enabled = false
+timeout_s = 2.0
+
+[tx]
+enabled = false
+connectivity = local
+host = 127.0.0.1
+port = 4533
+serial_port =
+baud =
+model_id =
+target_vfo = current
+cat_debug_logging = false
+write_enabled = false
+timeout_s = 2.0
+
+[rotator]
+enabled = false
+connectivity = network
+host = 127.0.0.1
+port = 4534
+serial_port =
+baud =
+model_id =
+write_enabled = false
+timeout_s = 2.0
+min_elevation_deg = 0.0
+home_azimuth_deg = 0.0
+home_elevation_deg = 0.0
+return_home_after_pass = false
+
+[safety]
+tx_inhibit_below_horizon = true
+tx_inhibit_on_cat_loss = true
+tx_inhibit_without_valid_pass = true
+frequency_deadband_hz = 10
+cat_rate_limit_hz = 4
+tracking_update_interval_ms = 1000

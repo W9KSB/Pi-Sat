@@ -1,0 +1,49 @@
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="${SCRIPT_DIR}"
+SERVICE_NAME="pi-sat"
+
+if [ "$(id -u)" -eq 0 ]; then
+  echo "Run this updater as the normal Pi user, not with sudo."
+  exit 1
+fi
+
+if ! command -v sudo >/dev/null 2>&1; then
+  echo "sudo is required."
+  exit 1
+fi
+
+if [ ! -d "${REPO_ROOT}/.git" ]; then
+  echo "This updater must be run from an existing git checkout."
+  exit 1
+fi
+
+if [ ! -f "${REPO_ROOT}/requirements.txt" ]; then
+  echo "requirements.txt not found in ${REPO_ROOT}."
+  exit 1
+fi
+
+if [ ! -d "${REPO_ROOT}/.venv" ]; then
+  echo "Python virtual environment not found in ${REPO_ROOT}/.venv."
+  echo "Run install/install_pi.sh first."
+  exit 1
+fi
+
+echo "Updating Pi-Sat Controller in: ${REPO_ROOT}"
+
+cd "${REPO_ROOT}"
+
+sudo systemctl stop "${SERVICE_NAME}"
+git fetch --all --prune
+git pull --ff-only
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+sudo systemctl daemon-reload
+sudo systemctl start "${SERVICE_NAME}"
+
+echo ""
+echo "Update complete."
+echo "Service: sudo systemctl status ${SERVICE_NAME}"
+echo "Logs:    journalctl -u ${SERVICE_NAME} -f"

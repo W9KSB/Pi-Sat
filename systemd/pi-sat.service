@@ -1,0 +1,16 @@
+[Unit]
+Description=Pi-Sat Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/REPLACE_WITH_INSTALL_USER/pi-sat
+ExecStart=/home/REPLACE_WITH_INSTALL_USER/pi-sat/.venv/bin/python -m pi_sat_controller.backend.run_server
+Restart=on-failure
+RestartSec=5
+User=REPLACE_WITH_INSTALL_USER
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

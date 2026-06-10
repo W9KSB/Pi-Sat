@@ -1,0 +1,9 @@
+Asset: world-map-equirectangular.png
+Source: NASA Scientific Visualization Studio, Blue Marble - A Seamless Image Mosaic of the Earth
+Source URL: https://svs.gsfc.nasa.gov/2915
+Original file: bluemarble-2048.png
+
+NASA imagery is generally not copyrighted and may be used for educational or
+informational purposes. NASA names, initials, emblems, and logos are protected
+and should not be used to imply endorsement.
+
