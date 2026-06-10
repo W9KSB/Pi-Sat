@@ -1110,10 +1110,11 @@ def _load_hamlib_model_caches() -> None:
         hamlib_radio_models_error = None
     except FileNotFoundError:
         hamlib_radio_models_cache = []
-        hamlib_radio_models_error = "rigctl was not found on this system."
+        hamlib_radio_models_error = "Hamlib radio models are unavailable on this system."
     except Exception as exc:
         hamlib_radio_models_cache = []
-        hamlib_radio_models_error = str(exc)
+        LOGGER.exception("Unable to load Hamlib radio models")
+        hamlib_radio_models_error = "Hamlib radio models could not be loaded."
 
     try:
         hamlib_rotator_models_cache = [
@@ -1122,10 +1123,11 @@ def _load_hamlib_model_caches() -> None:
         hamlib_rotator_models_error = None
     except FileNotFoundError:
         hamlib_rotator_models_cache = []
-        hamlib_rotator_models_error = "rotctl was not found on this system."
+        hamlib_rotator_models_error = "Hamlib rotator models are unavailable on this system."
     except Exception as exc:
         hamlib_rotator_models_cache = []
-        hamlib_rotator_models_error = str(exc)
+        LOGGER.exception("Unable to load Hamlib rotator models")
+        hamlib_rotator_models_error = "Hamlib rotator models could not be loaded."
 
 
 def _uses_same_local_radio(config) -> bool:
