@@ -1,4 +1,4 @@
-# Pi-Sat
+# Pi-Sat Satellite Communications Controller
 
 <p align="center">
   Browser-based satellite tracking, radio control, SDR control, and rotator control for Raspberry Pi.
