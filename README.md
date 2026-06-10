@@ -15,6 +15,8 @@ Pi-Sat is a local web control surface for satellite operations. It combines pass
 
 The Raspberry Pi owns the backend, device control, and tracking logic. The browser is the operator console.
 
+I had a few use cases for myself that existing software was not doing for me, so I decided to make this for my own use and share it freely. I have zero plans to monitize any of this. If you want to try it, feel free to do so. Report issues, make suggestions for features, and submit code improvements as well if you'd like!
+
 <p align="center">
   <img alt="Dashboard" src="https://www.w9ksb.com/wp-content/uploads/2026/06/Dashboard.jpg">
 </p>
@@ -71,3 +73,21 @@ journalctl -u pi-sat -f
 
 ## Manual Control
 Be sure to check out the wiki if you want more manual control in terms of installing or updating. The whole project is open source as well if you need to change anything and personalize your setup.
+
+## AI Usage
+This always comes up so I want to be upfront. I've been coding with python for 8-10 years or so now and have had many fun projects as part of my hobbies. That being said, I do use AI to assist with tasks and productivity. A couple of examples are documentation and the gui interface. I'll admit it, I do not have an artistic bone in my body, so helping with visuals is a great use for me. That being said, I am transparent with this code - it's all open source. You're free to evaluate any functionality as you wish and customize as you please.
+
+
+## Credits
+
+### Software and Libraries
+
+- [Hamlib](https://hamlib.github.io/) for radio and rotator control interfaces
+- [Skyfield](https://rhodesmill.org/skyfield/) for orbital calculations and pass prediction
+
+
+### Data Sources
+
+- [CelesTrak](https://celestrak.org/) for TLE data used by the application
+
+Pi-Sat depends on these projects and data sources for core functionality. Thanks to them for the outstanding work they have done for years in this space and wish them continued success.
