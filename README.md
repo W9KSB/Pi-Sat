@@ -17,6 +17,8 @@ The Raspberry Pi owns the backend, device control, and tracking logic. The brows
 
 I had a few use cases for myself that existing software was not doing for me, so I decided to make this for my own use and share it freely. I have zero plans to monitize any of this. If you want to try it, feel free to do so. Report issues, make suggestions for features, and submit code improvements as well if you'd like!
 
+Want more infomation about how you can get started? Be sure to check out the wiki: [Pi-sat Controller Wiki](https://github.com/W9KSB/Pi-Sat/wiki) 
+
 <p align="center">
   <img alt="Dashboard" src="https://www.w9ksb.com/wp-content/uploads/2026/06/Dashboard.jpg">
 </p>
