@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, time, timedelta, timezone
 import logging
+import math
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
@@ -31,6 +32,7 @@ from pi_sat_controller.backend.config import (
     save_settings,
 )
 from pi_sat_controller.backend.controller.rx_tracking import RxTrackingManager
+from pi_sat_controller.backend.maidenhead import locator_to_lat_lon
 from pi_sat_controller.backend.orbital.skyfield_engine import SkyfieldEngine
 from pi_sat_controller.backend.rotator.rotator_manager import (
     RotatorManager,
@@ -984,6 +986,125 @@ def get_tracking_ground_track(
     }
 
 
+@app.post("/api/qso-finder/search")
+def search_qso_windows(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+    grid_1 = str(payload.get("grid_1", "")).strip()
+    grid_2 = str(payload.get("grid_2", "")).strip()
+    satellite_filter = payload.get("norad_id")
+    min_elevation_deg = float(payload.get("min_elevation_deg", 10.0))
+    hours = int(payload.get("hours", 48))
+    min_duration_minutes = float(payload.get("min_duration_minutes", 2.0))
+
+    if not grid_1 or not grid_2:
+        raise HTTPException(status_code=400, detail="Both grid locators are required.")
+    if hours < 1 or hours > 168:
+        raise HTTPException(status_code=400, detail="Hours must be between 1 and 168.")
+    if min_elevation_deg < 0 or min_elevation_deg > 90:
+        raise HTTPException(status_code=400, detail="Minimum elevation must be between 0 and 90 degrees.")
+    if min_duration_minutes < 0 or min_duration_minutes > 1440:
+        raise HTTPException(status_code=400, detail="Minimum duration must be between 0 and 1440 minutes.")
+
+    try:
+        grid_1_lat, grid_1_lon = locator_to_lat_lon(grid_1)
+        grid_2_lat, grid_2_lon = locator_to_lat_lon(grid_2)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    tle_file = _resolve_tle_cache_file()
+    engine_grid_1 = SkyfieldEngine(tle_file, grid_1_lat, grid_1_lon, 0.0)
+    engine_grid_2 = SkyfieldEngine(tle_file, grid_2_lat, grid_2_lon, 0.0)
+    now_utc = datetime.now(timezone.utc)
+    horizon_utc = now_utc + timedelta(hours=hours)
+    days_ahead = max(1, min(7, math.ceil(hours / 24) + 1))
+    limit = max(48, hours * 3)
+    grid_1_timezone = qth_timezone_name(grid_1_lat, grid_1_lon)
+    grid_2_timezone = qth_timezone_name(grid_2_lat, grid_2_lon)
+
+    satellites = load_my_satellites()[0]
+    if satellite_filter not in (None, "", "all"):
+        try:
+            selected_norad = int(satellite_filter)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Satellite filter must be a NORAD ID or 'all'.") from exc
+        satellites = [satellite for satellite in satellites if satellite.norad_id == selected_norad]
+
+    opportunities: list[dict[str, object]] = []
+    summary_options = [
+        {
+            "norad_id": satellite.norad_id,
+            "name": satellite.name,
+        }
+        for satellite in satellites
+    ]
+
+    for satellite in satellites:
+        try:
+            grid_1_passes = [
+                satellite_pass
+                for satellite_pass in engine_grid_1.get_passes(
+                    satellite.norad_id,
+                    satellite.name,
+                    min_elevation_deg=min_elevation_deg,
+                    limit=limit,
+                    days_ahead=days_ahead,
+                )
+                if satellite_pass.los_utc > now_utc and satellite_pass.aos_utc < horizon_utc
+            ]
+            grid_2_passes = [
+                satellite_pass
+                for satellite_pass in engine_grid_2.get_passes(
+                    satellite.norad_id,
+                    satellite.name,
+                    min_elevation_deg=min_elevation_deg,
+                    limit=limit,
+                    days_ahead=days_ahead,
+                )
+                if satellite_pass.los_utc > now_utc and satellite_pass.aos_utc < horizon_utc
+            ]
+        except KeyError:
+            continue
+
+        opportunities.extend(
+            _build_qso_opportunities(
+                engine=engine_grid_1,
+                satellite_name=satellite.name,
+                norad_id=satellite.norad_id,
+                grid_1=grid_1,
+                grid_1_lat=grid_1_lat,
+                grid_1_lon=grid_1_lon,
+                grid_1_timezone=grid_1_timezone,
+                grid_1_passes=grid_1_passes,
+                grid_2=grid_2,
+                grid_2_lat=grid_2_lat,
+                grid_2_lon=grid_2_lon,
+                grid_2_timezone=grid_2_timezone,
+                grid_2_passes=grid_2_passes,
+                min_overlap_seconds=int(min_duration_minutes * 60),
+            )
+        )
+
+    opportunities.sort(key=lambda item: item["overlap_start_utc"])
+    return {
+        "grid_1": {
+            "locator": grid_1.upper(),
+            "latitude_deg": grid_1_lat,
+            "longitude_deg": grid_1_lon,
+            "timezone": grid_1_timezone,
+        },
+        "grid_2": {
+            "locator": grid_2.upper(),
+            "latitude_deg": grid_2_lat,
+            "longitude_deg": grid_2_lon,
+            "timezone": grid_2_timezone,
+        },
+        "satellites": summary_options,
+        "min_elevation_deg": min_elevation_deg,
+        "min_duration_minutes": min_duration_minutes,
+        "hours": hours,
+        "opportunities": opportunities,
+    }
+
+
 def _get_or_create_rx_tracking_manager(
     norad_id: int | None = None,
     transponder_index: int = 0,
@@ -1439,6 +1560,21 @@ def _build_orbital_engine() -> SkyfieldEngine:
         ) from exc
 
 
+def _resolve_tle_cache_file() -> Path:
+    config = load_config()
+    tle_manager = TleManager(config.tle.source_url, config.tle.cache_dir)
+    tle_status = tle_manager.status()
+    if not tle_status.exists:
+        try:
+            tle_status = tle_manager.download()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"TLE download failed: {exc}",
+            ) from exc
+    return tle_status.cache_file
+
+
 def _pass_to_dict(satellite_pass: SatellitePass) -> dict[str, object]:
     config = load_config()
     timezone_name = qth_timezone_name(
@@ -1463,6 +1599,118 @@ def _pass_to_dict(satellite_pass: SatellitePass) -> dict[str, object]:
         "timezone": timezone_name,
         "max_elevation_deg": satellite_pass.max_elevation_deg,
     }
+
+
+def _pass_to_dict_for_timezone(
+    satellite_pass: SatellitePass,
+    timezone_name: str,
+) -> dict[str, object]:
+    return {
+        "satellite_name": satellite_pass.satellite_name,
+        "norad_id": satellite_pass.norad_id,
+        "aos_utc": satellite_pass.aos_utc.isoformat(),
+        "max_utc": satellite_pass.max_utc.isoformat(),
+        "los_utc": satellite_pass.los_utc.isoformat(),
+        "start_azimuth_deg": satellite_pass.start_azimuth_deg,
+        "middle_azimuth_deg": satellite_pass.middle_azimuth_deg,
+        "end_azimuth_deg": satellite_pass.end_azimuth_deg,
+        "aos_local": to_local_iso(satellite_pass.aos_utc, timezone_name),
+        "max_local": to_local_iso(satellite_pass.max_utc, timezone_name),
+        "los_local": to_local_iso(satellite_pass.los_utc, timezone_name),
+        "aos_local_label": to_local_label(satellite_pass.aos_utc, timezone_name),
+        "max_local_label": to_local_label(satellite_pass.max_utc, timezone_name),
+        "los_local_label": to_local_label(satellite_pass.los_utc, timezone_name),
+        "timezone": timezone_name,
+        "max_elevation_deg": satellite_pass.max_elevation_deg,
+    }
+
+
+def _build_qso_opportunities(
+    *,
+    engine: SkyfieldEngine,
+    satellite_name: str,
+    norad_id: int,
+    grid_1: str,
+    grid_1_lat: float,
+    grid_1_lon: float,
+    grid_1_timezone: str,
+    grid_1_passes: list[SatellitePass],
+    grid_2: str,
+    grid_2_lat: float,
+    grid_2_lon: float,
+    grid_2_timezone: str,
+    grid_2_passes: list[SatellitePass],
+    min_overlap_seconds: int,
+) -> list[dict[str, object]]:
+    opportunities: list[dict[str, object]] = []
+    left_index = 0
+    right_index = 0
+
+    while left_index < len(grid_1_passes) and right_index < len(grid_2_passes):
+        left_pass = grid_1_passes[left_index]
+        right_pass = grid_2_passes[right_index]
+        overlap_start = max(left_pass.aos_utc, right_pass.aos_utc)
+        overlap_end = min(left_pass.los_utc, right_pass.los_utc)
+
+        if overlap_end > overlap_start:
+            overlap_seconds = int((overlap_end - overlap_start).total_seconds())
+            if overlap_seconds < min_overlap_seconds:
+                if left_pass.los_utc <= right_pass.los_utc:
+                    left_index += 1
+                else:
+                    right_index += 1
+                continue
+            midpoint_utc = overlap_start + (overlap_end - overlap_start) / 2
+            midpoint_position = engine.get_position_at(norad_id, midpoint_utc)
+            full_path_start = min(left_pass.aos_utc, right_pass.aos_utc)
+            full_path_end = max(left_pass.los_utc, right_pass.los_utc)
+            track_points = engine.get_ground_track(
+                norad_id=norad_id,
+                start_utc=full_path_start,
+                end_utc=full_path_end,
+                step_seconds=max(20, min(120, max(20, overlap_seconds // 24))),
+            )
+            footprint_points = engine.get_visibility_footprint(
+                norad_id=norad_id,
+                at_utc=midpoint_utc,
+            )
+            opportunities.append(
+                {
+                    "satellite_name": satellite_name,
+                    "norad_id": norad_id,
+                    "overlap_start_utc": overlap_start.isoformat(),
+                    "overlap_end_utc": overlap_end.isoformat(),
+                    "overlap_duration_seconds": overlap_seconds,
+                    "track_start_utc": full_path_start.isoformat(),
+                    "track_end_utc": full_path_end.isoformat(),
+                    "grid_1": {
+                        "locator": grid_1.upper(),
+                        "latitude_deg": grid_1_lat,
+                        "longitude_deg": grid_1_lon,
+                        "pass": _pass_to_dict_for_timezone(left_pass, grid_1_timezone),
+                    },
+                    "grid_2": {
+                        "locator": grid_2.upper(),
+                        "latitude_deg": grid_2_lat,
+                        "longitude_deg": grid_2_lon,
+                        "pass": _pass_to_dict_for_timezone(right_pass, grid_2_timezone),
+                    },
+                    "midpoint": {
+                        "utc": midpoint_utc.isoformat(),
+                        "latitude_deg": round(midpoint_position.latitude_deg, 5),
+                        "longitude_deg": round(midpoint_position.longitude_deg, 5),
+                    },
+                    "track_points": track_points,
+                    "footprint_points": footprint_points,
+                }
+            )
+
+        if left_pass.los_utc <= right_pass.los_utc:
+            left_index += 1
+        else:
+            right_index += 1
+
+    return opportunities
 
 
 def _list_serial_devices() -> list[dict[str, str]]:

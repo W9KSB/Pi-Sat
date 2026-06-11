@@ -27,6 +27,9 @@ let stationLongitudeDeg = null;
 let groundTrackPoints = [];
 let groundTrackNoradId = null;
 let groundTrackFetchedAtMs = 0;
+let qsoFinderResult = null;
+let qsoOpportunities = [];
+let selectedQsoOpportunityIndex = -1;
 const MAP_REFRESH_TIMEOUT_MS = 5000;
 const hiddenSettingsKeys = {
   server: new Set(['host', 'port', 'gui_resources_caching']),
@@ -159,7 +162,7 @@ async function loadStatus() {
 }
 
 function showPage(pageName) {
-  const selectedPage = ['home', 'satellites', 'monitor', 'map', 'settings'].includes(pageName)
+  const selectedPage = ['home', 'satellites', 'qso-finder', 'monitor', 'map', 'settings'].includes(pageName)
     ? pageName
     : 'home';
   document.querySelectorAll('[data-page-view]').forEach((view) => {
@@ -174,6 +177,8 @@ function showPage(pageName) {
     loadMySatellites();
   } else if (selectedPage === 'monitor') {
     loadMonitor();
+  } else if (selectedPage === 'qso-finder') {
+    loadQsoFinderPage();
   } else if (selectedPage === 'map') {
     loadTrackedSatelliteLocations();
     drawTrackedSatellitesMap();
@@ -184,7 +189,7 @@ function showPage(pageName) {
 
 function pageFromHash() {
   const page = window.location.hash.replace('#', '');
-  return ['home', 'satellites', 'monitor', 'map', 'settings'].includes(page) ? page : 'home';
+  return ['home', 'satellites', 'qso-finder', 'monitor', 'map', 'settings'].includes(page) ? page : 'home';
 }
 
 async function loadSatellites() {
@@ -208,6 +213,7 @@ async function loadSatellites() {
   };
 
   renderTrackFilter();
+  renderQsoSatelliteOptions();
   if (selectedSatelliteNorad) {
     await selectSatelliteByNorad(selectedSatelliteNorad);
   } else if (latestTracking?.norad_id) {
@@ -749,6 +755,414 @@ async function loadTrackedSatelliteLocations() {
     addLog('Tracked satellite map update failed.');
     drawTrackedSatellitesMap();
   }
+}
+
+function renderQsoSatelliteOptions() {
+  const select = document.getElementById('qso-satellite-filter');
+  if (!select) {
+    return;
+  }
+  const currentValue = select.value || 'all';
+  select.replaceChildren();
+
+  const allOption = document.createElement('option');
+  allOption.value = 'all';
+  allOption.textContent = 'All Tracked Satellites';
+  select.appendChild(allOption);
+
+  satellitesCache.forEach((satellite) => {
+    const option = document.createElement('option');
+    option.value = String(satellite.norad_id);
+    option.textContent = satellite.name;
+    select.appendChild(option);
+  });
+
+  const validValues = new Set(['all', ...satellitesCache.map((satellite) => String(satellite.norad_id))]);
+  select.value = validValues.has(currentValue) ? currentValue : 'all';
+}
+
+function loadQsoFinderPage() {
+  renderQsoSatelliteOptions();
+  renderQsoOpportunityList();
+  renderQsoDetails();
+  drawQsoMap();
+}
+
+async function searchQsoFinder(event) {
+  event?.preventDefault();
+  const status = document.getElementById('qso-finder-status');
+  const grid1 = document.getElementById('qso-grid-1').value.trim().toUpperCase();
+  const grid2 = document.getElementById('qso-grid-2').value.trim().toUpperCase();
+  const noradId = document.getElementById('qso-satellite-filter').value;
+  const minElevationDeg = Number(document.getElementById('qso-min-elevation').value);
+  const hours = Number(document.getElementById('qso-hours').value);
+  const minDurationMinutes = Number(document.getElementById('qso-min-duration').value);
+
+  if (!grid1 || !grid2) {
+    status.textContent = 'Enter both grid locators.';
+    return;
+  }
+
+  status.textContent = 'Searching overlap windows...';
+  try {
+    const response = await fetch('/api/qso-finder/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grid_1: grid1,
+        grid_2: grid2,
+        norad_id: noradId,
+        min_elevation_deg: minElevationDeg,
+        hours,
+        min_duration_minutes: minDurationMinutes,
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      status.textContent = result.detail || 'QSO search failed.';
+      return;
+    }
+    qsoFinderResult = result;
+    qsoOpportunities = Array.isArray(result.opportunities) ? result.opportunities : [];
+    selectedQsoOpportunityIndex = qsoOpportunities.length ? 0 : -1;
+    renderQsoOpportunityList();
+    renderQsoDetails();
+    drawQsoMap();
+    status.textContent = qsoOpportunities.length
+      ? `${qsoOpportunities.length} overlap window${qsoOpportunities.length === 1 ? '' : 's'} found.`
+      : 'No overlap windows found in the selected search window.';
+  } catch (error) {
+    status.textContent = 'QSO search failed.';
+  }
+}
+
+function renderQsoOpportunityList() {
+  const list = document.getElementById('qso-opportunity-list');
+  if (!list) {
+    return;
+  }
+  list.replaceChildren();
+
+  if (!qsoOpportunities.length) {
+    const empty = document.createElement('p');
+    empty.className = 'text-body-secondary mb-0';
+    empty.textContent = qsoFinderResult
+      ? 'No overlap windows found in the current search.'
+      : 'Enter two grid locators to search.';
+    list.appendChild(empty);
+    return;
+  }
+
+  qsoOpportunities.forEach((opportunity, index) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'qso-opportunity-item btn';
+    if (index === selectedQsoOpportunityIndex) {
+      button.classList.add('active');
+    }
+
+    const overlapStart = new Date(opportunity.overlap_start_utc);
+    const overlapEnd = new Date(opportunity.overlap_end_utc);
+    const title = document.createElement('div');
+    title.className = 'qso-opportunity-title';
+    title.textContent = opportunity.satellite_name || 'Unknown Satellite';
+
+    const meta = document.createElement('div');
+    meta.className = 'qso-opportunity-meta';
+    meta.textContent = `${formatDateOnlyForTimezone(overlapStart, 'UTC')}  ${formatTimeRangeForTimezone(overlapStart, overlapEnd, 'UTC')} UTC`;
+
+    const submeta = document.createElement('div');
+    submeta.className = 'qso-opportunity-submeta';
+    submeta.textContent = `${formatDuration(opportunity.overlap_duration_seconds)} overlap`;
+
+    button.append(title, meta, submeta);
+    button.addEventListener('click', () => {
+      selectedQsoOpportunityIndex = index;
+      renderQsoOpportunityList();
+      renderQsoDetails();
+      drawQsoMap();
+    });
+    list.appendChild(button);
+  });
+}
+
+function getSelectedQsoOpportunity() {
+  if (selectedQsoOpportunityIndex < 0 || selectedQsoOpportunityIndex >= qsoOpportunities.length) {
+    return null;
+  }
+  return qsoOpportunities[selectedQsoOpportunityIndex];
+}
+
+function renderQsoDetails() {
+  const selectedSatellite = document.getElementById('qso-selected-satellite');
+  const overlapSummary = document.getElementById('qso-overlap-summary');
+  const opportunity = getSelectedQsoOpportunity();
+
+  if (!selectedSatellite || !overlapSummary) {
+    return;
+  }
+  if (!opportunity) {
+    selectedSatellite.textContent = 'No overlap selected.';
+    overlapSummary.textContent = 'No overlap selected.';
+    document.getElementById('qso-grid-1-title').textContent = 'Grid 1';
+    document.getElementById('qso-grid-2-title').textContent = 'Grid 2';
+    document.getElementById('qso-grid-1-timezone').textContent = '--';
+    document.getElementById('qso-grid-2-timezone').textContent = '--';
+    document.getElementById('qso-grid-1-start').textContent = '--';
+    document.getElementById('qso-grid-1-end').textContent = '--';
+    document.getElementById('qso-grid-1-peak').textContent = '--';
+    document.getElementById('qso-grid-2-start').textContent = '--';
+    document.getElementById('qso-grid-2-end').textContent = '--';
+    document.getElementById('qso-grid-2-peak').textContent = '--';
+    document.getElementById('qso-window-start-local').textContent = 'Start Local --';
+    document.getElementById('qso-window-start-utc').textContent = 'Start UTC --';
+    document.getElementById('qso-window-end-local').textContent = 'Stop Local --';
+    document.getElementById('qso-window-end-utc').textContent = 'Stop UTC --';
+    document.getElementById('qso-duration').textContent = 'Duration --';
+    return;
+  }
+
+  const overlapStart = new Date(opportunity.overlap_start_utc);
+  const overlapEnd = new Date(opportunity.overlap_end_utc);
+  const grid1Pass = opportunity.grid_1?.pass || {};
+  const grid2Pass = opportunity.grid_2?.pass || {};
+
+  selectedSatellite.textContent = `${opportunity.satellite_name} (${opportunity.norad_id})`;
+  overlapSummary.textContent = `${formatDateOnlyForTimezone(overlapStart, 'UTC')}  ${formatTimeRangeForTimezone(overlapStart, overlapEnd, 'UTC')} UTC`;
+  document.getElementById('qso-grid-1-title').textContent = opportunity.grid_1?.locator || 'Grid 1';
+  document.getElementById('qso-grid-2-title').textContent = opportunity.grid_2?.locator || 'Grid 2';
+  document.getElementById('qso-grid-1-timezone').textContent = grid1Pass.timezone || '--';
+  document.getElementById('qso-grid-2-timezone').textContent = grid2Pass.timezone || '--';
+  document.getElementById('qso-grid-1-start').textContent = formatDisplayDateTime(grid1Pass.aos_utc, grid1Pass.timezone);
+  document.getElementById('qso-grid-1-end').textContent = formatDisplayDateTime(grid1Pass.los_utc, grid1Pass.timezone);
+  document.getElementById('qso-grid-1-peak').textContent = formatNumber(grid1Pass.max_elevation_deg, 1, ' deg');
+  document.getElementById('qso-grid-2-start').textContent = formatDisplayDateTime(grid2Pass.aos_utc, grid2Pass.timezone);
+  document.getElementById('qso-grid-2-end').textContent = formatDisplayDateTime(grid2Pass.los_utc, grid2Pass.timezone);
+  document.getElementById('qso-grid-2-peak').textContent = formatNumber(grid2Pass.max_elevation_deg, 1, ' deg');
+  document.getElementById('qso-window-start-local').textContent = `Start Local ${formatDateTimeForTimezone(overlapStart, qthTimezone)}`;
+  document.getElementById('qso-window-start-utc').textContent = `Start UTC ${formatDateTimeForTimezone(overlapStart, 'UTC')}`;
+  document.getElementById('qso-window-end-local').textContent = `Stop Local ${formatDateTimeForTimezone(overlapEnd, qthTimezone)}`;
+  document.getElementById('qso-window-end-utc').textContent = `Stop UTC ${formatDateTimeForTimezone(overlapEnd, 'UTC')}`;
+  document.getElementById('qso-duration').textContent = `Duration ${formatDuration(opportunity.overlap_duration_seconds)}`;
+}
+
+function drawQsoMap() {
+  const canvas = document.getElementById('qso-map');
+  if (!canvas) {
+    return;
+  }
+  const ctx = canvas.getContext('2d');
+  const width = canvas.width;
+  const height = canvas.height;
+  const opportunity = getSelectedQsoOpportunity();
+
+  ctx.clearRect(0, 0, width, height);
+  const view = buildQsoMapView(opportunity);
+  drawMapBackground(ctx, width, height, view);
+  drawMapGrid(ctx, width, height, view);
+
+  if (!opportunity) {
+    ctx.fillStyle = '#d4dee7';
+    ctx.font = '16px Arial';
+    ctx.fillText('Search for overlap windows to render the map.', 20, 30);
+    return;
+  }
+
+  drawQsoTrack(ctx, width, height, opportunity.track_points || [], view);
+  drawQsoFootprint(ctx, width, height, opportunity.footprint_points || [], view);
+  drawQsoGridMarker(
+    ctx,
+    width,
+    height,
+    Number(opportunity.grid_1?.latitude_deg),
+    Number(opportunity.grid_1?.longitude_deg),
+    opportunity.grid_1?.locator || 'Grid 1',
+    '#59d66f',
+    view
+  );
+  drawQsoGridMarker(
+    ctx,
+    width,
+    height,
+    Number(opportunity.grid_2?.latitude_deg),
+    Number(opportunity.grid_2?.longitude_deg),
+    opportunity.grid_2?.locator || 'Grid 2',
+    '#ffd45b',
+    view
+  );
+
+  if (hasValidCoordinate(opportunity.midpoint?.latitude_deg) && hasValidCoordinate(opportunity.midpoint?.longitude_deg)) {
+    drawMapSatellite(
+      ctx,
+      width,
+      height,
+      Number(opportunity.midpoint.latitude_deg),
+      Number(opportunity.midpoint.longitude_deg),
+      opportunity.satellite_name || '',
+      view
+    );
+  }
+
+  drawQsoLegend(ctx, width, height, opportunity);
+}
+
+function drawQsoTrack(ctx, width, height, points, view = null) {
+  if (!Array.isArray(points) || points.length < 2) {
+    return;
+  }
+  ctx.strokeStyle = '#2bb7ff';
+  ctx.lineWidth = 2;
+  ctx.globalAlpha = 0.95;
+  ctx.beginPath();
+  let started = false;
+  let lastX = 0;
+  points.forEach((point) => {
+    if (!hasValidCoordinate(point.latitude_deg) || !hasValidCoordinate(point.longitude_deg)) {
+      return;
+    }
+    const { x, y } = latLonToMapPoint(
+      Number(point.latitude_deg),
+      Number(point.longitude_deg),
+      width,
+      height,
+      view
+    );
+    if (!started) {
+      ctx.moveTo(x, y);
+      started = true;
+      lastX = x;
+      return;
+    }
+    if (Math.abs(x - lastX) > width * 0.5) {
+      ctx.moveTo(x, y);
+    } else {
+      ctx.lineTo(x, y);
+    }
+    lastX = x;
+  });
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function drawQsoFootprint(ctx, width, height, points, view = null) {
+  if (!Array.isArray(points) || points.length < 4) {
+    return;
+  }
+  const projected = points
+    .filter((point) => hasValidCoordinate(point.latitude_deg) && hasValidCoordinate(point.longitude_deg))
+    .map((point) => latLonToMapPoint(Number(point.latitude_deg), Number(point.longitude_deg), width, height, view));
+  if (projected.length < 4) {
+    return;
+  }
+  ctx.fillStyle = 'rgba(79, 163, 255, 0.14)';
+  ctx.strokeStyle = 'rgba(110, 196, 255, 0.62)';
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  projected.forEach((point, index) => {
+    if (index === 0) {
+      ctx.moveTo(point.x, point.y);
+    } else {
+      ctx.lineTo(point.x, point.y);
+    }
+  });
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+}
+
+function drawQsoGridMarker(ctx, width, height, lat, lon, label, color, view = null) {
+  if (!hasValidCoordinate(lat) || !hasValidCoordinate(lon)) {
+    return;
+  }
+  const { x, y } = latLonToMapPoint(lat, lon, width, height, view);
+  ctx.fillStyle = color;
+  ctx.strokeStyle = 'rgba(6, 17, 26, 0.92)';
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  ctx.arc(x, y, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = '#f3f6f8';
+  ctx.font = '12px Arial';
+  ctx.textAlign = 'left';
+  const safeLabel = label || '';
+  ctx.fillText(
+    safeLabel,
+    Math.min(x + 10, width - ctx.measureText(safeLabel).width - 6),
+    Math.max(y - 10, 14)
+  );
+}
+
+function buildQsoMapView(opportunity) {
+  if (!opportunity) {
+    return null;
+  }
+  const centerLatCandidates = [
+    opportunity.midpoint?.latitude_deg,
+    opportunity.grid_1?.latitude_deg,
+    opportunity.grid_2?.latitude_deg,
+  ].filter((value) => hasValidCoordinate(value));
+  const centerLonCandidates = [
+    opportunity.midpoint?.longitude_deg,
+    opportunity.grid_1?.longitude_deg,
+    opportunity.grid_2?.longitude_deg,
+  ].filter((value) => hasValidCoordinate(value));
+
+  if (!centerLatCandidates.length || !centerLonCandidates.length) {
+    return null;
+  }
+
+  const centerLat = Number(centerLatCandidates[0]);
+  const centerLon = normalizeLon(Number(centerLonCandidates[0]));
+  const latSpan = 80;
+  const lonSpan = 140;
+  const minLat = Math.max(-90, Math.min(90 - latSpan, centerLat - (latSpan / 2)));
+
+  return {
+    minLat,
+    maxLat: minLat + latSpan,
+    centerLon,
+    lonSpan,
+  };
+}
+
+function drawQsoLegend(ctx, width, height, opportunity) {
+  ctx.fillStyle = 'rgba(4, 12, 19, 0.84)';
+  ctx.fillRect(10, height - 24, 316, 16);
+
+  ctx.strokeStyle = '#2bb7ff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(18, height - 16);
+  ctx.lineTo(42, height - 16);
+  ctx.stroke();
+
+  ctx.fillStyle = '#d5e4f1';
+  ctx.font = '10px Arial';
+  ctx.fillText('TRACK', 46, height - 13);
+
+  ctx.fillStyle = '#59d66f';
+  ctx.beginPath();
+  ctx.arc(94, height - 16, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#d5e4f1';
+  ctx.fillText(opportunity.grid_1?.locator || 'GRID 1', 102, height - 13);
+
+  ctx.fillStyle = '#ffd45b';
+  ctx.beginPath();
+  ctx.arc(164, height - 16, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#d5e4f1';
+  ctx.fillText(opportunity.grid_2?.locator || 'GRID 2', 172, height - 13);
+
+  ctx.fillStyle = 'rgba(79, 163, 255, 0.18)';
+  ctx.fillRect(234, height - 20, 18, 8);
+  ctx.strokeStyle = 'rgba(110, 196, 255, 0.62)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(234, height - 20, 18, 8);
+  ctx.fillStyle = '#d5e4f1';
+  ctx.fillText('FOOTPRINT', 258, height - 13);
 }
 
 function renderRotator(result) {
@@ -2450,6 +2864,26 @@ function formatLocalDateTime(date) {
   });
 }
 
+function formatDateOnlyForTimezone(date, timezone) {
+  return date.toLocaleDateString([], {
+    month: 'numeric',
+    day: 'numeric',
+    year: '2-digit',
+    timeZone: timezone || qthTimezone,
+  });
+}
+
+function formatDateTimeForTimezone(date, timezone) {
+  return date.toLocaleString([], {
+    month: 'numeric',
+    day: 'numeric',
+    year: '2-digit',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: timezone || qthTimezone,
+  });
+}
+
 function formatLocalDateOnly(date) {
   return date.toLocaleDateString([], {
     month: 'numeric',
@@ -2460,15 +2894,19 @@ function formatLocalDateOnly(date) {
 }
 
 function formatLocalTimeRange(start, end) {
+  return formatTimeRangeForTimezone(start, end, qthTimezone);
+}
+
+function formatTimeRangeForTimezone(start, end, timezone) {
   const startParts = new Intl.DateTimeFormat('en-US', {
     hour: 'numeric',
     minute: '2-digit',
-    timeZone: qthTimezone,
+    timeZone: timezone || qthTimezone,
   }).formatToParts(start);
   const endParts = new Intl.DateTimeFormat('en-US', {
     hour: 'numeric',
     minute: '2-digit',
-    timeZone: qthTimezone,
+    timeZone: timezone || qthTimezone,
   }).formatToParts(end);
 
   const startTime = startParts.filter((part) => part.type !== 'dayPeriod').map((part) => part.value).join('').trim();
@@ -2479,6 +2917,13 @@ function formatLocalTimeRange(start, end) {
     return `${startTime} - ${endTime} ${endMeridiem}`;
   }
   return `${startTime} ${startMeridiem} - ${endTime} ${endMeridiem}`.trim();
+}
+
+function formatDisplayDateTime(value, timezone) {
+  if (!value) {
+    return '--';
+  }
+  return formatDateTimeForTimezone(new Date(value), timezone);
 }
 
 function formatAzimuthPath(pass) {
@@ -2495,6 +2940,23 @@ function formatClockForQth(date) {
     second: '2-digit',
     timeZone: qthTimezone,
   });
+}
+
+function formatDuration(totalSeconds) {
+  if (!Number.isFinite(Number(totalSeconds)) || Number(totalSeconds) < 0) {
+    return '--';
+  }
+  const seconds = Math.floor(Number(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${remainder}s`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${remainder}s`;
+  }
+  return `${remainder}s`;
 }
 
 function bindConnectivityState() {
@@ -2572,7 +3034,11 @@ loadSettings();
 loadMySatellites();
 initializePassControls();
 drawMap();
-worldMapImage.addEventListener('load', drawMap);
+worldMapImage.addEventListener('load', () => {
+  drawMap();
+  drawTrackedSatellitesMap();
+  drawQsoMap();
+});
 showPage(pageFromHash());
 window.addEventListener('hashchange', () => showPage(pageFromHash()));
 document.querySelectorAll('[data-page]').forEach((button) => {
@@ -2618,6 +3084,9 @@ document
 document
   .getElementById('my-satellite-options')
   .addEventListener('submit', saveMySatelliteOptions);
+document
+  .getElementById('qso-finder-form')
+  .addEventListener('submit', searchQsoFinder);
 document
   .getElementById('refresh-passes-btn')
   .addEventListener('click', refreshSatellitePasses);
