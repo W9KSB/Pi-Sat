@@ -167,6 +167,15 @@ body {
   background: #091320;
 }
 
+#qso-map {
+  display: block;
+  width: 100%;
+  aspect-ratio: 2;
+  border: 1px solid #32637f;
+  border-radius: 0.5rem;
+  background: #091320;
+}
+
 .track-filter {
   border: 1px solid var(--app-border);
   border-radius: 0.5rem;
@@ -650,6 +659,104 @@ dd {
   font-size: 0.78rem;
 }
 
+.qso-opportunity-list {
+  display: grid;
+  gap: 0.55rem;
+  max-height: 49rem;
+  overflow-y: auto;
+  padding-right: 0.2rem;
+}
+
+.qso-opportunity-item {
+  display: grid;
+  gap: 0.22rem;
+  padding: 0.65rem 0.7rem;
+  text-align: left;
+  border: 1px solid #283542;
+  border-radius: 0.45rem;
+  background: #0c1218;
+  color: #d4dee7;
+}
+
+.qso-opportunity-item:hover,
+.qso-opportunity-item:focus {
+  background: #122232;
+  color: #fff;
+}
+
+.qso-opportunity-item.active {
+  border-color: #4a7db7;
+  background: #16304a;
+  color: #fff;
+}
+
+.qso-opportunity-title {
+  font-weight: 700;
+  color: #f6f8fb;
+}
+
+.qso-opportunity-meta,
+.qso-opportunity-submeta {
+  color: var(--app-muted);
+  font-size: 0.8rem;
+}
+
+.qso-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.85rem;
+}
+
+.qso-duration-box {
+  grid-column: 1 / -1;
+  text-align: center;
+}
+
+.qso-station-readouts {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+}
+
+.qso-station-readouts div {
+  display: grid;
+  grid-template-columns: minmax(64px, 0.5fr) minmax(0, 1fr);
+  gap: 0.65rem;
+  align-items: center;
+}
+
+.qso-station-readouts dd {
+  margin: 0;
+  text-align: right;
+  font-size: 0.86rem;
+  font-family: "Consolas", "Courier New", monospace;
+}
+
+.qso-timezone-label {
+  margin-bottom: 0.45rem;
+  color: #d4dee7;
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
+.qso-window-summary {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.35rem 0.55rem;
+  color: #f3f6f8;
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+
+.qso-window-summary span {
+  white-space: nowrap;
+}
+
+.qso-window-separator {
+  color: var(--app-muted);
+}
+
 .settings-form {
   display: grid;
   gap: 1rem;
@@ -826,6 +933,10 @@ button:disabled {
   }
 
   .satellite-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .qso-detail-grid {
     grid-template-columns: 1fr;
   }
 

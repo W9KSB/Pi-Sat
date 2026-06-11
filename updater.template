@@ -37,7 +37,7 @@ cd "${REPO_ROOT}"
 
 sudo systemctl stop "${SERVICE_NAME}"
 git fetch --all --prune
-git pull --ff-only
+git reset --hard origin/main
 . .venv/bin/activate
 python -m pip install -r requirements.txt
 sudo systemctl daemon-reload

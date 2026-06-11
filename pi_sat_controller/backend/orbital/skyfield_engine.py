@@ -5,6 +5,7 @@ Skyfield-specific imports should stay in this module.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -35,14 +36,21 @@ class SkyfieldEngine(OrbitalEngine):
         self.satellites = self._load_satellites(tle_file)
 
     def get_position(self, norad_id: int) -> SatellitePosition:
+        return self.get_position_at(norad_id, datetime.now(timezone.utc))
+
+    def get_position_at(
+        self,
+        norad_id: int,
+        at_utc: datetime,
+    ) -> SatellitePosition:
         satellite = self.satellites.get(norad_id)
         if satellite is None:
             raise KeyError(f"NORAD {norad_id} not found in {self.tle_file}")
 
-        now = self.timescale.now()
-        geocentric = satellite.at(now)
+        instant = self.timescale.from_datetime(at_utc.astimezone(timezone.utc))
+        geocentric = satellite.at(instant)
         subpoint = wgs84.subpoint(geocentric)
-        position = (satellite - self.observer).at(now)
+        position = (satellite - self.observer).at(instant)
         altitude, azimuth, distance = position.altaz()
         _, _, _, _, _, range_rate = position.frame_latlon_and_rates(self.observer)
 
@@ -54,6 +62,50 @@ class SkyfieldEngine(OrbitalEngine):
             range_km=distance.km,
             range_rate_m_s=range_rate.km_per_s * 1000,
         )
+
+    def get_visibility_footprint(
+        self,
+        norad_id: int,
+        at_utc: datetime,
+        point_count: int = 72,
+    ) -> list[dict[str, float]]:
+        satellite = self.satellites.get(norad_id)
+        if satellite is None:
+            raise KeyError(f"NORAD {norad_id} not found in {self.tle_file}")
+
+        instant = self.timescale.from_datetime(at_utc.astimezone(timezone.utc))
+        geocentric = satellite.at(instant)
+        subpoint = wgs84.subpoint(geocentric)
+        altitude_km = max(0.0, subpoint.elevation.km)
+        earth_radius_km = 6371.0
+        if altitude_km <= 0.0:
+            return []
+
+        angular_distance_rad = math.acos(earth_radius_km / (earth_radius_km + altitude_km))
+        center_lat_rad = math.radians(subpoint.latitude.degrees)
+        center_lon_rad = math.radians(subpoint.longitude.degrees)
+        total_points = max(24, point_count)
+        points: list[dict[str, float]] = []
+
+        for index in range(total_points + 1):
+            bearing_rad = (math.tau * index) / total_points
+            latitude_rad = math.asin(
+                math.sin(center_lat_rad) * math.cos(angular_distance_rad)
+                + math.cos(center_lat_rad) * math.sin(angular_distance_rad) * math.cos(bearing_rad)
+            )
+            longitude_rad = center_lon_rad + math.atan2(
+                math.sin(bearing_rad) * math.sin(angular_distance_rad) * math.cos(center_lat_rad),
+                math.cos(angular_distance_rad) - math.sin(center_lat_rad) * math.sin(latitude_rad),
+            )
+            longitude_deg = ((math.degrees(longitude_rad) + 180) % 360) - 180
+            points.append(
+                {
+                    "latitude_deg": round(math.degrees(latitude_rad), 5),
+                    "longitude_deg": round(longitude_deg, 5),
+                }
+            )
+
+        return points
 
     def get_ground_track(
         self,
