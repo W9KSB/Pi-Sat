@@ -286,6 +286,7 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "serial_port",
         "baud",
         "model_id",
+        "cat_debug_logging",
         "write_enabled",
         "timeout_s",
         "min_elevation_deg",
@@ -478,6 +479,8 @@ def _render_settings(settings: dict[str, dict[str, str]]) -> str:
     lines.append(f"serial_port = {values['serial_port']}")
     lines.append(f"baud = {values['baud']}")
     lines.append(f"model_id = {values['model_id']}")
+    lines.append("# Enable verbose rotator/Hamlib command logging for this role.")
+    lines.append(f"cat_debug_logging = {values['cat_debug_logging']}")
     lines.append("# Enable rotator position writes. Keep false until hardware is ready.")
     lines.append(f"write_enabled = {values['write_enabled']}")
     lines.append(f"timeout_s = {values['timeout_s']}")
@@ -495,4 +498,7 @@ def _render_settings(settings: dict[str, dict[str, str]]) -> str:
 
 def _append_keys(lines: list[str], values: dict[str, str], keys: list[str]) -> None:
     for key in keys:
-        lines.append(f"{key} = {values[key]}")
+        value = values[key]
+        if key == "source_url":
+            value = _encode_source_url(value)
+        lines.append(f"{key} = {value}")

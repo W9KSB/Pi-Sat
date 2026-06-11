@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
 from threading import Event, Lock, Thread
 from typing import Any
 
 from pi_sat_controller.backend.radio.rigctld_client import PersistentRigctldClient
 from pi_sat_controller.backend.radio.radio_manager import RadioManager
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -36,8 +39,9 @@ class PollingSdrManager:
         port: int,
         timeout_s: float,
         poll_interval_s: float = 1.0,
+        debug_logging: bool = False,
     ) -> None:
-        self.client = PersistentRigctldClient(host, port, timeout_s)
+        self.client = PersistentRigctldClient(host, port, timeout_s, debug_logging)
         self.poll_interval_s = poll_interval_s
         self._stop = Event()
         self._state_lock = Lock()
@@ -48,6 +52,7 @@ class PollingSdrManager:
         self._last_read_at_utc: str | None = None
         self._last_write_at_utc: str | None = None
         self._error: str | None = None
+        self._consecutive_failures = 0
 
     def start(self) -> None:
         if self._thread is not None:
@@ -96,7 +101,10 @@ class PollingSdrManager:
     def _run(self) -> None:
         while not self._stop.is_set():
             self.poll_once()
-            self._stop.wait(self.poll_interval_s)
+            delay = self.poll_interval_s
+            if self._consecutive_failures >= 3:
+                delay = max(self.poll_interval_s, min(15.0, self.poll_interval_s * 5))
+            self._stop.wait(delay)
 
     def poll_once(self) -> None:
         with self._client_lock:
@@ -107,15 +115,23 @@ class PollingSdrManager:
                 return
 
         with self._state_lock:
+            was_connected = self._connected
             self._connected = True
             self._frequency_hz = frequency_hz
             self._last_read_at_utc = _utc_now()
             self._error = None
+            self._consecutive_failures = 0
+        if not was_connected:
+            LOGGER.info("RX polling connection restored")
 
     def _record_error(self, exc: Exception) -> None:
         with self._state_lock:
+            previous_error = self._error
             self._connected = False
             self._error = str(exc)
+            self._consecutive_failures += 1
+        if previous_error != str(exc):
+            LOGGER.warning("RX polling failed: %s", exc)
 
 
 class PollingRadioFrequencyManager:
@@ -193,7 +209,11 @@ class PollingRadioFrequencyManager:
     def _run(self) -> None:
         while not self._stop.is_set():
             self.poll_once()
-            self._stop.wait(self.poll_interval_s)
+            delay = self.poll_interval_s
+            snapshot = self.snapshot()
+            if not snapshot.connected and snapshot.error:
+                delay = max(self.poll_interval_s, min(15.0, self.poll_interval_s * 5))
+            self._stop.wait(delay)
 
     def poll_once(self) -> SdrDeviceSnapshot:
         state = self.radio_manager.poll_once()

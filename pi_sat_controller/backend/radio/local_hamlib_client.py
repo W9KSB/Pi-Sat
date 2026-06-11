@@ -137,7 +137,7 @@ class LocalHamlibClient:
         while monotonic() < deadline:
             if self._daemon.poll() is not None:
                 raise RuntimeError(f"rigctld exited early with code {self._daemon.returncode}")
-            client = PersistentRigctldClient("127.0.0.1", port, self.timeout_s)
+            client = PersistentRigctldClient("127.0.0.1", port, self.timeout_s, self.debug_logging)
             try:
                 client.connect()
             except Exception as exc:

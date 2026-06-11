@@ -9,6 +9,7 @@ tracking, orbital, and data-ingest behavior lives in the backend submodules.
 
 from collections import deque
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, time, timedelta, timezone
 import logging
 from pathlib import Path
@@ -20,6 +21,7 @@ from starlette.responses import Response
 from fastapi.staticfiles import StaticFiles
 
 from pi_sat_controller.backend.config import (
+    DeviceConfig,
     PROJECT_ROOT,
     SETTINGS_SCHEMA,
     load_config,
@@ -146,6 +148,107 @@ class DisabledTrackingSdrManager:
 
     def set_frequency(self, frequency_hz: int):
         return disabled_sdr_snapshot()
+
+
+class FailedTrackingSdrManager:
+    """Fallback RX manager used when startup cannot build the real device path."""
+
+    def __init__(self, error: str) -> None:
+        self.error = error
+
+    def start(self) -> None:
+        LOGGER.warning("RX manager unavailable: %s", self.error)
+
+    def stop(self) -> None:
+        return
+
+    def snapshot(self):
+        snapshot = disabled_sdr_snapshot()
+        return replace(
+            snapshot,
+            enabled=True,
+            error=self.error,
+        )
+
+    def set_frequency(self, frequency_hz: int):
+        raise RuntimeError(self.error)
+
+
+class FailedRadioManager:
+    """Fallback TX manager used when startup cannot build the real device path."""
+
+    def __init__(self, error: str) -> None:
+        self.error = error
+        self.client = None
+
+    def snapshot(self):
+        snapshot = disabled_radio_snapshot()
+        return replace(
+            snapshot,
+            enabled=True,
+            error=self.error,
+        )
+
+    def poll_once(self):
+        return self.snapshot()
+
+    def set_frequency(self, frequency_hz: int, source: str = ""):
+        raise RuntimeError(self.error)
+
+    def set_mode(self, mode: str, passband_hz: int = 0, source: str = ""):
+        raise RuntimeError(self.error)
+
+    def set_vfo(self, vfo: str | None, source: str = ""):
+        raise RuntimeError(self.error)
+
+
+class FailedRotatorManager:
+    """Fallback rotator manager used when startup cannot build the real device path."""
+
+    def __init__(self, error: str, enabled: bool, write_enabled: bool) -> None:
+        self.error = error
+        self.enabled = enabled
+        self.write_enabled = write_enabled
+        self.client = None
+        self._pass_active = False
+
+    def _snapshot(self):
+        return {
+            **disabled_rotator_snapshot().to_dict(),
+            "enabled": self.enabled,
+            "write_enabled": self.write_enabled,
+            "pass_active": self._pass_active,
+            "manual_controls_enabled": False,
+            "state_label": "Rotator unavailable",
+            "error": self.error,
+        }
+
+    def snapshot(self):
+        return disabled_rotator_snapshot().__class__(**self._snapshot())
+
+    def poll_once(self):
+        return self.snapshot()
+
+    def set_pass_active(
+        self,
+        active: bool,
+        target_azimuth_deg: float | None = None,
+        target_elevation_deg: float | None = None,
+    ):
+        self._pass_active = active
+        return self.snapshot()
+
+    def track_position(self, azimuth_deg: float, elevation_deg: float):
+        return self.snapshot()
+
+    def manual_position(self, azimuth_deg: float, elevation_deg: float):
+        return self.snapshot()
+
+    def send_home(self):
+        return self.snapshot()
+
+    def stop(self):
+        return self.snapshot()
 
 
 @asynccontextmanager
@@ -483,6 +586,28 @@ def reload_runtime() -> dict[str, object]:
 @app.get("/api/serial-devices")
 def get_serial_devices() -> dict[str, object]:
     return {"devices": _list_serial_devices()}
+
+
+@app.post("/api/device-tests/{role}")
+def test_device(role: str, payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+    normalized_role = role.strip().lower()
+    if normalized_role not in {"rx", "tx", "rotator"}:
+        raise HTTPException(status_code=404, detail="Unknown device role")
+    try:
+        overrides = payload.get("settings", {})
+        if not isinstance(overrides, dict):
+            raise ValueError("settings must be an object")
+        return _run_device_test(normalized_role, overrides)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        LOGGER.exception("Device test failed unexpectedly role=%s", normalized_role)
+        return {
+            "ok": False,
+            "role": normalized_role,
+            "message": "Device test failed unexpectedly.",
+            "details": {},
+        }
 
 
 @app.post("/api/device-controls")
@@ -980,25 +1105,44 @@ def _reload_runtime_config() -> None:
             debug_logging=bool(config.rx.cat_debug_logging or config.tx.cat_debug_logging),
         )
     if config.rx.enabled:
-        sdr_manager = _build_rx_manager(config.rx, shared_local_client)
-        sdr_manager.start()
+        try:
+            sdr_manager = _build_rx_manager(config.rx, shared_local_client)
+            sdr_manager.start()
+        except Exception as exc:
+            error = f"RX startup failed: {exc}"
+            LOGGER.warning(error)
+            sdr_manager = FailedTrackingSdrManager(error)
     if config.tx.enabled:
-        tx_radio_manager = RadioManager(
-            client=_build_radio_client(config.tx, "TX", shared_local_client),
-            enabled=config.tx.enabled,
-            write_enabled=config.tx.write_enabled,
-            target_vfo=config.tx.target_vfo,
-        )
+        try:
+            tx_radio_manager = RadioManager(
+                client=_build_radio_client(config.tx, "TX", shared_local_client),
+                enabled=config.tx.enabled,
+                write_enabled=config.tx.write_enabled,
+                target_vfo=config.tx.target_vfo,
+            )
+        except Exception as exc:
+            error = f"TX startup failed: {exc}"
+            LOGGER.warning(error)
+            tx_radio_manager = FailedRadioManager(error)
     if config.rotator.enabled:
-        rotator_manager = RotatorManager(
-            client=_build_rotator_client(config.rotator),
-            enabled=config.rotator.enabled,
-            write_enabled=config.rotator.write_enabled,
-            min_elevation_deg=config.rotator.min_elevation_deg or 0.0,
-            home_azimuth_deg=config.rotator.home_azimuth_deg or 0.0,
-            home_elevation_deg=config.rotator.home_elevation_deg or 0.0,
-            return_home_after_pass=config.rotator.return_home_after_pass,
-        )
+        try:
+            rotator_manager = RotatorManager(
+                client=_build_rotator_client(config.rotator),
+                enabled=config.rotator.enabled,
+                write_enabled=config.rotator.write_enabled,
+                min_elevation_deg=config.rotator.min_elevation_deg or 0.0,
+                home_azimuth_deg=config.rotator.home_azimuth_deg or 0.0,
+                home_elevation_deg=config.rotator.home_elevation_deg or 0.0,
+                return_home_after_pass=config.rotator.return_home_after_pass,
+            )
+        except Exception as exc:
+            error = f"Rotator startup failed: {exc}"
+            LOGGER.warning(error)
+            rotator_manager = FailedRotatorManager(
+                error,
+                enabled=config.rotator.enabled,
+                write_enabled=config.rotator.write_enabled,
+            )
     try:
         _ensure_pass_cache()
     except Exception:
@@ -1013,15 +1157,24 @@ def _reload_rotator_config_only() -> None:
         rotator_manager.client.close()
     rotator_manager = None
     if config.rotator.enabled:
-        rotator_manager = RotatorManager(
-            client=_build_rotator_client(config.rotator),
-            enabled=config.rotator.enabled,
-            write_enabled=config.rotator.write_enabled,
-            min_elevation_deg=config.rotator.min_elevation_deg or 0.0,
-            home_azimuth_deg=config.rotator.home_azimuth_deg or 0.0,
-            home_elevation_deg=config.rotator.home_elevation_deg or 0.0,
-            return_home_after_pass=config.rotator.return_home_after_pass,
-        )
+        try:
+            rotator_manager = RotatorManager(
+                client=_build_rotator_client(config.rotator),
+                enabled=config.rotator.enabled,
+                write_enabled=config.rotator.write_enabled,
+                min_elevation_deg=config.rotator.min_elevation_deg or 0.0,
+                home_azimuth_deg=config.rotator.home_azimuth_deg or 0.0,
+                home_elevation_deg=config.rotator.home_elevation_deg or 0.0,
+                return_home_after_pass=config.rotator.return_home_after_pass,
+            )
+        except Exception as exc:
+            error = f"Rotator startup failed: {exc}"
+            LOGGER.warning(error)
+            rotator_manager = FailedRotatorManager(
+                error,
+                enabled=config.rotator.enabled,
+                write_enabled=config.rotator.write_enabled,
+            )
     if rx_tracking_manager is not None:
         rx_tracking_manager.rotator_manager = rotator_manager
 
@@ -1033,6 +1186,7 @@ def _build_rx_manager(device_config, shared_local_client=None):
             port=device_config.port,
             timeout_s=device_config.timeout_s,
             poll_interval_s=1.0,
+            debug_logging=device_config.cat_debug_logging,
         )
     if device_config.connectivity == "local":
         client = _build_radio_client(device_config, "RX", shared_local_client)
@@ -1048,6 +1202,119 @@ def _build_rx_manager(device_config, shared_local_client=None):
     raise ValueError(f"Unsupported RX connectivity: {device_config.connectivity}")
 
 
+def _parse_bool_setting(value: Any, fallback: bool = False) -> bool:
+    text = str(value).strip().lower()
+    if not text or text in {"none", "null"}:
+        return fallback
+    return text in {"1", "yes", "true", "on"}
+
+
+def _parse_int_setting(value: Any, fallback: int | None = None) -> int | None:
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null"}:
+        return fallback
+    return int(text)
+
+
+def _parse_float_setting(value: Any, fallback: float | None = None) -> float | None:
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null"}:
+        return fallback
+    return float(text)
+
+
+def _device_config_from_settings(role: str, overrides: dict[str, Any]) -> DeviceConfig:
+    settings = load_settings()
+    section_settings = dict(settings.get(role, {}))
+    section_settings.update(
+        {str(key): "" if value is None else str(value) for key, value in overrides.items()}
+    )
+    return DeviceConfig(
+        enabled=_parse_bool_setting(section_settings.get("enabled"), False),
+        connectivity=str(section_settings.get("connectivity", "network")).strip() or "network",
+        host=str(section_settings.get("host", "")).strip(),
+        port=_parse_int_setting(section_settings.get("port"), 0) or 0,
+        serial_port=str(section_settings.get("serial_port", "")).strip(),
+        baud=_parse_int_setting(section_settings.get("baud")),
+        model_id=_parse_int_setting(section_settings.get("model_id")),
+        target_vfo=str(section_settings.get("target_vfo", "")).strip() or None,
+        write_enabled=_parse_bool_setting(section_settings.get("write_enabled"), False),
+        timeout_s=_parse_float_setting(section_settings.get("timeout_s"), 2.0) or 2.0,
+        cat_debug_logging=_parse_bool_setting(section_settings.get("cat_debug_logging"), False),
+        min_elevation_deg=_parse_float_setting(section_settings.get("min_elevation_deg")),
+        home_azimuth_deg=_parse_float_setting(section_settings.get("home_azimuth_deg")),
+        home_elevation_deg=_parse_float_setting(section_settings.get("home_elevation_deg")),
+        return_home_after_pass=_parse_bool_setting(
+            section_settings.get("return_home_after_pass"),
+            False,
+        ),
+    )
+
+
+def _device_endpoint_details(role: str, device_config: DeviceConfig) -> dict[str, object]:
+    details: dict[str, object] = {
+        "connectivity": device_config.connectivity,
+        "timeout_s": device_config.timeout_s,
+    }
+    if device_config.connectivity == "network":
+        details["host"] = device_config.host
+        details["port"] = device_config.port
+    else:
+        details["serial_port"] = device_config.serial_port
+        details["baud"] = device_config.baud
+        details["model_id"] = device_config.model_id
+        if role in {"rx", "tx"}:
+            details["target_vfo"] = device_config.target_vfo or "current"
+    return details
+
+
+def _run_device_test(role: str, overrides: dict[str, Any]) -> dict[str, object]:
+    device_config = _device_config_from_settings(role, overrides)
+    device_config = replace(
+        device_config,
+        timeout_s=min(max(float(device_config.timeout_s), 0.5), 5.0),
+    )
+    details = _device_endpoint_details(role, device_config)
+    client = None
+    try:
+        if role in {"rx", "tx"}:
+            client = _build_radio_client(device_config, role.upper())
+            frequency_hz = client.get_frequency()
+            details["frequency_hz"] = frequency_hz
+            return {
+                "ok": True,
+                "role": role,
+                "message": f"{role.upper()} test succeeded.",
+                "details": details,
+            }
+
+        client = _build_rotator_client(device_config)
+        position = client.get_position()
+        details["azimuth_deg"] = position.azimuth_deg
+        details["elevation_deg"] = position.elevation_deg
+        return {
+            "ok": True,
+            "role": role,
+            "message": "Rotator test succeeded.",
+            "details": details,
+        }
+    except Exception as exc:
+        LOGGER.warning("Device test failed role=%s error=%s", role, exc)
+        details["error"] = str(exc)
+        return {
+            "ok": False,
+            "role": role,
+            "message": f"{role.upper() if role != 'rotator' else 'Rotator'} test failed.",
+            "details": details,
+        }
+    finally:
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                LOGGER.exception("Temporary device test client cleanup failed role=%s", role)
+
+
 def _build_radio_client(device_config, role: str, shared_local_client=None):
     if device_config.connectivity == "network":
         return HamlibClient(
@@ -1055,6 +1322,7 @@ def _build_radio_client(device_config, role: str, shared_local_client=None):
             port=device_config.port,
             timeout_s=device_config.timeout_s,
             target_vfo=device_config.target_vfo,
+            debug_logging=device_config.cat_debug_logging,
         )
     if device_config.connectivity == "local":
         if not device_config.model_id:
@@ -1082,6 +1350,7 @@ def _build_rotator_client(device_config):
             host=device_config.host,
             port=device_config.port,
             timeout_s=device_config.timeout_s,
+            debug_logging=device_config.cat_debug_logging,
         )
     if device_config.connectivity == "local":
         if not device_config.model_id:
@@ -1095,6 +1364,7 @@ def _build_rotator_client(device_config):
             serial_port=device_config.serial_port,
             baud=device_config.baud,
             timeout_s=device_config.timeout_s,
+            debug_logging=device_config.cat_debug_logging,
         )
     raise ValueError(f"Unsupported rotator connectivity: {device_config.connectivity}")
 

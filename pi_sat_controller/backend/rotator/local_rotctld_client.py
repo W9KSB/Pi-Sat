@@ -20,11 +20,13 @@ class LocalRotctldClient:
         serial_port: str,
         baud: int,
         timeout_s: float = 2.0,
+        debug_logging: bool = False,
     ) -> None:
         self.model_id = model_id
         self.serial_port = serial_port
         self.baud = baud
         self.timeout_s = timeout_s
+        self.debug_logging = debug_logging
         self._lock = RLock()
         self._daemon: subprocess.Popen[str] | None = None
         self._client: RotctldClient | None = None
@@ -90,7 +92,7 @@ class LocalRotctldClient:
         while monotonic() < deadline:
             if self._daemon.poll() is not None:
                 raise RuntimeError(f"rotctld exited early with code {self._daemon.returncode}")
-            client = RotctldClient("127.0.0.1", port, self.timeout_s)
+            client = RotctldClient("127.0.0.1", port, self.timeout_s, self.debug_logging)
             try:
                 client.get_position()
             except Exception as exc:

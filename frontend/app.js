@@ -33,7 +33,7 @@ const hiddenSettingsKeys = {
   my_satellites: new Set(['autotrack_next_pass']),
   rx: new Set(['cat_debug_logging']),
   tx: new Set(['cat_debug_logging']),
-  rotator: new Set(['home_azimuth_deg', 'home_elevation_deg']),
+  rotator: new Set(['home_azimuth_deg', 'home_elevation_deg', 'cat_debug_logging']),
   tle: new Set(['cache_dir']),
   profiles: new Set(['satellites_file']),
 };
@@ -869,6 +869,10 @@ async function loadSettings() {
         fieldset.appendChild(row);
       });
 
+      if (['rx', 'tx', 'rotator'].includes(section)) {
+        fieldset.appendChild(buildDeviceTestControls(section));
+      }
+
       form.appendChild(fieldset);
     });
     applyConnectivityState();
@@ -1063,6 +1067,8 @@ async function loadMonitor() {
       String(result.settings?.rx?.cat_debug_logging || '').toLowerCase() === 'true';
     document.getElementById('monitor-tx-cat-debug').checked =
       String(result.settings?.tx?.cat_debug_logging || '').toLowerCase() === 'true';
+    document.getElementById('monitor-rotator-cat-debug').checked =
+      String(result.settings?.rotator?.cat_debug_logging || '').toLowerCase() === 'true';
     status.textContent = '';
   } catch (error) {
     status.textContent = 'Monitor load failed.';
@@ -1083,6 +1089,9 @@ async function updateMonitorDebug() {
           },
           tx: {
             cat_debug_logging: document.getElementById('monitor-tx-cat-debug').checked ? 'true' : 'false',
+          },
+          rotator: {
+            cat_debug_logging: document.getElementById('monitor-rotator-cat-debug').checked ? 'true' : 'false',
           },
         },
       }),
@@ -1152,6 +1161,97 @@ async function loadHamlibRotatorModels() {
     return result.models || [];
   } catch (error) {
     return [];
+  }
+}
+
+function buildDeviceTestControls(section) {
+  const row = document.createElement('div');
+  row.className = 'settings-section-actions';
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn btn-outline-primary btn-sm';
+  button.textContent = `Test ${formatSectionLabel(section)}`;
+  button.addEventListener('click', () => testDevice(section));
+
+  const status = document.createElement('span');
+  status.className = 'settings-section-status';
+  status.id = `test-status-${section}`;
+
+  row.append(button, status);
+  return row;
+}
+
+function collectSectionSettings(section) {
+  const form = document.getElementById('settings-form');
+  const settings = {};
+  Array.from(form.elements).forEach((element) => {
+    if (!element.name || element.type === 'checkbox') {
+      return;
+    }
+    const [elementSection, key] = element.name.split('.');
+    if (elementSection !== section) {
+      return;
+    }
+    settings[key] = element.value;
+  });
+  return settings;
+}
+
+function setDeviceTestStatus(section, message, isError = false) {
+  const status = document.getElementById(`test-status-${section}`);
+  if (!status) {
+    return;
+  }
+  status.textContent = message || '';
+  status.classList.toggle('is-error', Boolean(isError));
+}
+
+function formatDeviceTestResult(section, result) {
+  if (!result?.details) {
+    return result?.message || 'Test complete.';
+  }
+  const details = result.details;
+  if (result.ok) {
+    if ((section === 'rx' || section === 'tx') && Number.isFinite(Number(details.frequency_hz))) {
+      return `${result.message} ${Number(details.frequency_hz).toLocaleString()} Hz`;
+    }
+    if (section === 'rotator') {
+      const azimuth = Number(details.azimuth_deg);
+      const elevation = Number(details.elevation_deg);
+      if (Number.isFinite(azimuth) && Number.isFinite(elevation)) {
+        return `${result.message} Az ${azimuth.toFixed(1)} deg, El ${elevation.toFixed(1)} deg`;
+      }
+    }
+    return result.message || 'Test succeeded.';
+  }
+  const error = String(details.error || '').trim();
+  if (error) {
+    return `${result.message} ${error}`;
+  }
+  return result.message || 'Test failed.';
+}
+
+async function testDevice(section) {
+  setDeviceTestStatus(section, `Testing ${formatSectionLabel(section)}...`, false);
+  try {
+    const response = await fetch(`/api/device-tests/${section}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        settings: collectSectionSettings(section),
+      }),
+    });
+    const result = await response.json();
+    const message = response.ok
+      ? formatDeviceTestResult(section, result)
+      : (result.detail || `Test ${formatSectionLabel(section)} failed.`);
+    setDeviceTestStatus(section, message, !response.ok || !result.ok);
+    addLog(message);
+  } catch (error) {
+    const message = `Test ${formatSectionLabel(section)} failed.`;
+    setDeviceTestStatus(section, message, true);
+    addLog(message);
   }
 }
 
@@ -1376,6 +1476,16 @@ function buildSettingControl(section, key, value) {
 
   control.name = fieldName;
   row.append(labelText, control);
+  if (
+    key === 'serial_port'
+    && (section === 'rx' || section === 'tx' || section === 'rotator')
+    && control.dataset.deviceMissing === 'true'
+  ) {
+    const warning = document.createElement('span');
+    warning.className = 'settings-inline-warning';
+    warning.textContent = 'Selected device not connected.';
+    row.appendChild(warning);
+  }
   return row;
 }
 
@@ -1403,6 +1513,9 @@ function buildSerialPortSelect(value) {
     option.textContent = device.label || device.name || device.path;
     control.appendChild(option);
   });
+  if (selectedValue && !known) {
+    control.dataset.deviceMissing = 'true';
+  }
   control.value = selectedValue;
   return control;
 }
@@ -1436,6 +1549,19 @@ function buildHamlibModelSelect(value) {
   });
   control.value = selectedValue;
   return control;
+}
+
+function formatSectionLabel(section) {
+  if (section === 'rx') {
+    return 'RX';
+  }
+  if (section === 'tx') {
+    return 'TX';
+  }
+  if (section === 'rotator') {
+    return 'Rotator';
+  }
+  return section;
 }
 
 function buildHamlibRotatorModelSelect(value) {
@@ -2503,6 +2629,9 @@ document
   .addEventListener('change', updateMonitorDebug);
 document
   .getElementById('monitor-tx-cat-debug')
+  .addEventListener('change', updateMonitorDebug);
+document
+  .getElementById('monitor-rotator-cat-debug')
   .addEventListener('change', updateMonitorDebug);
 document
   .getElementById('rotator-send-button')

@@ -9,10 +9,13 @@ elevation, and can optionally send the rotator home when a tracked pass ends.
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import logging
 from threading import Lock
 from typing import Any
 
 from pi_sat_controller.backend.rotator.rotctld_client import RotctldClient
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,7 @@ class RotatorManager:
             return self.snapshot()
 
         with self._lock:
+            was_connected = self._snapshot.connected
             self._snapshot = RotatorSnapshot(
                 enabled=self.enabled,
                 write_enabled=self.write_enabled,
@@ -101,6 +105,8 @@ class RotatorManager:
                 last_write_at_utc=self._snapshot.last_write_at_utc,
                 error=None,
             )
+        if not was_connected:
+            LOGGER.info("Rotator connection restored")
         return self.snapshot()
 
     def set_pass_active(
@@ -176,6 +182,7 @@ class RotatorManager:
             return self.snapshot()
 
         with self._lock:
+            was_connected = self._snapshot.connected
             self._snapshot = _replace_snapshot(
                 self._snapshot,
                 connected=True,
@@ -184,6 +191,8 @@ class RotatorManager:
                 last_write_at_utc=_utc_now(),
                 error=None,
             )
+        if not was_connected:
+            LOGGER.info("Rotator tracking connection restored")
         return self.snapshot()
 
     def manual_position(self, azimuth_deg: float, elevation_deg: float) -> RotatorSnapshot:
@@ -217,6 +226,7 @@ class RotatorManager:
             return self.snapshot()
 
         with self._lock:
+            was_connected = self._snapshot.connected
             self._snapshot = _replace_snapshot(
                 self._snapshot,
                 connected=True,
@@ -228,6 +238,8 @@ class RotatorManager:
                 last_write_at_utc=_utc_now(),
                 error=None,
             )
+        if not was_connected:
+            LOGGER.info("Rotator manual connection restored")
         return self.snapshot()
 
     def send_home(self) -> RotatorSnapshot:
@@ -242,20 +254,26 @@ class RotatorManager:
             self._set_error(str(exc))
             return self.snapshot()
         with self._lock:
+            was_connected = self._snapshot.connected
             self._snapshot = _replace_snapshot(
                 self._snapshot,
                 connected=True,
                 error=None,
             )
+        if not was_connected:
+            LOGGER.info("Rotator stop connection restored")
         return self.snapshot()
 
     def _set_error(self, error: str) -> None:
         with self._lock:
+            previous_error = self._snapshot.error
             self._snapshot = _replace_snapshot(
                 self._snapshot,
                 connected=False,
                 error=error,
             )
+        if previous_error != error:
+            LOGGER.warning("Rotator operation failed: %s", error)
 
 
 def disabled_rotator_snapshot() -> RotatorSnapshot:
