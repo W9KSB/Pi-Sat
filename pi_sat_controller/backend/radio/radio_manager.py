@@ -78,10 +78,13 @@ class RadioManager:
                 self._record_error(exc)
                 raise
 
+            was_connected = self._connected
             self._connected = True
             self._frequency_hz = frequency_hz
             self._last_read_at_utc = _utc_now()
             self._error = None
+        if not was_connected:
+            LOGGER.info("Radio connection restored")
         return frequency_hz
 
     def set_frequency(
@@ -106,10 +109,13 @@ class RadioManager:
                 self._record_error(exc)
                 raise
 
+            was_connected = self._connected
             self._connected = True
             self._frequency_hz = frequency_hz
             self._last_write_at_utc = _utc_now()
             self._error = None
+        if not was_connected:
+            LOGGER.info("Radio write connection restored")
         return self.snapshot()
 
     def set_mode(
@@ -137,10 +143,13 @@ class RadioManager:
                 self._record_error(exc)
                 raise
 
+            was_connected = self._connected
             self._connected = True
             self._mode = normalized_mode
             self._last_write_at_utc = _utc_now()
             self._error = None
+        if not was_connected:
+            LOGGER.info("Radio mode connection restored")
         return self.snapshot()
 
     def set_vfo(self, vfo: str | None, source: str = "") -> RadioDeviceSnapshot:
@@ -162,10 +171,13 @@ class RadioManager:
                 self._record_error(exc)
                 raise
 
+            was_connected = self._connected
             self._connected = True
             self._vfo = normalized_vfo
             self._last_write_at_utc = _utc_now()
             self._error = None
+        if not was_connected:
+            LOGGER.info("Radio VFO connection restored")
         return self.snapshot()
 
     def poll_once(self) -> RadioDeviceSnapshot:
@@ -177,8 +189,11 @@ class RadioManager:
 
     def _record_error(self, exc: Exception) -> None:
         with self._lock:
+            previous_error = self._error
             self._connected = False
             self._error = str(exc)
+        if previous_error != str(exc):
+            LOGGER.warning("Radio operation failed: %s", exc)
 
 
 def disabled_radio_snapshot() -> RadioDeviceSnapshot:

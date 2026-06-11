@@ -759,6 +759,29 @@ dd {
   min-width: 11rem;
 }
 
+.settings-section-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  min-height: 2.25rem;
+}
+
+.settings-section-status {
+  color: var(--app-muted);
+  font-size: 0.82rem;
+}
+
+.settings-section-status.is-error {
+  color: #f3a6a6;
+}
+
+.settings-inline-warning {
+  color: #f3a6a6;
+  font-size: 0.78rem;
+}
+
 button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
