@@ -783,6 +783,74 @@ dd {
   font-weight: 700;
 }
 
+.advanced-settings {
+  border: 1px solid var(--app-border);
+  border-radius: 0.5rem;
+  background: #111820;
+  overflow: hidden;
+}
+
+.advanced-settings-summary {
+  cursor: pointer;
+  padding: 0.95rem 1rem;
+  color: #fff;
+  font-size: 0.95rem;
+  font-weight: 700;
+  list-style: none;
+}
+
+.advanced-settings-summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-settings-summary::before {
+  content: '>';
+  display: inline-block;
+  margin-right: 0.55rem;
+  color: #9ecbff;
+  transition: transform 0.15s ease;
+}
+
+.advanced-settings[open] .advanced-settings-summary::before {
+  transform: rotate(90deg);
+}
+
+.advanced-settings-content {
+  display: grid;
+  gap: 0;
+  padding: 0 1rem 1rem;
+}
+
+.advanced-settings-item {
+  display: grid;
+  grid-template-columns: minmax(240px, 360px) minmax(0, 1fr);
+  gap: 1rem 1.25rem;
+  align-items: start;
+  padding: 0.85rem 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.advanced-settings-item:first-child {
+  border-top: 0;
+}
+
+.advanced-settings-control {
+  width: 100%;
+  justify-self: stretch;
+}
+
+.advanced-settings-control .form-label {
+  max-width: none;
+}
+
+.advanced-settings-description {
+  align-self: center;
+  color: var(--app-muted);
+  font-size: 0.83rem;
+  line-height: 1.45;
+  max-width: 60rem;
+}
+
 .settings-row {
   display: grid;
   gap: 0.35rem;
@@ -901,6 +969,10 @@ button:disabled {
 
   .sync-toggle {
     justify-content: flex-start;
+  }
+
+  .advanced-settings-item {
+    grid-template-columns: 1fr;
   }
 
   .pass-panel,

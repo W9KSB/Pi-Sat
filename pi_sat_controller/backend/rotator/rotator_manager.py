@@ -16,6 +16,7 @@ from typing import Any
 from pi_sat_controller.backend.rotator.rotctld_client import RotctldClient
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_FAILURE_THRESHOLD = 3
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class RotatorManager:
         home_azimuth_deg: float = 0.0,
         home_elevation_deg: float = 0.0,
         return_home_after_pass: bool = False,
+        failure_threshold: int = DEFAULT_FAILURE_THRESHOLD,
     ) -> None:
         self.client = client
         self.enabled = enabled
@@ -74,6 +76,8 @@ class RotatorManager:
             last_write_at_utc=None,
             error=None,
         )
+        self._consecutive_failures = 0
+        self._failure_threshold = max(1, int(failure_threshold))
 
     def snapshot(self) -> RotatorSnapshot:
         with self._lock:
@@ -105,6 +109,7 @@ class RotatorManager:
                 last_write_at_utc=self._snapshot.last_write_at_utc,
                 error=None,
             )
+            self._consecutive_failures = 0
         if not was_connected:
             LOGGER.info("Rotator connection restored")
         return self.snapshot()
@@ -191,6 +196,7 @@ class RotatorManager:
                 last_write_at_utc=_utc_now(),
                 error=None,
             )
+            self._consecutive_failures = 0
         if not was_connected:
             LOGGER.info("Rotator tracking connection restored")
         return self.snapshot()
@@ -238,6 +244,7 @@ class RotatorManager:
                 last_write_at_utc=_utc_now(),
                 error=None,
             )
+            self._consecutive_failures = 0
         if not was_connected:
             LOGGER.info("Rotator manual connection restored")
         return self.snapshot()
@@ -260,12 +267,16 @@ class RotatorManager:
                 connected=True,
                 error=None,
             )
+            self._consecutive_failures = 0
         if not was_connected:
             LOGGER.info("Rotator stop connection restored")
         return self.snapshot()
 
     def _set_error(self, error: str) -> None:
         with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures < self._failure_threshold:
+                return
             previous_error = self._snapshot.error
             self._snapshot = _replace_snapshot(
                 self._snapshot,

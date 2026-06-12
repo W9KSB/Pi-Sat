@@ -10,6 +10,7 @@ from pi_sat_controller.backend.radio.rigctld_client import PersistentRigctldClie
 from pi_sat_controller.backend.radio.radio_manager import RadioManager
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_FAILURE_THRESHOLD = 3
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class PollingSdrManager:
         timeout_s: float,
         poll_interval_s: float = 1.0,
         debug_logging: bool = False,
+        failure_threshold: int = DEFAULT_FAILURE_THRESHOLD,
     ) -> None:
         self.client = PersistentRigctldClient(host, port, timeout_s, debug_logging)
         self.poll_interval_s = poll_interval_s
@@ -53,6 +55,7 @@ class PollingSdrManager:
         self._last_write_at_utc: str | None = None
         self._error: str | None = None
         self._consecutive_failures = 0
+        self._failure_threshold = max(1, int(failure_threshold))
 
     def start(self) -> None:
         if self._thread is not None:
@@ -98,11 +101,19 @@ class PollingSdrManager:
             self._error = None
         return self.snapshot()
 
+    def try_set_frequency(self, frequency_hz: int) -> SdrDeviceSnapshot:
+        try:
+            return self.set_frequency(frequency_hz)
+        except ValueError:
+            raise
+        except Exception:
+            return self.snapshot()
+
     def _run(self) -> None:
         while not self._stop.is_set():
             self.poll_once()
             delay = self.poll_interval_s
-            if self._consecutive_failures >= 3:
+            if self._consecutive_failures >= self._failure_threshold:
                 delay = max(self.poll_interval_s, min(15.0, self.poll_interval_s * 5))
             self._stop.wait(delay)
 
@@ -126,10 +137,12 @@ class PollingSdrManager:
 
     def _record_error(self, exc: Exception) -> None:
         with self._state_lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures < self._failure_threshold:
+                return
             previous_error = self._error
             self._connected = False
             self._error = str(exc)
-            self._consecutive_failures += 1
         if previous_error != str(exc):
             LOGGER.warning("RX polling failed: %s", exc)
 
@@ -184,6 +197,20 @@ class PollingRadioFrequencyManager:
             error=state.error,
         )
 
+    def try_set_frequency(self, frequency_hz: int) -> SdrDeviceSnapshot:
+        state = self.radio_manager.try_set_frequency(
+            frequency_hz,
+            source="rx_tracking",
+        )
+        return SdrDeviceSnapshot(
+            enabled=state.enabled,
+            connected=state.connected,
+            frequency_hz=state.frequency_hz,
+            last_read_at_utc=state.last_read_at_utc,
+            last_write_at_utc=state.last_write_at_utc,
+            error=state.error,
+        )
+
     def set_mode(self, mode: str, source: str = "") -> SdrDeviceSnapshot:
         state = self.radio_manager.set_mode(mode, source=source)
         return SdrDeviceSnapshot(
@@ -195,8 +222,30 @@ class PollingRadioFrequencyManager:
             error=state.error,
         )
 
+    def try_set_mode(self, mode: str, source: str = "") -> SdrDeviceSnapshot:
+        state = self.radio_manager.try_set_mode(mode, source=source)
+        return SdrDeviceSnapshot(
+            enabled=state.enabled,
+            connected=state.connected,
+            frequency_hz=state.frequency_hz,
+            last_read_at_utc=state.last_read_at_utc,
+            last_write_at_utc=state.last_write_at_utc,
+            error=state.error,
+        )
+
     def set_vfo(self, vfo: str | None, source: str = "") -> SdrDeviceSnapshot:
         state = self.radio_manager.set_vfo(vfo, source=source)
+        return SdrDeviceSnapshot(
+            enabled=state.enabled,
+            connected=state.connected,
+            frequency_hz=state.frequency_hz,
+            last_read_at_utc=state.last_read_at_utc,
+            last_write_at_utc=state.last_write_at_utc,
+            error=state.error,
+        )
+
+    def try_set_vfo(self, vfo: str | None, source: str = "") -> SdrDeviceSnapshot:
+        state = self.radio_manager.try_set_vfo(vfo, source=source)
         return SdrDeviceSnapshot(
             enabled=state.enabled,
             connected=state.connected,

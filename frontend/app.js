@@ -30,9 +30,11 @@ let groundTrackFetchedAtMs = 0;
 let qsoFinderResult = null;
 let qsoOpportunities = [];
 let selectedQsoOpportunityIndex = -1;
+const PAGE_NAMES = ['home', 'satellites', 'qso-finder', 'monitor', 'map', 'settings'];
 const MAP_REFRESH_TIMEOUT_MS = 5000;
 const hiddenSettingsKeys = {
   server: new Set(['host', 'port', 'gui_resources_caching']),
+  station: new Set(['latitude_deg', 'longitude_deg']),
   my_satellites: new Set(['autotrack_next_pass']),
   rx: new Set(['cat_debug_logging']),
   tx: new Set(['cat_debug_logging']),
@@ -48,6 +50,26 @@ const lastLoggedErrors = {
 };
 const worldMapImage = new Image();
 worldMapImage.src = '/assets/world-map-equirectangular.png';
+const ADVANCED_SETTING_DESCRIPTIONS = {
+  tx_inhibit_below_horizon: 'Prevents transmit control when the tracked satellite is below the horizon.',
+  tx_inhibit_on_cat_loss: 'Stops TX-side control when CAT communication with the transmit device is lost.',
+  tx_inhibit_without_valid_pass: 'Blocks TX-side control unless the current tracking state is tied to a valid computed pass.',
+  frequency_deadband_hz: 'Minimum frequency change required before a new CAT tuning command is sent.',
+  cat_rate_limit_hz: 'Maximum number of CAT control updates per second sent to the live device path while tracking.',
+  tracking_update_interval_ms: 'How often the tracking loop recalculates satellite position, Doppler, and control targets.',
+  device_offline_failure_threshold: 'How many consecutive device failures must happen before RX, TX, SDR, or rotator is marked offline.',
+};
+const STANDARD_PAGE_NAV = PAGE_NAMES.map((page) => {
+  const labelByPage = {
+    home: 'Home',
+    satellites: 'Satellites',
+    'qso-finder': 'QSO Finder',
+    monitor: 'Monitor',
+    map: 'Map',
+    settings: 'Settings',
+  };
+  return `<button type="button" class="btn btn-outline-primary nav-button" data-page="${page}">${labelByPage[page]}</button>`;
+}).join('');
 
 function addLog(message) {
   if (!message) {
@@ -119,22 +141,57 @@ function formatLogMessage(entry) {
   return `${level}${entry.message || ''}`;
 }
 
-async function refreshMonitorLogs() {
+async function fetchJson(url, fallback) {
   try {
-    const response = await fetch('/api/monitor/logs');
-    const result = await response.json();
-    backendLogMessages = Array.isArray(result.entries)
-      ? result.entries.map((entry) => ({
-        timestampMs: Number(entry.timestamp_ms) || 0,
-        message: entry.message || '',
-        level: entry.level || '',
-        source: entry.source || 'backend',
-      }))
-      : [];
-    renderLogs();
+    const response = await fetch(url);
+    return await response.json();
   } catch (error) {
-    // Keep the last successful log snapshot if monitor refresh fails.
+    return fallback;
   }
+}
+
+function renderStandardPageHeaders() {
+  document.querySelectorAll('.standard-page-header').forEach((header) => {
+    const title = header.dataset.pageTitle || '';
+    const subtitle = header.dataset.pageSubtitle || '';
+    header.innerHTML = `
+      <div class="card-body">
+        <div class="row align-items-center g-3">
+          <div class="col-12 col-lg-4">
+            <div class="brand-lockup">
+              <img class="brand-satellite" src="/assets/pi-sat-satellite.png" alt="" aria-hidden="true">
+              <div>
+                <h1 class="h3 mb-0">${escapeHtml(title)}</h1>
+                <p class="text-body-secondary mb-0">${escapeHtml(subtitle)}</p>
+              </div>
+            </div>
+          </div>
+          <div class="col-12 col-lg-4">
+            <nav class="nav nav-pills justify-content-lg-center gap-2" aria-label="Primary navigation">
+              ${STANDARD_PAGE_NAV}
+            </nav>
+          </div>
+          <div class="col-12 col-lg-4"></div>
+        </div>
+      </div>
+    `;
+  });
+}
+
+async function refreshMonitorLogs() {
+  const result = await fetchJson('/api/monitor/logs', null);
+  if (!result) {
+    return;
+  }
+  backendLogMessages = Array.isArray(result.entries)
+    ? result.entries.map((entry) => ({
+      timestampMs: Number(entry.timestamp_ms) || 0,
+      message: entry.message || '',
+      level: entry.level || '',
+      source: entry.source || 'backend',
+    }))
+    : [];
+  renderLogs();
 }
 
 async function loadStatus() {
@@ -162,7 +219,7 @@ async function loadStatus() {
 }
 
 function showPage(pageName) {
-  const selectedPage = ['home', 'satellites', 'qso-finder', 'monitor', 'map', 'settings'].includes(pageName)
+  const selectedPage = PAGE_NAMES.includes(pageName)
     ? pageName
     : 'home';
   document.querySelectorAll('[data-page-view]').forEach((view) => {
@@ -183,13 +240,38 @@ function showPage(pageName) {
     loadTrackedSatelliteLocations();
     drawTrackedSatellitesMap();
   } else {
+    loadSdrFrequency();
+    loadTracking(true);
+    loadRotator();
     drawMap();
   }
 }
 
 function pageFromHash() {
   const page = window.location.hash.replace('#', '');
-  return ['home', 'satellites', 'qso-finder', 'monitor', 'map', 'settings'].includes(page) ? page : 'home';
+  return PAGE_NAMES.includes(page) ? page : 'home';
+}
+
+function isDocumentVisible() {
+  return document.visibilityState === 'visible';
+}
+
+function refreshVisibleGuiOnly() {
+  if (!isDocumentVisible()) {
+    return;
+  }
+  const currentPage = pageFromHash();
+  if (currentPage === 'monitor') {
+    refreshMonitorLogs();
+    return;
+  }
+  if (currentPage === 'map') {
+    loadTrackedSatelliteLocations();
+    return;
+  }
+  if (currentPage === 'home') {
+    drawMap();
+  }
 }
 
 async function loadSatellites() {
@@ -893,6 +975,15 @@ function getSelectedQsoOpportunity() {
   return qsoOpportunities[selectedQsoOpportunityIndex];
 }
 
+function setTextValues(values) {
+  Object.entries(values).forEach(([id, value]) => {
+    const element = document.getElementById(id);
+    if (element) {
+      element.textContent = value;
+    }
+  });
+}
+
 function renderQsoDetails() {
   const selectedSatellite = document.getElementById('qso-selected-satellite');
   const overlapSummary = document.getElementById('qso-overlap-summary');
@@ -904,21 +995,23 @@ function renderQsoDetails() {
   if (!opportunity) {
     selectedSatellite.textContent = 'No overlap selected.';
     overlapSummary.textContent = 'No overlap selected.';
-    document.getElementById('qso-grid-1-title').textContent = 'Grid 1';
-    document.getElementById('qso-grid-2-title').textContent = 'Grid 2';
-    document.getElementById('qso-grid-1-timezone').textContent = '--';
-    document.getElementById('qso-grid-2-timezone').textContent = '--';
-    document.getElementById('qso-grid-1-start').textContent = '--';
-    document.getElementById('qso-grid-1-end').textContent = '--';
-    document.getElementById('qso-grid-1-peak').textContent = '--';
-    document.getElementById('qso-grid-2-start').textContent = '--';
-    document.getElementById('qso-grid-2-end').textContent = '--';
-    document.getElementById('qso-grid-2-peak').textContent = '--';
-    document.getElementById('qso-window-start-local').textContent = 'Start Local --';
-    document.getElementById('qso-window-start-utc').textContent = 'Start UTC --';
-    document.getElementById('qso-window-end-local').textContent = 'Stop Local --';
-    document.getElementById('qso-window-end-utc').textContent = 'Stop UTC --';
-    document.getElementById('qso-duration').textContent = 'Duration --';
+    setTextValues({
+      'qso-grid-1-title': 'Grid 1',
+      'qso-grid-2-title': 'Grid 2',
+      'qso-grid-1-timezone': '--',
+      'qso-grid-2-timezone': '--',
+      'qso-grid-1-start': '--',
+      'qso-grid-1-end': '--',
+      'qso-grid-1-peak': '--',
+      'qso-grid-2-start': '--',
+      'qso-grid-2-end': '--',
+      'qso-grid-2-peak': '--',
+      'qso-window-start-local': 'Start Local --',
+      'qso-window-start-utc': 'Start UTC --',
+      'qso-window-end-local': 'Stop Local --',
+      'qso-window-end-utc': 'Stop UTC --',
+      'qso-duration': 'Duration --',
+    });
     return;
   }
 
@@ -929,21 +1022,23 @@ function renderQsoDetails() {
 
   selectedSatellite.textContent = `${opportunity.satellite_name} (${opportunity.norad_id})`;
   overlapSummary.textContent = `${formatDateOnlyForTimezone(overlapStart, 'UTC')}  ${formatTimeRangeForTimezone(overlapStart, overlapEnd, 'UTC')} UTC`;
-  document.getElementById('qso-grid-1-title').textContent = opportunity.grid_1?.locator || 'Grid 1';
-  document.getElementById('qso-grid-2-title').textContent = opportunity.grid_2?.locator || 'Grid 2';
-  document.getElementById('qso-grid-1-timezone').textContent = grid1Pass.timezone || '--';
-  document.getElementById('qso-grid-2-timezone').textContent = grid2Pass.timezone || '--';
-  document.getElementById('qso-grid-1-start').textContent = formatDisplayDateTime(grid1Pass.aos_utc, grid1Pass.timezone);
-  document.getElementById('qso-grid-1-end').textContent = formatDisplayDateTime(grid1Pass.los_utc, grid1Pass.timezone);
-  document.getElementById('qso-grid-1-peak').textContent = formatNumber(grid1Pass.max_elevation_deg, 1, ' deg');
-  document.getElementById('qso-grid-2-start').textContent = formatDisplayDateTime(grid2Pass.aos_utc, grid2Pass.timezone);
-  document.getElementById('qso-grid-2-end').textContent = formatDisplayDateTime(grid2Pass.los_utc, grid2Pass.timezone);
-  document.getElementById('qso-grid-2-peak').textContent = formatNumber(grid2Pass.max_elevation_deg, 1, ' deg');
-  document.getElementById('qso-window-start-local').textContent = `Start Local ${formatDateTimeForTimezone(overlapStart, qthTimezone)}`;
-  document.getElementById('qso-window-start-utc').textContent = `Start UTC ${formatDateTimeForTimezone(overlapStart, 'UTC')}`;
-  document.getElementById('qso-window-end-local').textContent = `Stop Local ${formatDateTimeForTimezone(overlapEnd, qthTimezone)}`;
-  document.getElementById('qso-window-end-utc').textContent = `Stop UTC ${formatDateTimeForTimezone(overlapEnd, 'UTC')}`;
-  document.getElementById('qso-duration').textContent = `Duration ${formatDuration(opportunity.overlap_duration_seconds)}`;
+  setTextValues({
+    'qso-grid-1-title': opportunity.grid_1?.locator || 'Grid 1',
+    'qso-grid-2-title': opportunity.grid_2?.locator || 'Grid 2',
+    'qso-grid-1-timezone': grid1Pass.timezone || '--',
+    'qso-grid-2-timezone': grid2Pass.timezone || '--',
+    'qso-grid-1-start': formatDisplayDateTime(grid1Pass.aos_utc, grid1Pass.timezone),
+    'qso-grid-1-end': formatDisplayDateTime(grid1Pass.los_utc, grid1Pass.timezone),
+    'qso-grid-1-peak': formatNumber(grid1Pass.max_elevation_deg, 1, ' deg'),
+    'qso-grid-2-start': formatDisplayDateTime(grid2Pass.aos_utc, grid2Pass.timezone),
+    'qso-grid-2-end': formatDisplayDateTime(grid2Pass.los_utc, grid2Pass.timezone),
+    'qso-grid-2-peak': formatNumber(grid2Pass.max_elevation_deg, 1, ' deg'),
+    'qso-window-start-local': `Start Local ${formatDateTimeForTimezone(overlapStart, qthTimezone)}`,
+    'qso-window-start-utc': `Start UTC ${formatDateTimeForTimezone(overlapStart, 'UTC')}`,
+    'qso-window-end-local': `Stop Local ${formatDateTimeForTimezone(overlapEnd, qthTimezone)}`,
+    'qso-window-end-utc': `Stop UTC ${formatDateTimeForTimezone(overlapEnd, 'UTC')}`,
+    'qso-duration': `Duration ${formatDuration(opportunity.overlap_duration_seconds)}`,
+  });
 }
 
 function drawQsoMap() {
@@ -1269,19 +1364,9 @@ async function loadSettings() {
       if (!visibleKeys.length) {
         return;
       }
-      const fieldset = document.createElement('fieldset');
-      const legend = document.createElement('legend');
-      legend.textContent = section;
-      fieldset.appendChild(legend);
-
-      visibleKeys.forEach((key) => {
-        const row = buildSettingControl(
-          section,
-          key,
-          result.settings[section][key] ?? ''
-        );
-        fieldset.appendChild(row);
-      });
+      const fieldset = section === 'safety'
+        ? buildAdvancedSettingsSection(visibleKeys, result.settings[section] || {})
+        : buildSettingsSection(section, visibleKeys, result.settings[section] || {});
 
       if (['rx', 'tx', 'rotator'].includes(section)) {
         fieldset.appendChild(buildDeviceTestControls(section));
@@ -1297,24 +1382,63 @@ async function loadSettings() {
   }
 }
 
+function buildSettingsSection(section, visibleKeys, sectionSettings) {
+  const fieldset = document.createElement('fieldset');
+  const legend = document.createElement('legend');
+  legend.textContent = formatSectionLegend(section);
+  fieldset.appendChild(legend);
+
+  visibleKeys.forEach((key) => {
+    const row = buildSettingControl(
+      section,
+      key,
+      sectionSettings[key] ?? ''
+    );
+    fieldset.appendChild(row);
+  });
+
+  return fieldset;
+}
+
+function buildAdvancedSettingsSection(visibleKeys, sectionSettings) {
+  const details = document.createElement('details');
+  details.className = 'advanced-settings';
+
+  const summary = document.createElement('summary');
+  summary.className = 'advanced-settings-summary';
+  summary.textContent = 'Advanced Settings';
+  details.appendChild(summary);
+
+  const content = document.createElement('div');
+  content.className = 'advanced-settings-content';
+
+  visibleKeys.forEach((key) => {
+    const item = document.createElement('div');
+    item.className = 'advanced-settings-item';
+
+    const control = buildSettingControl('safety', key, sectionSettings[key] ?? '');
+    control.classList.add('advanced-settings-control');
+
+    const description = document.createElement('div');
+    description.className = 'advanced-settings-description';
+    description.textContent = ADVANCED_SETTING_DESCRIPTIONS[key] || '';
+
+    item.append(control, description);
+    content.appendChild(item);
+  });
+
+  details.appendChild(content);
+  return details;
+}
+
 async function loadHamlibRadioModels() {
-  try {
-    const response = await fetch('/api/hamlib/radio-models');
-    const result = await response.json();
-    return result.models || [];
-  } catch (error) {
-    return [];
-  }
+  const result = await fetchJson('/api/hamlib/radio-models', null);
+  return result?.models || [];
 }
 
 async function loadSerialDevices() {
-  try {
-    const response = await fetch('/api/serial-devices');
-    const result = await response.json();
-    return result.devices || [];
-  } catch (error) {
-    return [];
-  }
+  const result = await fetchJson('/api/serial-devices', null);
+  return result?.devices || [];
 }
 
 function ensureManagedSatelliteSelection() {
@@ -1569,13 +1693,8 @@ function buildFrequencyProfileList(profiles) {
 }
 
 async function loadHamlibRotatorModels() {
-  try {
-    const response = await fetch('/api/hamlib/rotator-models');
-    const result = await response.json();
-    return result.models || [];
-  } catch (error) {
-    return [];
-  }
+  const result = await fetchJson('/api/hamlib/rotator-models', null);
+  return result?.models || [];
 }
 
 function buildDeviceTestControls(section) {
@@ -1868,6 +1987,19 @@ function buildSettingControl(section, key, value) {
     control = buildHamlibRotatorModelSelect(value);
   } else if (key === 'target_vfo' && (section === 'rx' || section === 'tx')) {
     control = buildVfoSelect(value);
+  } else if (section === 'station' && key === 'grid_locator') {
+    control = document.createElement('input');
+    control.className = 'form-control compact-input';
+    control.value = String(value || '').toUpperCase();
+    control.maxLength = 6;
+    control.placeholder = 'EN91GD';
+    row.classList.add('settings-row-compact-md');
+    control.addEventListener('input', () => {
+      control.value = control.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+    });
+  } else if (section === 'safety' && key === 'device_offline_failure_threshold') {
+    control = buildFailureThresholdSelect(value);
+    row.classList.add(compactRowClassForKey(key));
   } else if (section === 'tle' && key === 'source_url') {
     control = document.createElement('textarea');
     control.className = 'form-control multiline-setting';
@@ -1901,6 +2033,20 @@ function buildSettingControl(section, key, value) {
     row.appendChild(warning);
   }
   return row;
+}
+
+function buildFailureThresholdSelect(value) {
+  const control = document.createElement('select');
+  control.className = 'form-select compact-input';
+  const selectedValue = String(value || '3');
+  for (let threshold = 1; threshold <= 10; threshold += 1) {
+    const option = document.createElement('option');
+    option.value = String(threshold);
+    option.textContent = String(threshold);
+    control.appendChild(option);
+  }
+  control.value = /^[1-9]$|^10$/.test(selectedValue) ? selectedValue : '3';
+  return control;
 }
 
 function buildSerialPortSelect(value) {
@@ -1976,6 +2122,13 @@ function formatSectionLabel(section) {
     return 'Rotator';
   }
   return section;
+}
+
+function formatSectionLegend(section) {
+  if (section === 'safety') {
+    return 'Advanced Settings';
+  }
+  return formatSectionLabel(section);
 }
 
 function buildHamlibRotatorModelSelect(value) {
@@ -2134,13 +2287,12 @@ function isNumericSetting(key) {
     || key === 'baud'
     || key === 'model_id'
     || key === 'timeout_s'
-    || key === 'latitude_deg'
-    || key === 'longitude_deg'
     || key === 'elevation_m'
     || key === 'stale_after_hours'
     || key === 'frequency_deadband_hz'
     || key === 'cat_rate_limit_hz'
     || key === 'tracking_update_interval_ms'
+    || key === 'device_offline_failure_threshold'
     || key === 'min_elevation_deg';
 }
 
@@ -2154,10 +2306,10 @@ function compactRowClassForKey(key) {
   if (key === 'stale_after_hours' || key === 'timeout_s' || key === 'min_elevation_deg') {
     return 'settings-row-compact-sm';
   }
-  if (key === 'port' || key === 'baud' || key === 'model_id' || key === 'tracking_update_interval_ms') {
+  if (key === 'port' || key === 'baud' || key === 'model_id' || key === 'tracking_update_interval_ms' || key === 'device_offline_failure_threshold') {
     return 'settings-row-compact-md';
   }
-  if (key === 'latitude_deg' || key === 'longitude_deg' || key === 'elevation_m' || key === 'frequency_deadband_hz' || key === 'cat_rate_limit_hz') {
+  if (key === 'grid_locator' || key === 'elevation_m' || key === 'frequency_deadband_hz' || key === 'cat_rate_limit_hz') {
     return 'settings-row-compact-lg';
   }
   return 'settings-row-compact-md';
@@ -2172,6 +2324,7 @@ function formatSettingLabel(key) {
     serial_port: 'Serial Port',
     write_enabled: 'Write Enabled',
     timeout_s: 'Timeout (s)',
+    grid_locator: 'Grid Locator',
     latitude_deg: 'Latitude (deg)',
     longitude_deg: 'Longitude (deg)',
     elevation_m: 'Elevation (m)',
@@ -2185,6 +2338,7 @@ function formatSettingLabel(key) {
     cat_debug_logging: 'CAT Debug Logging',
     target_vfo: 'Target VFO',
     tracking_update_interval_ms: 'Tracking Update Interval (ms)',
+    device_offline_failure_threshold: 'Number of Failures Before Device Is Marked Offline',
     tx_inhibit_below_horizon: 'TX Inhibit Below Horizon',
     tx_inhibit_on_cat_loss: 'TX Inhibit On CAT Loss',
     tx_inhibit_without_valid_pass: 'TX Inhibit Without Valid Pass',
@@ -3039,8 +3193,14 @@ worldMapImage.addEventListener('load', () => {
   drawTrackedSatellitesMap();
   drawQsoMap();
 });
+renderStandardPageHeaders();
 showPage(pageFromHash());
 window.addEventListener('hashchange', () => showPage(pageFromHash()));
+document.addEventListener('visibilitychange', () => {
+  if (isDocumentVisible()) {
+    refreshVisibleGuiOnly();
+  }
+});
 document.querySelectorAll('[data-page]').forEach((button) => {
   button.addEventListener('click', () => {
     window.location.hash = button.dataset.page;
@@ -3113,10 +3273,18 @@ setInterval(loadTracking, 1000);
 setInterval(loadRotator, 2000);
 setInterval(loadPasses, 60000);
 setInterval(checkAutotrackNextPass, 1000);
-setInterval(drawMap, 10000);
-setInterval(loadTrackedSatelliteLocations, 10000);
 setInterval(() => {
-  if (pageFromHash() === 'monitor') {
+  if (isDocumentVisible() && pageFromHash() === 'home') {
+    drawMap();
+  }
+}, 10000);
+setInterval(() => {
+  if (isDocumentVisible() && pageFromHash() === 'map') {
+    loadTrackedSatelliteLocations();
+  }
+}, 10000);
+setInterval(() => {
+  if (isDocumentVisible() && pageFromHash() === 'monitor') {
     refreshMonitorLogs();
   }
 }, 5000);
