@@ -199,11 +199,10 @@ class RxTrackingManager:
         commanded_rx_hz = self._last_commanded_rx_hz
         errors: list[str] = []
         if write_rx:
-            try:
-                self._ensure_rx_session_state()
-                self.sdr_manager.set_frequency(plan.downlink_hz)
-            except Exception as exc:
-                errors.append(str(exc))
+            self._ensure_rx_session_state(errors)
+            sdr_state = self.sdr_manager.try_set_frequency(plan.downlink_hz)
+            if sdr_state.error:
+                errors.append(sdr_state.error)
             else:
                 commanded_rx_hz = plan.downlink_hz
                 with self._lock:
@@ -211,14 +210,13 @@ class RxTrackingManager:
                     self._last_commanded_at = monotonic()
 
         if not self._rx_only and plan.uplink_hz is not None and self.tx_radio_manager:
-            try:
-                self._ensure_tx_session_state()
-                self.tx_radio_manager.set_frequency(
-                    plan.uplink_hz,
-                    source="rx_tracking.apply_current_plan",
-                )
-            except Exception as exc:
-                errors.append(str(exc))
+            self._ensure_tx_session_state(errors)
+            tx_state = self.tx_radio_manager.try_set_frequency(
+                plan.uplink_hz,
+                source="rx_tracking.apply_current_plan",
+            )
+            if tx_state.error:
+                errors.append(tx_state.error)
 
         with self._lock:
             self._last_snapshot = RxTrackingSnapshot(
@@ -327,11 +325,10 @@ class RxTrackingManager:
         if write_devices and (
             current_rx_hz is None or abs(current_rx_hz - plan.downlink_hz) > self.deadband_hz
         ):
-            try:
-                self._ensure_rx_session_state()
-                self.sdr_manager.set_frequency(plan.downlink_hz)
-            except Exception as exc:
-                errors.append(str(exc))
+            self._ensure_rx_session_state(errors)
+            sdr_state = self.sdr_manager.try_set_frequency(plan.downlink_hz)
+            if sdr_state.error:
+                errors.append(sdr_state.error)
             else:
                 commanded_rx_hz = plan.downlink_hz
                 with self._lock:
@@ -359,14 +356,13 @@ class RxTrackingManager:
             and plan.uplink_hz is not None
             and self.tx_radio_manager
         ):
-            try:
-                self._ensure_tx_session_state()
-                self.tx_radio_manager.set_frequency(
-                    plan.uplink_hz,
-                    source="rx_tracking.update_once",
-                )
-            except Exception as exc:
-                errors.append(str(exc))
+            self._ensure_tx_session_state(errors)
+            tx_state = self.tx_radio_manager.try_set_frequency(
+                plan.uplink_hz,
+                source="rx_tracking.update_once",
+            )
+            if tx_state.error:
+                errors.append(tx_state.error)
 
         with self._lock:
             self._last_snapshot = RxTrackingSnapshot(
@@ -396,48 +392,63 @@ class RxTrackingManager:
                 error=" | ".join(errors) if errors else None,
             )
 
-    def _ensure_rx_session_state(self) -> None:
+    def _ensure_rx_session_state(self, errors: list[str] | None = None) -> None:
         if self._rx_session_ready:
             return
-        try:
-            rx_target_vfo = getattr(
-                getattr(self.sdr_manager, "radio_manager", None),
-                "target_vfo",
-                None,
+        rx_target_vfo = getattr(
+            getattr(self.sdr_manager, "radio_manager", None),
+            "target_vfo",
+            None,
+        )
+        if hasattr(self.sdr_manager, "try_set_vfo"):
+            vfo_state = self.sdr_manager.try_set_vfo(
+                rx_target_vfo,
+                source="rx_tracking.session_setup",
             )
-            if hasattr(self.sdr_manager, "set_vfo"):
+            if errors is not None and vfo_state.error:
+                errors.append(vfo_state.error)
+        elif hasattr(self.sdr_manager, "set_vfo"):
+            try:
                 self.sdr_manager.set_vfo(
                     rx_target_vfo,
                     source="rx_tracking.session_setup",
                 )
-            if hasattr(self.sdr_manager, "set_mode"):
+            except Exception as exc:
+                if errors is not None:
+                    errors.append(str(exc))
+        if hasattr(self.sdr_manager, "try_set_mode"):
+            mode_state = self.sdr_manager.try_set_mode(
+                self.transponder.downlink_mode,
+                source="rx_tracking.session_setup",
+            )
+            if errors is not None and mode_state.error:
+                errors.append(mode_state.error)
+        elif hasattr(self.sdr_manager, "set_mode"):
+            try:
                 self.sdr_manager.set_mode(
                     self.transponder.downlink_mode,
                     source="rx_tracking.session_setup",
                 )
-        except Exception:
-            self._rx_session_ready = True
-            raise
+            except Exception as exc:
+                if errors is not None:
+                    errors.append(str(exc))
         self._rx_session_ready = True
 
-    def _ensure_tx_session_state(self) -> None:
+    def _ensure_tx_session_state(self, errors: list[str] | None = None) -> None:
         if self._tx_session_ready or self.tx_radio_manager is None:
             return
-        try:
-            self.tx_radio_manager.set_vfo(
-                self.tx_radio_manager.target_vfo,
-                source="rx_tracking.session_setup",
-            )
-            self.tx_radio_manager.set_mode(
-                self.transponder.uplink_mode,
-                source="rx_tracking.session_setup",
-            )
-        except Exception:
-            # Some local CAT paths apply the VFO/mode change but Hamlib times out
-            # waiting for the final ack. Avoid re-sending that same mode command on
-            # every doppler tick once the session state has been attempted.
-            self._tx_session_ready = True
-            raise
+        vfo_state = self.tx_radio_manager.try_set_vfo(
+            self.tx_radio_manager.target_vfo,
+            source="rx_tracking.session_setup",
+        )
+        if errors is not None and vfo_state.error:
+            errors.append(vfo_state.error)
+        mode_state = self.tx_radio_manager.try_set_mode(
+            self.transponder.uplink_mode,
+            source="rx_tracking.session_setup",
+        )
+        if errors is not None and mode_state.error:
+            errors.append(mode_state.error)
         self._tx_session_ready = True
 
     def _record_error(self, error: str) -> None:

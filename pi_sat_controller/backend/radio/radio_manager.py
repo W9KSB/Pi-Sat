@@ -7,6 +7,7 @@ from threading import RLock
 from typing import Any, Protocol
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_FAILURE_THRESHOLD = 3
 
 
 class RadioClient(Protocol):
@@ -44,6 +45,7 @@ class RadioManager:
         enabled: bool,
         write_enabled: bool,
         target_vfo: str | None = None,
+        failure_threshold: int = DEFAULT_FAILURE_THRESHOLD,
     ) -> None:
         self.client = client
         self.enabled = enabled
@@ -57,6 +59,8 @@ class RadioManager:
         self._last_read_at_utc: str | None = None
         self._last_write_at_utc: str | None = None
         self._error: str | None = None
+        self._consecutive_failures = 0
+        self._failure_threshold = max(1, int(failure_threshold))
 
     def snapshot(self) -> RadioDeviceSnapshot:
         with self._lock:
@@ -83,6 +87,7 @@ class RadioManager:
             self._frequency_hz = frequency_hz
             self._last_read_at_utc = _utc_now()
             self._error = None
+            self._consecutive_failures = 0
         if not was_connected:
             LOGGER.info("Radio connection restored")
         return frequency_hz
@@ -114,9 +119,22 @@ class RadioManager:
             self._frequency_hz = frequency_hz
             self._last_write_at_utc = _utc_now()
             self._error = None
+            self._consecutive_failures = 0
         if not was_connected:
             LOGGER.info("Radio write connection restored")
         return self.snapshot()
+
+    def try_set_frequency(
+        self,
+        frequency_hz: int,
+        source: str = "",
+    ) -> RadioDeviceSnapshot:
+        try:
+            return self.set_frequency(frequency_hz, source=source)
+        except ValueError:
+            raise
+        except Exception:
+            return self.snapshot()
 
     def set_mode(
         self,
@@ -148,9 +166,21 @@ class RadioManager:
             self._mode = normalized_mode
             self._last_write_at_utc = _utc_now()
             self._error = None
+            self._consecutive_failures = 0
         if not was_connected:
             LOGGER.info("Radio mode connection restored")
         return self.snapshot()
+
+    def try_set_mode(
+        self,
+        mode: str,
+        passband_hz: int = 0,
+        source: str = "",
+    ) -> RadioDeviceSnapshot:
+        try:
+            return self.set_mode(mode, passband_hz=passband_hz, source=source)
+        except Exception:
+            return self.snapshot()
 
     def set_vfo(self, vfo: str | None, source: str = "") -> RadioDeviceSnapshot:
         normalized_vfo = normalize_hamlib_vfo(vfo)
@@ -176,9 +206,16 @@ class RadioManager:
             self._vfo = normalized_vfo
             self._last_write_at_utc = _utc_now()
             self._error = None
+            self._consecutive_failures = 0
         if not was_connected:
             LOGGER.info("Radio VFO connection restored")
         return self.snapshot()
+
+    def try_set_vfo(self, vfo: str | None, source: str = "") -> RadioDeviceSnapshot:
+        try:
+            return self.set_vfo(vfo, source=source)
+        except Exception:
+            return self.snapshot()
 
     def poll_once(self) -> RadioDeviceSnapshot:
         try:
@@ -189,6 +226,9 @@ class RadioManager:
 
     def _record_error(self, exc: Exception) -> None:
         with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures < self._failure_threshold:
+                return
             previous_error = self._error
             self._connected = False
             self._error = str(exc)

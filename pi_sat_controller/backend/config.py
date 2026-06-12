@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pi_sat_controller.backend.maidenhead import lat_lon_to_locator, locator_to_lat_lon
 from pi_sat_controller.backend.models import MySatellite
 
 
@@ -74,6 +75,7 @@ class SafetyConfig:
     frequency_deadband_hz: int
     cat_rate_limit_hz: int
     tracking_update_interval_ms: int
+    device_offline_failure_threshold: int
 
 
 @dataclass(frozen=True)
@@ -164,6 +166,12 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
                 "tracking_update_interval_ms",
                 fallback=1000,
             ),
+            device_offline_failure_threshold=_get_int(
+                parser,
+                "safety",
+                "device_offline_failure_threshold",
+                fallback=3,
+            ),
         ),
     )
 
@@ -251,7 +259,7 @@ def _get_bool(
 
 SETTINGS_SCHEMA: dict[str, list[str]] = {
     "server": ["host", "port", "gui_resources_caching"],
-    "station": ["name", "latitude_deg", "longitude_deg", "elevation_m"],
+    "station": ["name", "grid_locator", "latitude_deg", "longitude_deg", "elevation_m"],
     "tle": ["source_url", "cache_dir", "stale_after_hours"],
     "profiles": ["satellites_file"],
     "my_satellites": ["min_pass_elevation_deg", "autotrack_next_pass"],
@@ -301,6 +309,7 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "frequency_deadband_hz",
         "cat_rate_limit_hz",
         "tracking_update_interval_ms",
+        "device_offline_failure_threshold",
     ],
 }
 
@@ -366,6 +375,8 @@ def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str,
             raw_value = parser.get(section, key, fallback="")
             if section == "tle" and key == "source_url":
                 settings[section][key] = _decode_source_url(raw_value)
+            elif section == "station" and key == "grid_locator":
+                settings[section][key] = _load_station_grid_locator(parser)
             else:
                 settings[section][key] = raw_value
     for section in ("rx", "tx", "rotator"):
@@ -403,6 +414,8 @@ def save_settings(
                     current[section][key] = "" if value is None else _encode_source_url(str(value))
                 else:
                     current[section][key] = "" if value is None else str(value)
+
+    _apply_station_grid_locator(current)
 
     rendered = _render_settings(current)
     Path(path).write_text(rendered, encoding="utf-8")
@@ -502,3 +515,28 @@ def _append_keys(lines: list[str], values: dict[str, str], keys: list[str]) -> N
         if key == "source_url":
             value = _encode_source_url(value)
         lines.append(f"{key} = {value}")
+
+
+def _load_station_grid_locator(parser: ConfigParser) -> str:
+    explicit = parser.get("station", "grid_locator", fallback="").strip().upper()
+    if explicit:
+        return explicit
+    latitude_deg = _get_float(parser, "station", "latitude_deg")
+    longitude_deg = _get_float(parser, "station", "longitude_deg")
+    return lat_lon_to_locator(latitude_deg, longitude_deg, precision=6)
+
+
+def _apply_station_grid_locator(settings: dict[str, dict[str, str]]) -> None:
+    station = settings.get("station", {})
+    locator = str(station.get("grid_locator", "")).strip().upper()
+    if not locator:
+        latitude_deg = float(station["latitude_deg"])
+        longitude_deg = float(station["longitude_deg"])
+        station["grid_locator"] = lat_lon_to_locator(latitude_deg, longitude_deg, precision=6)
+        return
+    if len(locator) != 6:
+        raise ValueError("Station grid locator must be exactly 6 characters.")
+    latitude_deg, longitude_deg = locator_to_lat_lon(locator)
+    station["grid_locator"] = locator
+    station["latitude_deg"] = str(latitude_deg)
+    station["longitude_deg"] = str(longitude_deg)
