@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
 from time import monotonic
-from typing import Any
+from typing import Any, Callable
 
 from pi_sat_controller.backend.controller.frequency_planner import (
     plan_from_offsets,
@@ -76,6 +76,8 @@ class RxTrackingManager:
         deadband_hz: int,
         rotator_manager: RotatorManager | None = None,
         tx_radio_manager: RadioManager | None = None,
+        on_pass_start: Callable[[dict[str, Any]], None] | None = None,
+        on_pass_end: Callable[[dict[str, Any]], None] | None = None,
         interval_s: float = 1.0,
     ) -> None:
         self.orbital_engine = orbital_engine
@@ -85,6 +87,8 @@ class RxTrackingManager:
         self.deadband_hz = deadband_hz
         self.rotator_manager = rotator_manager
         self.tx_radio_manager = tx_radio_manager
+        self.on_pass_start = on_pass_start
+        self.on_pass_end = on_pass_end
         self.interval_s = interval_s
         self._stop = Event()
         self._lock = Lock()
@@ -96,6 +100,7 @@ class RxTrackingManager:
         self._rx_only = is_rx_only_profile(transponder)
         self._rx_session_ready = False
         self._tx_session_ready = False
+        self._last_pass_active = False
         self._last_commanded_rx_hz: int | None = None
         self._last_commanded_at = 0.0
         self._last_snapshot = RxTrackingSnapshot(
@@ -274,6 +279,7 @@ class RxTrackingManager:
         """Applies one orbital position update to SDR, TX, and rotator state."""
 
         pass_active = position.elevation_deg >= 0.0
+        pass_transition: str | None = None
         downlink_doppler = doppler_shift_hz(
             self.transponder.preferred_downlink,
             position.range_rate_m_s,
@@ -365,6 +371,12 @@ class RxTrackingManager:
                 errors.append(tx_state.error)
 
         with self._lock:
+            if write_devices:
+                if pass_active and not self._last_pass_active:
+                    pass_transition = "aos"
+                elif not pass_active and self._last_pass_active:
+                    pass_transition = "los"
+                self._last_pass_active = pass_active
             self._last_snapshot = RxTrackingSnapshot(
                 active=self._active,
                 norad_id=self.satellite.norad_id,
@@ -391,6 +403,10 @@ class RxTrackingManager:
                 last_update_at_utc=_utc_now(),
                 error=" | ".join(errors) if errors else None,
             )
+            snapshot = self._last_snapshot
+
+        if write_devices and pass_transition:
+            self._emit_pass_transition(pass_transition, snapshot, position)
 
     def _ensure_rx_session_state(self, errors: list[str] | None = None) -> None:
         if self._rx_session_ready:
@@ -480,6 +496,32 @@ class RxTrackingManager:
                 last_update_at_utc=_utc_now(),
                 error=error,
             )
+
+    def _emit_pass_transition(
+        self,
+        event_name: str,
+        snapshot: RxTrackingSnapshot,
+        position: SatellitePosition,
+    ) -> None:
+        callback = self.on_pass_start if event_name == "aos" else self.on_pass_end
+        if callback is None:
+            return
+        callback(
+            {
+                "event": event_name.upper(),
+                "norad_id": self.satellite.norad_id,
+                "satellite_name": self.satellite.name,
+                "transponder_name": self.transponder.name,
+                "azimuth_deg": round(position.azimuth_deg, 2),
+                "elevation_deg": round(position.elevation_deg, 2),
+                "latitude_deg": round(position.latitude_deg, 5),
+                "longitude_deg": round(position.longitude_deg, 5),
+                "range_km": round(position.range_km, 3),
+                "range_rate_m_s": round(position.range_rate_m_s, 3),
+                "target_rx_hz": snapshot.target_rx_hz,
+                "target_tx_hz": snapshot.calculated_tx_hz,
+            }
+        )
 
     def _build_plan(
         self,

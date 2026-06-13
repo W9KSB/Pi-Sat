@@ -283,7 +283,7 @@ def disabled_sdr_snapshot() -> SdrDeviceSnapshot:
         frequency_hz=None,
         last_read_at_utc=None,
         last_write_at_utc=None,
-        error="SDR is disabled in pi-sat-controller.conf",
+        error="RX control is disabled in pi-sat-controller.conf",
     )
 
 

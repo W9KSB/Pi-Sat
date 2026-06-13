@@ -97,6 +97,7 @@ def build_radio_client(device_config, role: str, shared_local_client=None):
             timeout_s=device_config.timeout_s,
             target_vfo=device_config.target_vfo,
             debug_logging=device_config.cat_debug_logging,
+            role_label=role.lower(),
         )
     if device_config.connectivity == "local":
         if not device_config.model_id:
@@ -114,6 +115,7 @@ def build_radio_client(device_config, role: str, shared_local_client=None):
             timeout_s=device_config.timeout_s,
             target_vfo=device_config.target_vfo,
             debug_logging=device_config.cat_debug_logging,
+            role_label=role.lower(),
         )
     raise ValueError(f"Unsupported TX connectivity: {device_config.connectivity}")
 
@@ -125,6 +127,7 @@ def build_rotator_client(device_config):
             port=device_config.port,
             timeout_s=device_config.timeout_s,
             debug_logging=device_config.cat_debug_logging,
+            role_label="rotator",
         )
     if device_config.connectivity == "local":
         if not device_config.model_id:
@@ -139,6 +142,7 @@ def build_rotator_client(device_config):
             baud=device_config.baud,
             timeout_s=device_config.timeout_s,
             debug_logging=device_config.cat_debug_logging,
+            role_label="rotator",
         )
     raise ValueError(f"Unsupported rotator connectivity: {device_config.connectivity}")
 

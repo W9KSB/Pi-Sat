@@ -21,12 +21,14 @@ class LocalRotctldClient:
         baud: int,
         timeout_s: float = 2.0,
         debug_logging: bool = False,
+        role_label: str = "rotator",
     ) -> None:
         self.model_id = model_id
         self.serial_port = serial_port
         self.baud = baud
         self.timeout_s = timeout_s
         self.debug_logging = debug_logging
+        self.role_label = role_label
         self._lock = RLock()
         self._daemon: subprocess.Popen[str] | None = None
         self._client: RotctldClient | None = None
@@ -72,7 +74,8 @@ class LocalRotctldClient:
             str(port),
         ]
         LOGGER.info(
-            "local_rotctld starting model_id=%s serial_port=%s baud=%s port=%s command=%s",
+            "local_rotctld role=%s starting model_id=%s serial_port=%s baud=%s port=%s command=%s",
+            self.role_label,
             self.model_id,
             self.serial_port,
             self.baud,
@@ -92,7 +95,13 @@ class LocalRotctldClient:
         while monotonic() < deadline:
             if self._daemon.poll() is not None:
                 raise RuntimeError(f"rotctld exited early with code {self._daemon.returncode}")
-            client = RotctldClient("127.0.0.1", port, self.timeout_s, self.debug_logging)
+            client = RotctldClient(
+                "127.0.0.1",
+                port,
+                self.timeout_s,
+                self.debug_logging,
+                role_label=self.role_label,
+            )
             try:
                 client.get_position()
             except Exception as exc:
@@ -100,7 +109,7 @@ class LocalRotctldClient:
                 sleep(0.1)
                 continue
             self._client = client
-            LOGGER.info("local_rotctld ready port=%s", port)
+            LOGGER.info("local_rotctld role=%s ready port=%s", self.role_label, port)
             return client
         raise RuntimeError(f"rotctld startup timed out: {last_error}")
 
