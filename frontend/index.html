@@ -240,16 +240,20 @@
               <div class="card-body">
                 <div class="monitor-controls">
                   <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-general-debug" checked>
+                    <span class="form-check-label monitor-label-general">General debug</span>
+                  </label>
+                  <label class="form-check form-switch mb-0">
                     <input class="form-check-input" type="checkbox" role="switch" id="monitor-rx-cat-debug">
-                    <span class="form-check-label">RX CAT debug logging</span>
+                    <span class="form-check-label monitor-label-rx">RX CAT debug logging</span>
                   </label>
                   <label class="form-check form-switch mb-0">
                     <input class="form-check-input" type="checkbox" role="switch" id="monitor-tx-cat-debug">
-                    <span class="form-check-label">TX CAT debug logging</span>
+                    <span class="form-check-label monitor-label-tx">TX CAT debug logging</span>
                   </label>
                   <label class="form-check form-switch mb-0">
                     <input class="form-check-input" type="checkbox" role="switch" id="monitor-rotator-cat-debug">
-                    <span class="form-check-label">Rotator debug logging</span>
+                    <span class="form-check-label monitor-label-rotator">Rotator debug logging</span>
                   </label>
                 </div>
                 <p id="monitor-status" class="command-status mb-0"></p>

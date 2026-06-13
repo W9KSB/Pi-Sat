@@ -15,20 +15,41 @@ class RotatorPosition:
 
 
 class RotctldClient:
-    def __init__(self, host: str, port: int, timeout_s: float = 2.0, debug_logging: bool = False) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout_s: float = 2.0,
+        debug_logging: bool = False,
+        role_label: str = "rotator",
+    ) -> None:
         self.host = host
         self.port = port
         self.timeout_s = timeout_s
         self.debug_logging = debug_logging
+        self.role_label = role_label
 
     def _request(self, command: str) -> str:
         with socket.create_connection((self.host, self.port), self.timeout_s) as sock:
             if self.debug_logging:
-                LOGGER.info("rotctld_socket_request host=%s port=%s command=%s", self.host, self.port, command)
+                LOGGER.info(
+                    "rotctld_socket_request role=%s host=%s port=%s command=%s",
+                    self.role_label,
+                    self.host,
+                    self.port,
+                    command,
+                )
             sock.sendall(command.encode("ascii") + b"\n")
             response = sock.recv(4096).decode("ascii").strip()
             if self.debug_logging:
-                LOGGER.info("rotctld_socket_response host=%s port=%s command=%s response=%s", self.host, self.port, command, response)
+                LOGGER.info(
+                    "rotctld_socket_response role=%s host=%s port=%s command=%s response=%s",
+                    self.role_label,
+                    self.host,
+                    self.port,
+                    command,
+                    response,
+                )
             return response
 
     def get_position(self) -> RotatorPosition:

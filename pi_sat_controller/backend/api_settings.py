@@ -17,6 +17,8 @@ def register_settings_api(
     reload_rotator_config_only: Callable[[], None],
     list_serial_devices: Callable[[], list[dict[str, str]]],
     run_device_test: Callable[[str, dict[str, Any]], dict[str, object]],
+    list_automation_scripts: Callable[[], list[dict[str, str]]],
+    run_automation_script_test: Callable[[str, str], dict[str, object]],
     build_status: Callable[[], dict[str, object]],
 ) -> None:
     @app.get("/api/settings")
@@ -49,6 +51,30 @@ def register_settings_api(
     @app.get("/api/serial-devices")
     def get_serial_devices() -> dict[str, object]:
         return {"devices": list_serial_devices()}
+
+    @app.get("/api/automation/scripts")
+    def get_automation_scripts() -> dict[str, object]:
+        return {"scripts": list_automation_scripts()}
+
+    @app.post("/api/automation/test/{event_name}")
+    def test_automation_script(
+        event_name: str,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, object]:
+        normalized_event = event_name.strip().lower()
+        if normalized_event not in {"aos", "los"}:
+            raise HTTPException(status_code=404, detail="Unknown automation event")
+        try:
+            script_name = str(payload.get("script_name", "")).strip()
+            return run_automation_script_test(normalized_event, script_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception(
+                "Automation script test failed unexpectedly event=%s",
+                normalized_event,
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/api/device-tests/{role}")
     def test_device(role: str, payload: dict[str, Any] = Body(...)) -> dict[str, object]:

@@ -49,6 +49,12 @@ class ProfilesConfig:
 
 
 @dataclass(frozen=True)
+class AutomationConfig:
+    aos_script: str
+    los_script: str
+
+
+@dataclass(frozen=True)
 class DeviceConfig:
     enabled: bool
     connectivity: str
@@ -84,6 +90,7 @@ class AppConfig:
     station: StationConfig
     tle: TleConfig
     profiles: ProfilesConfig
+    automation: AutomationConfig
     rx: DeviceConfig
     tx: DeviceConfig
     rotator: DeviceConfig
@@ -144,6 +151,10 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         ),
         profiles=ProfilesConfig(
             satellites_file=_resolve_path(parser.get("profiles", "satellites_file")),
+        ),
+        automation=AutomationConfig(
+            aos_script=_get_text(parser, "automation", "aos_script", ""),
+            los_script=_get_text(parser, "automation", "los_script", ""),
         ),
         rx=_load_device(parser, "rx"),
         tx=_load_device(parser, "tx"),
@@ -257,6 +268,17 @@ def _get_bool(
     return value in {"1", "yes", "true", "on"}
 
 
+def _get_text(
+    parser: ConfigParser,
+    section: str,
+    option: str,
+    fallback: str = "",
+) -> str:
+    if not parser.has_section(section):
+        return fallback
+    return parser.get(section, option, fallback=fallback)
+
+
 SETTINGS_SCHEMA: dict[str, list[str]] = {
     "server": ["host", "port", "gui_resources_caching"],
     "station": ["name", "grid_locator", "latitude_deg", "longitude_deg", "elevation_m"],
@@ -302,6 +324,7 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "home_elevation_deg",
         "return_home_after_pass",
     ],
+    "automation": ["aos_script", "los_script"],
     "safety": [
         "tx_inhibit_below_horizon",
         "tx_inhibit_on_cat_loss",
@@ -371,8 +394,9 @@ def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str,
     settings: dict[str, dict[str, str]] = {}
     for section, keys in SETTINGS_SCHEMA.items():
         settings[section] = {}
+        section_exists = parser.has_section(section)
         for key in keys:
-            raw_value = parser.get(section, key, fallback="")
+            raw_value = parser.get(section, key, fallback="") if section_exists else ""
             if section == "tle" and key == "source_url":
                 settings[section][key] = _decode_source_url(raw_value)
             elif section == "station" and key == "grid_locator":
@@ -447,7 +471,6 @@ def _render_settings(settings: dict[str, dict[str, str]]) -> str:
     values = section("profiles")
     _append_keys(lines, values, SETTINGS_SCHEMA["profiles"])
 
-    lines.append("")
     values = section("my_satellites")
     _append_keys(lines, values, SETTINGS_SCHEMA["my_satellites"])
     for key in sorted(key for key in values if key.startswith("satellite_")):
@@ -501,6 +524,10 @@ def _render_settings(settings: dict[str, dict[str, str]]) -> str:
     lines.append(f"home_azimuth_deg = {values['home_azimuth_deg']}")
     lines.append(f"home_elevation_deg = {values['home_elevation_deg']}")
     lines.append(f"return_home_after_pass = {values['return_home_after_pass']}")
+
+    lines.append("")
+    values = section("automation")
+    _append_keys(lines, values, SETTINGS_SCHEMA["automation"])
 
     lines.append("")
     values = section("safety")

@@ -22,6 +22,7 @@ class LocalHamlibClient:
         timeout_s: float = 2.0,
         target_vfo: str | None = None,
         debug_logging: bool = False,
+        role_label: str = "rx",
     ) -> None:
         self.model_id = model_id
         self.serial_port = serial_port
@@ -29,6 +30,7 @@ class LocalHamlibClient:
         self.timeout_s = timeout_s
         self.target_vfo = target_vfo
         self.debug_logging = debug_logging
+        self.role_label = role_label
         self._lock = RLock()
         self._daemon: subprocess.Popen[str] | None = None
         self._daemon_port: int | None = None
@@ -48,7 +50,8 @@ class LocalHamlibClient:
                 return
             except Exception as exc:
                 LOGGER.warning(
-                    "local_hamlib frequency ack failed model_id=%s serial_port=%s target_hz=%s error=%s",
+                    "local_hamlib role=%s frequency ack failed model_id=%s serial_port=%s target_hz=%s error=%s",
+                    self.role_label,
                     self.model_id,
                     self.serial_port,
                     frequency_hz,
@@ -57,7 +60,8 @@ class LocalHamlibClient:
                 current_frequency = client.get_frequency()
                 if current_frequency == frequency_hz:
                     LOGGER.info(
-                        "local_hamlib frequency verified_by_readback target_hz=%s",
+                        "local_hamlib role=%s frequency verified_by_readback target_hz=%s",
+                        self.role_label,
                         frequency_hz,
                     )
                     return
@@ -107,7 +111,8 @@ class LocalHamlibClient:
         if self.debug_logging:
             command.insert(1, "-vvvvv")
         LOGGER.info(
-            "local_hamlib starting_rigctld model_id=%s serial_port=%s baud=%s port=%s debug=%s command=%s",
+            "local_hamlib role=%s starting_rigctld model_id=%s serial_port=%s baud=%s port=%s debug=%s command=%s",
+            self.role_label,
             self.model_id,
             self.serial_port,
             self.baud,
@@ -126,7 +131,7 @@ class LocalHamlibClient:
         if self.debug_logging and self._daemon.stdout is not None:
             self._log_thread = Thread(
                 target=_drain_rigctld_logs,
-                args=(self._daemon.stdout,),
+                args=(self._daemon.stdout, self.role_label),
                 name="rigctld-log-drain",
                 daemon=True,
             )
@@ -137,7 +142,13 @@ class LocalHamlibClient:
         while monotonic() < deadline:
             if self._daemon.poll() is not None:
                 raise RuntimeError(f"rigctld exited early with code {self._daemon.returncode}")
-            client = PersistentRigctldClient("127.0.0.1", port, self.timeout_s, self.debug_logging)
+            client = PersistentRigctldClient(
+                "127.0.0.1",
+                port,
+                self.timeout_s,
+                self.debug_logging,
+                role_label=self.role_label,
+            )
             try:
                 client.connect()
             except Exception as exc:
@@ -146,7 +157,7 @@ class LocalHamlibClient:
                 continue
             self._client = client
             self._daemon_port = port
-            LOGGER.info("local_hamlib rigctld_ready port=%s", port)
+            LOGGER.info("local_hamlib role=%s rigctld_ready port=%s", self.role_label, port)
             return client
         raise RuntimeError(f"rigctld startup timed out: {last_error}")
 
@@ -157,6 +168,6 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _drain_rigctld_logs(stream) -> None:
+def _drain_rigctld_logs(stream, role_label: str) -> None:
     for line in stream:
-        LOGGER.info("rigctld_raw %s", line.rstrip())
+        LOGGER.info("rigctld_raw role=%s %s", role_label, line.rstrip())

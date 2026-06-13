@@ -25,6 +25,10 @@ from pi_sat_controller.backend.api_satellites import register_satellites_api
 from pi_sat_controller.backend.api_settings import register_settings_api
 from pi_sat_controller.backend.api_system import register_system_api
 from pi_sat_controller.backend.api_tracking import register_tracking_api
+from pi_sat_controller.backend.automation_scripts import (
+    list_automation_scripts,
+    run_automation_script,
+)
 from pi_sat_controller.backend.config import (
     PROJECT_ROOT,
     SETTINGS_SCHEMA,
@@ -290,6 +294,8 @@ def _get_or_create_rx_tracking_manager(
         deadband_hz=config.safety.frequency_deadband_hz,
         rotator_manager=rotator_manager,
         tx_radio_manager=tx_radio_manager,
+        on_pass_start=lambda context: _trigger_automation_script_event("aos", context),
+        on_pass_end=lambda context: _trigger_automation_script_event("los", context),
         interval_s=max(0.1, config.safety.tracking_update_interval_ms / 1000.0),
     )
     return rx_tracking_manager
@@ -334,6 +340,7 @@ def _reload_runtime_config() -> None:
             baud=config.rx.baud or config.tx.baud or 0,
             timeout_s=max(config.rx.timeout_s, config.tx.timeout_s),
             debug_logging=bool(config.rx.cat_debug_logging or config.tx.cat_debug_logging),
+            role_label="shared",
         )
     if config.rx.enabled:
         try:
@@ -775,6 +782,104 @@ def _stop_transponder_refresh_scheduler() -> None:
         transponder_refresh_thread = None
 
 
+def _trigger_automation_script_event(
+    event_name: str,
+    context: dict[str, object],
+) -> None:
+    Thread(
+        target=_run_automation_script_event,
+        args=(event_name, context),
+        name=f"automation-script-{event_name}",
+        daemon=True,
+    ).start()
+
+
+def _run_automation_script_event(
+    event_name: str,
+    context: dict[str, object],
+) -> None:
+    try:
+        config = load_config()
+        script_name = (
+            config.automation.aos_script
+            if event_name == "aos"
+            else config.automation.los_script
+        ).strip()
+        if not script_name:
+            return
+        event_label = event_name.upper()
+        LOGGER.info(
+            "automation_script_event starting event=%s script=%s satellite=%s norad=%s",
+            event_label,
+            script_name,
+            context.get("satellite_name"),
+            context.get("norad_id"),
+        )
+        result = run_automation_script(
+            script_name,
+            event_label,
+            context=context,
+        )
+        LOGGER.info(
+            "automation_script_event finished event=%s script=%s ok=%s exit_code=%s duration_ms=%s",
+            event_label,
+            result["script_name"],
+            result["ok"],
+            result["exit_code"],
+            result["duration_ms"],
+        )
+        if result.get("stdout"):
+            LOGGER.info(
+                "automation_script_event stdout script=%s output=%s",
+                result["script_name"],
+                result["stdout"],
+            )
+        if result.get("stderr"):
+            LOGGER.warning(
+                "automation_script_event stderr script=%s output=%s",
+                result["script_name"],
+                result["stderr"],
+            )
+    except Exception:
+        LOGGER.exception(
+            "automation_script_event failed event=%s satellite=%s norad=%s",
+            event_name.upper(),
+            context.get("satellite_name"),
+            context.get("norad_id"),
+        )
+
+
+def _run_automation_script_test(event_name: str, script_name: str) -> dict[str, object]:
+    event_label = f"TEST_{event_name.upper()}"
+    LOGGER.info(
+        "automation_script_test starting event=%s script=%s",
+        event_label,
+        script_name or "none",
+    )
+    result = run_automation_script(script_name, event_label)
+    LOGGER.info(
+        "automation_script_test finished event=%s script=%s ok=%s exit_code=%s duration_ms=%s",
+        event_label,
+        result["script_name"],
+        result["ok"],
+        result["exit_code"],
+        result["duration_ms"],
+    )
+    if result.get("stdout"):
+        LOGGER.info(
+            "automation_script_test stdout script=%s output=%s",
+            result["script_name"],
+            result["stdout"],
+        )
+    if result.get("stderr"):
+        LOGGER.warning(
+            "automation_script_test stderr script=%s output=%s",
+            result["script_name"],
+            result["stderr"],
+        )
+    return result
+
+
 register_system_api(
     app,
     get_monitor_entries=lambda: monitor_log_entries,
@@ -809,6 +914,11 @@ register_settings_api(
     reload_rotator_config_only=_reload_rotator_config_only,
     list_serial_devices=_list_serial_devices,
     run_device_test=lambda role, overrides: run_device_test(role, overrides, LOGGER),
+    list_automation_scripts=lambda: [script.to_dict() for script in list_automation_scripts()],
+    run_automation_script_test=lambda event_name, script_name: _run_automation_script_test(
+        event_name,
+        script_name,
+    ),
     build_status=_build_status_payload,
 )
 

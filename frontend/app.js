@@ -16,6 +16,7 @@ let backendLogMessages = [];
 let hamlibRadioModels = [];
 let hamlibRotatorModels = [];
 let serialDevices = [];
+let automationScripts = [];
 let qthTimezone = 'UTC';
 let rotatorControlEnabled = false;
 let mapRefreshPending = false;
@@ -32,13 +33,14 @@ let qsoOpportunities = [];
 let selectedQsoOpportunityIndex = -1;
 const PAGE_NAMES = ['home', 'satellites', 'qso-finder', 'monitor', 'map', 'settings'];
 const MAP_REFRESH_TIMEOUT_MS = 5000;
+const MONITOR_GENERAL_DEBUG_STORAGE_KEY = 'pi-sat.monitor.general-debug';
 const hiddenSettingsKeys = {
   server: new Set(['host', 'port', 'gui_resources_caching']),
   station: new Set(['latitude_deg', 'longitude_deg']),
   my_satellites: new Set(['autotrack_next_pass']),
-  rx: new Set(['cat_debug_logging']),
-  tx: new Set(['cat_debug_logging']),
-  rotator: new Set(['home_azimuth_deg', 'home_elevation_deg', 'cat_debug_logging']),
+  rx: new Set(['cat_debug_logging', 'write_enabled']),
+  tx: new Set(['cat_debug_logging', 'write_enabled']),
+  rotator: new Set(['home_azimuth_deg', 'home_elevation_deg', 'cat_debug_logging', 'write_enabled']),
   tle: new Set(['cache_dir']),
   profiles: new Set(['satellites_file']),
 };
@@ -108,20 +110,83 @@ function renderLogs() {
     return;
   }
   list.replaceChildren();
+  const filters = getMonitorLogFilters();
   const entries = [...backendLogMessages, ...frontendLogMessages]
     .sort((left, right) => (right.timestampMs || 0) - (left.timestampMs || 0))
+    .filter((entry) => shouldDisplayLogEntry(entry, filters))
     .slice(0, 100);
   entries.forEach((entry) => {
+    const category = classifyLogEntry(entry);
     const item = document.createElement('div');
     item.className = 'log-item';
     const time = document.createElement('span');
     time.className = 'log-time';
     time.textContent = formatLogTime(entry.timestampMs);
     const message = document.createElement('span');
+    message.className = `log-message-${category}`;
     message.textContent = formatLogMessage(entry);
     item.append(time, message);
     list.appendChild(item);
   });
+}
+
+function getMonitorLogFilters() {
+  return {
+    general: document.getElementById('monitor-general-debug')?.checked ?? true,
+  };
+}
+
+function loadMonitorPreferences() {
+  try {
+    const stored = window.localStorage.getItem(MONITOR_GENERAL_DEBUG_STORAGE_KEY);
+    if (stored === null) {
+      return;
+    }
+    const toggle = document.getElementById('monitor-general-debug');
+    if (toggle) {
+      toggle.checked = stored === 'true';
+    }
+  } catch (error) {
+    // Ignore local storage failures and keep defaults.
+  }
+}
+
+function persistGeneralMonitorDebugPreference() {
+  try {
+    const toggle = document.getElementById('monitor-general-debug');
+    if (!toggle) {
+      return;
+    }
+    window.localStorage.setItem(
+      MONITOR_GENERAL_DEBUG_STORAGE_KEY,
+      toggle.checked ? 'true' : 'false',
+    );
+  } catch (error) {
+    // Ignore local storage failures and keep in-memory UI behavior.
+  }
+}
+
+function classifyLogEntry(entry) {
+  const message = String(entry?.message || '').toLowerCase();
+  const source = String(entry?.source || '').toLowerCase();
+  if (message.includes('role=rotator') || message.includes('rotator') || message.includes('rotctld')) {
+    return 'rotator';
+  }
+  if (message.includes('role=tx') || message.includes(' tx ') || message.startsWith('tx ') || message.includes('tx polling')) {
+    return 'tx';
+  }
+  if (message.includes('role=rx') || message.includes('rx ') || message.startsWith('rx ') || source.includes('polling_sdr')) {
+    return 'rx';
+  }
+  return 'general';
+}
+
+function shouldDisplayLogEntry(entry, filters) {
+  const category = classifyLogEntry(entry);
+  if (category === 'general') {
+    return Boolean(filters.general);
+  }
+  return true;
 }
 
 function formatLogTime(timestampMs) {
@@ -1347,14 +1412,16 @@ async function loadSettings() {
   try {
     const response = await fetch('/api/settings');
     const result = await response.json();
-    const [radioModels, rotatorModels, devices] = await Promise.all([
+    const [radioModels, rotatorModels, devices, scripts] = await Promise.all([
       loadHamlibRadioModels(),
       loadHamlibRotatorModels(),
       loadSerialDevices(),
+      loadAutomationScripts(),
     ]);
     hamlibRadioModels = radioModels;
     hamlibRotatorModels = rotatorModels;
     serialDevices = devices;
+    automationScripts = scripts;
     form.replaceChildren();
     Object.entries(result.schema).forEach(([section, keys]) => {
       if (section === 'my_satellites') {
@@ -1364,7 +1431,9 @@ async function loadSettings() {
       if (!visibleKeys.length) {
         return;
       }
-      const fieldset = section === 'safety'
+      const fieldset = section === 'automation'
+        ? buildAutomationSettingsSection(result.settings[section] || {})
+        : section === 'safety'
         ? buildAdvancedSettingsSection(visibleKeys, result.settings[section] || {})
         : buildSettingsSection(section, visibleKeys, result.settings[section] || {});
 
@@ -1398,6 +1467,99 @@ function buildSettingsSection(section, visibleKeys, sectionSettings) {
   });
 
   return fieldset;
+}
+
+function buildAutomationSettingsSection(sectionSettings) {
+  const fieldset = document.createElement('fieldset');
+  fieldset.className = 'automation-settings';
+
+  const legend = document.createElement('legend');
+  legend.textContent = 'Automation';
+  fieldset.appendChild(legend);
+
+  const note = document.createElement('div');
+  note.className = 'automation-settings-note';
+  note.textContent = 'Scripts run on the Pi as the service user.';
+  fieldset.appendChild(note);
+
+  const layout = document.createElement('div');
+  layout.className = 'automation-settings-layout';
+
+  const controls = document.createElement('div');
+  controls.className = 'automation-settings-controls';
+  controls.append(
+    buildAutomationScriptRow(
+      'AOS Script',
+      'automation.aos_script',
+      sectionSettings.aos_script ?? '',
+      'aos',
+    ),
+    buildAutomationScriptRow(
+      'LOS Script',
+      'automation.los_script',
+      sectionSettings.los_script ?? '',
+      'los',
+    ),
+  );
+
+  const resultPanel = document.createElement('div');
+  resultPanel.className = 'automation-settings-results';
+  resultPanel.innerHTML = `
+    <div class="automation-settings-results-title">Test Results</div>
+    <pre id="automation-script-result" class="automation-script-result">Run a test script to view output here.</pre>
+  `;
+
+  layout.append(controls, resultPanel);
+  fieldset.appendChild(layout);
+  return fieldset;
+}
+
+function buildAutomationScriptRow(label, fieldName, value, eventName) {
+  const row = document.createElement('div');
+  row.className = 'automation-script-row';
+
+  const fieldLabel = document.createElement('label');
+  fieldLabel.className = 'form-label mb-0';
+  fieldLabel.textContent = label;
+
+  const select = buildAutomationScriptSelect(value);
+  select.name = fieldName;
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn btn-outline-primary btn-sm';
+  button.textContent = `Test ${eventName.toUpperCase()}`;
+  button.addEventListener('click', () => testAutomationScript(eventName));
+
+  row.append(fieldLabel, select, button);
+  return row;
+}
+
+function buildAutomationScriptSelect(value) {
+  const control = document.createElement('select');
+  control.className = 'form-select';
+
+  const noneOption = document.createElement('option');
+  noneOption.value = '';
+  noneOption.textContent = 'None';
+  control.appendChild(noneOption);
+
+  automationScripts.forEach((script) => {
+    const option = document.createElement('option');
+    option.value = script.name;
+    option.textContent = script.name;
+    control.appendChild(option);
+  });
+
+  const selectedValue = String(value || '');
+  if (selectedValue && !automationScripts.some((script) => script.name === selectedValue)) {
+    const missing = document.createElement('option');
+    missing.value = selectedValue;
+    missing.textContent = `${selectedValue} (missing)`;
+    control.appendChild(missing);
+  }
+  control.value = selectedValue;
+  return control;
 }
 
 function buildAdvancedSettingsSection(visibleKeys, sectionSettings) {
@@ -1439,6 +1601,11 @@ async function loadHamlibRadioModels() {
 async function loadSerialDevices() {
   const result = await fetchJson('/api/serial-devices', null);
   return result?.devices || [];
+}
+
+async function loadAutomationScripts() {
+  const result = await fetchJson('/api/automation/scripts', null);
+  return result?.scripts || [];
 }
 
 function ensureManagedSatelliteSelection() {
@@ -1596,6 +1763,7 @@ async function loadMySatellites() {
 async function loadMonitor() {
   const status = document.getElementById('monitor-status');
   try {
+    loadMonitorPreferences();
     const [settingsResponse] = await Promise.all([
       fetch('/api/settings'),
       refreshMonitorLogs(),
@@ -1607,6 +1775,7 @@ async function loadMonitor() {
       String(result.settings?.tx?.cat_debug_logging || '').toLowerCase() === 'true';
     document.getElementById('monitor-rotator-cat-debug').checked =
       String(result.settings?.rotator?.cat_debug_logging || '').toLowerCase() === 'true';
+    renderLogs();
     status.textContent = '';
   } catch (error) {
     status.textContent = 'Monitor load failed.';
@@ -1642,6 +1811,68 @@ async function updateMonitorDebug() {
     status.textContent = 'Debug settings saved and connections reloaded.';
   } catch (error) {
     status.textContent = 'Debug settings save failed.';
+  }
+}
+
+function setAutomationScriptResult(message) {
+  const result = document.getElementById('automation-script-result');
+  if (!result) {
+    return;
+  }
+  result.textContent = message;
+}
+
+function formatAutomationScriptResult(result) {
+  const lines = [
+    `Script: ${result.script_name || 'Unknown'}`,
+    `Event: ${result.event_name || 'Unknown'}`,
+    `Exit code: ${result.exit_code}`,
+    `Duration: ${result.duration_ms} ms`,
+  ];
+  if (result.stdout) {
+    lines.push('', 'STDOUT:', result.stdout);
+  }
+  if (result.stderr) {
+    lines.push('', 'STDERR:', result.stderr);
+  }
+  return lines.join('\n');
+}
+
+async function testAutomationScript(eventName) {
+  const status = document.getElementById('settings-status');
+  const select = document.querySelector(`select[name="automation.${eventName}_script"]`);
+  if (!select) {
+    return;
+  }
+  setAutomationScriptResult(`Running ${eventName.toUpperCase()} test...`);
+  status.textContent = `Testing ${eventName.toUpperCase()} script...`;
+  try {
+    const response = await fetch(`/api/automation/test/${eventName}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        script_name: select.value,
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      const message = result.detail || `Test ${eventName.toUpperCase()} script failed.`;
+      setAutomationScriptResult(message);
+      status.textContent = message;
+      addLog(message);
+      return;
+    }
+    const summary = result.ok
+      ? `${eventName.toUpperCase()} script test completed.`
+      : `${eventName.toUpperCase()} script test failed.`;
+    setAutomationScriptResult(formatAutomationScriptResult(result));
+    status.textContent = summary;
+    addLog(summary);
+  } catch (error) {
+    const message = `Test ${eventName.toUpperCase()} script failed.`;
+    setAutomationScriptResult(message);
+    status.textContent = message;
+    addLog(message);
   }
 }
 
@@ -3253,6 +3484,12 @@ document
 document
   .getElementById('auto-track-toggle')
   .addEventListener('change', updateAutotrackSetting);
+document
+  .getElementById('monitor-general-debug')
+  .addEventListener('change', () => {
+    persistGeneralMonitorDebugPreference();
+    renderLogs();
+  });
 document
   .getElementById('monitor-rx-cat-debug')
   .addEventListener('change', updateMonitorDebug);

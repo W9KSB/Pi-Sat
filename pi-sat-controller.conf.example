@@ -1,12 +1,14 @@
 [server]
 host = 0.0.0.0
 port = 80
+# Enable browser caching for GUI static resources.
 gui_resources_caching = false
 
 [station]
 name = Home
-latitude_deg = 40.0
-longitude_deg = 80.0
+grid_locator = NN00AA
+latitude_deg = 40.020833
+longitude_deg = 80.041667
 elevation_m = 250.0
 
 [tle]
@@ -16,7 +18,6 @@ stale_after_hours = 48
 
 [profiles]
 satellites_file = data/satellites.json
-
 [my_satellites]
 min_pass_elevation_deg = 10.0
 autotrack_next_pass = true
@@ -26,44 +27,66 @@ satellite_44909 = RS-44
 
 [rx]
 enabled = false
+# Set below to local for USB/serial connected devices and network for rigctld/Hamlib devices.
 connectivity = network
+# If connectivity is set to network, these values below are used.
 host = 127.0.0.1
 port = 4532
-serial_port =
-baud =
-model_id =
+# If connectivity is set to local, these values below are used.
+serial_port = 
+baud = 
+model_id = 
+# Select which VFO Hamlib should control for RX: current, A, or B.
 target_vfo = current
+# Enable verbose CAT/Hamlib command logging for this role.
 cat_debug_logging = false
+# Enable frequency writes for this role.
 write_enabled = false
 timeout_s = 2.0
 
 [tx]
 enabled = false
+# Set below to local for USB/serial connected devices and network for rigctld/Hamlib devices.
 connectivity = local
+# If connectivity is set to network, these values below are used.
 host = 127.0.0.1
 port = 4533
-serial_port =
-baud =
-model_id =
+# If connectivity is set to local, these values below are used.
+serial_port = 
+baud = 
+model_id = 
+# Select which VFO Hamlib should control for TX: current, A, or B.
 target_vfo = current
+# Enable verbose CAT/Hamlib command logging for this role.
 cat_debug_logging = false
+# Enable frequency writes for this role.
 write_enabled = false
 timeout_s = 2.0
 
 [rotator]
 enabled = false
+# Set below to local for USB/serial connected devices and network for rotctld/Hamlib devices.
 connectivity = network
+# If connectivity is set to network, these values below are used.
 host = 127.0.0.1
 port = 4534
-serial_port =
-baud =
-model_id =
+# If connectivity is set to local, these values below are used.
+serial_port = 
+baud = 
+model_id = 
+# Enable verbose rotator/Hamlib command logging for this role.
+cat_debug_logging = 
+# Enable rotator position writes. Keep false until hardware is ready.
 write_enabled = false
 timeout_s = 2.0
 min_elevation_deg = 0.0
 home_azimuth_deg = 0.0
 home_elevation_deg = 0.0
 return_home_after_pass = false
+
+[automation]
+aos_script = demo.sh
+los_script = demo.py
 
 [safety]
 tx_inhibit_below_horizon = true
@@ -72,3 +95,4 @@ tx_inhibit_without_valid_pass = true
 frequency_deadband_hz = 10
 cat_rate_limit_hz = 4
 tracking_update_interval_ms = 1000
+device_offline_failure_threshold = 
