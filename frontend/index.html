@@ -5,15 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Pi-Sat Controller</title>
     <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
-    <link rel="stylesheet" href="/style.css?v=20260611-qso1">
+    <link rel="stylesheet" href="/style.css?v=20260613-responsive1">
   </head>
   <body>
     <main class="container-fluid py-3 app-shell">
       <section class="page-view" id="home-page" data-page-view="home">
         <header class="card app-header mb-3">
           <div class="card-body">
-            <div class="row align-items-center g-3">
-              <div class="col-12 col-lg-4">
+            <div class="home-header-grid">
+              <div class="home-header-brand">
                 <div class="brand-lockup">
                   <img class="brand-satellite" src="/assets/pi-sat-satellite.png" alt="" aria-hidden="true">
                   <div>
@@ -22,8 +22,8 @@
                   </div>
                 </div>
               </div>
-              <div class="col-12 col-lg-4">
-                <nav class="nav nav-pills justify-content-lg-center gap-2" aria-label="Primary navigation">
+              <div class="home-header-nav">
+                <nav class="nav nav-pills gap-2" aria-label="Primary navigation">
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="home">Home</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="satellites">Satellites</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="qso-finder">QSO Finder</button>
@@ -32,7 +32,7 @@
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="settings">Settings</button>
                 </nav>
               </div>
-              <div class="col-12 col-lg-4">
+              <div class="home-header-controls">
                 <div class="header-switches">
                   <label class="form-check form-switch mb-0">
                     <input class="form-check-input" type="checkbox" role="switch" id="rx-control-toggle">
@@ -47,13 +47,12 @@
                     <span class="form-check-label">Rotator control</span>
                   </label>
                 </div>
-              </div>
             </div>
           </div>
         </header>
 
-        <div class="row g-3 dashboard-row">
-          <section class="col-12 col-xl-4">
+        <div class="row g-3 dashboard-row home-dashboard-row">
+          <section class="col-12 col-xl-4 home-tracking-section">
             <div class="card h-100">
               <div class="card-header d-flex align-items-center justify-content-between gap-3">
                 <h2 class="h5 mb-0" id="live-tracking-title">Live Tracking</h2>
@@ -89,12 +88,12 @@
             </div>
           </section>
 
-          <section class="col-12 col-xl-8">
+          <section class="col-12 col-xl-8 home-control-section">
             <div class="card mb-3 control-panel-card">
               <div class="card-header">
                 <h2 class="h5 mb-0">Control Panel</h2>
               </div>
-              <div class="card-body">
+              <div class="card-body control-panel-body">
                 <div class="row g-3 align-items-stretch mb-3 profile-row">
                   <div class="col-12 col-lg-6">
                     <div class="summary-box profile-select-box">
@@ -182,8 +181,8 @@
               </div>
             </div>
 
-            <div class="row g-3">
-              <section class="col-12">
+            <div class="row g-3 home-rotator-row">
+              <section class="col-12 home-rotator-section">
                 <div class="card h-100">
                   <div class="card-header py-2 d-flex align-items-center justify-content-between gap-3">
                     <h2 class="h6 mb-0">Rotator Status</h2>
@@ -551,6 +550,6 @@
       <a href="https://github.com/w9ksb" target="_blank" rel="noopener noreferrer">github.com/w9ksb</a>
     </footer>
     <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
-    <script src="/app.js?v=20260611-qso1"></script>
+    <script src="/app.js?v=20260613-responsive1"></script>
   </body>
 </html>

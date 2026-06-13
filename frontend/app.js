@@ -34,6 +34,8 @@ let selectedQsoOpportunityIndex = -1;
 const PAGE_NAMES = ['home', 'satellites', 'qso-finder', 'monitor', 'map', 'settings'];
 const MAP_REFRESH_TIMEOUT_MS = 5000;
 const MONITOR_GENERAL_DEBUG_STORAGE_KEY = 'pi-sat.monitor.general-debug';
+const DASHBOARD_MOBILE_MAX_WIDTH = 900;
+let currentDashboardMode = '';
 const hiddenSettingsKeys = {
   server: new Set(['host', 'port', 'gui_resources_caching']),
   station: new Set(['latitude_deg', 'longitude_deg']),
@@ -221,8 +223,8 @@ function renderStandardPageHeaders() {
     const subtitle = header.dataset.pageSubtitle || '';
     header.innerHTML = `
       <div class="card-body">
-        <div class="row align-items-center g-3">
-          <div class="col-12 col-lg-4">
+        <div class="standard-header-grid">
+          <div class="standard-header-brand">
             <div class="brand-lockup">
               <img class="brand-satellite" src="/assets/pi-sat-satellite.png" alt="" aria-hidden="true">
               <div>
@@ -231,12 +233,12 @@ function renderStandardPageHeaders() {
               </div>
             </div>
           </div>
-          <div class="col-12 col-lg-4">
-            <nav class="nav nav-pills justify-content-lg-center gap-2" aria-label="Primary navigation">
+          <div class="standard-header-nav">
+            <nav class="nav nav-pills gap-2" aria-label="Primary navigation">
               ${STANDARD_PAGE_NAV}
             </nav>
           </div>
-          <div class="col-12 col-lg-4"></div>
+          <div class="standard-header-spacer" aria-hidden="true"></div>
         </div>
       </div>
     `;
@@ -315,6 +317,38 @@ function showPage(pageName) {
 function pageFromHash() {
   const page = window.location.hash.replace('#', '');
   return PAGE_NAMES.includes(page) ? page : 'home';
+}
+
+function resolveDashboardMode() {
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+  if (viewportWidth <= DASHBOARD_MOBILE_MAX_WIDTH) {
+    return 'mobile';
+  }
+  return 'desktop';
+}
+
+function updateDashboardMode() {
+  const nextMode = resolveDashboardMode();
+  if (nextMode === currentDashboardMode) {
+    return nextMode;
+  }
+  currentDashboardMode = nextMode;
+  document.body.dataset.dashboardMode = nextMode;
+  return nextMode;
+}
+
+let dashboardResizeTimer = null;
+
+function handleDashboardResize() {
+  updateDashboardMode();
+  if (dashboardResizeTimer) {
+    clearTimeout(dashboardResizeTimer);
+  }
+  dashboardResizeTimer = window.setTimeout(() => {
+    drawMap();
+    drawTrackedSatellitesMap();
+    drawQsoMap();
+  }, 120);
 }
 
 function isDocumentVisible() {
@@ -3411,6 +3445,7 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
+updateDashboardMode();
 loadStatus();
 document.getElementById('sync-rx-tx-toggle').checked = syncRxTx;
 loadSdrFrequency();
@@ -3427,6 +3462,7 @@ worldMapImage.addEventListener('load', () => {
 renderStandardPageHeaders();
 showPage(pageFromHash());
 window.addEventListener('hashchange', () => showPage(pageFromHash()));
+window.addEventListener('resize', handleDashboardResize);
 document.addEventListener('visibilitychange', () => {
   if (isDocumentVisible()) {
     refreshVisibleGuiOnly();
