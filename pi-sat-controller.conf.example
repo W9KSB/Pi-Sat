@@ -85,8 +85,8 @@ home_elevation_deg = 0.0
 return_home_after_pass = false
 
 [automation]
-aos_script = demo.sh
-los_script = demo.py
+aos_script =
+los_script =
 
 [safety]
 tx_inhibit_below_horizon = true
@@ -95,4 +95,4 @@ tx_inhibit_without_valid_pass = true
 frequency_deadband_hz = 10
 cat_rate_limit_hz = 4
 tracking_update_interval_ms = 1000
-device_offline_failure_threshold = 
+device_offline_failure_threshold = 3
