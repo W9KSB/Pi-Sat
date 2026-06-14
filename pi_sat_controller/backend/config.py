@@ -19,6 +19,7 @@ from pi_sat_controller.backend.models import MySatellite
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "pi-sat-controller.conf"
 MULTI_URL_SEPARATOR = " || "
+CAT_DEVICE_SECTION_PREFIX = "cat_device_"
 
 
 @dataclass(frozen=True)
@@ -55,8 +56,22 @@ class AutomationConfig:
 
 
 @dataclass(frozen=True)
+class CatDeviceConfig:
+    device_id: str
+    name: str
+    connectivity: str
+    host: str
+    port: int
+    serial_port: str
+    baud: int | None
+    model_id: int | None
+    timeout_s: float
+
+
+@dataclass(frozen=True)
 class DeviceConfig:
     enabled: bool
+    device_id: str | None
     connectivity: str
     host: str
     port: int
@@ -66,6 +81,7 @@ class DeviceConfig:
     target_vfo: str | None
     write_enabled: bool
     timeout_s: float
+    shared_local_split_mode: bool = False
     cat_debug_logging: bool = False
     min_elevation_deg: float | None = None
     home_azimuth_deg: float | None = None
@@ -91,6 +107,7 @@ class AppConfig:
     tle: TleConfig
     profiles: ProfilesConfig
     automation: AutomationConfig
+    cat_devices: dict[str, CatDeviceConfig]
     rx: DeviceConfig
     tx: DeviceConfig
     rotator: DeviceConfig
@@ -127,6 +144,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     if not loaded:
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
+    cat_devices = _load_cat_devices(parser)
+
     return AppConfig(
         server=ServerConfig(
             host=parser.get("server", "host"),
@@ -156,8 +175,9 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             aos_script=_get_text(parser, "automation", "aos_script", ""),
             los_script=_get_text(parser, "automation", "los_script", ""),
         ),
-        rx=_load_device(parser, "rx"),
-        tx=_load_device(parser, "tx"),
+        cat_devices=cat_devices,
+        rx=_load_device(parser, "rx", cat_devices),
+        tx=_load_device(parser, "tx", cat_devices),
         rotator=_load_device(parser, "rotator"),
         safety=SafetyConfig(
             tx_inhibit_below_horizon=parser.getboolean(
@@ -187,19 +207,49 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     )
 
 
-def _load_device(parser: ConfigParser, section: str) -> DeviceConfig:
+def _load_device(
+    parser: ConfigParser,
+    section: str,
+    cat_devices: dict[str, CatDeviceConfig] | None = None,
+) -> DeviceConfig:
+    cat_devices = cat_devices or {}
+    device_id = parser.get(section, "device_id", fallback="").strip() or None
+    base_device = cat_devices.get(device_id) if device_id else None
     return DeviceConfig(
         enabled=_get_bool(parser, section, "enabled"),
-        connectivity=parser.get(section, "connectivity"),
-        host=parser.get(section, "host"),
-        port=_get_int(parser, section, "port"),
-        serial_port=parser.get(section, "serial_port", fallback=""),
-        baud=_get_optional_int(parser, section, "baud"),
-        model_id=_get_optional_int(parser, section, "model_id"),
+        device_id=device_id,
+        connectivity=(
+            base_device.connectivity
+            if base_device
+            else parser.get(section, "connectivity", fallback="network")
+        ),
+        host=base_device.host if base_device else parser.get(section, "host", fallback=""),
+        port=base_device.port if base_device else _get_int(parser, section, "port", fallback=0),
+        serial_port=(
+            base_device.serial_port
+            if base_device
+            else parser.get(section, "serial_port", fallback="")
+        ),
+        baud=base_device.baud if base_device else _get_optional_int(parser, section, "baud"),
+        model_id=(
+            base_device.model_id
+            if base_device
+            else _get_optional_int(parser, section, "model_id")
+        ),
         target_vfo=parser.get(section, "target_vfo", fallback="").strip() or None,
+        shared_local_split_mode=_get_bool(
+            parser,
+            section,
+            "shared_local_split_mode",
+            False,
+        ),
         cat_debug_logging=_get_bool(parser, section, "cat_debug_logging", False),
         write_enabled=_get_bool(parser, section, "write_enabled"),
-        timeout_s=_get_float(parser, section, "timeout_s"),
+        timeout_s=(
+            base_device.timeout_s
+            if base_device
+            else _get_float(parser, section, "timeout_s", fallback=2.0)
+        ),
         min_elevation_deg=_get_optional_float(parser, section, "min_elevation_deg"),
         home_azimuth_deg=_get_optional_float(parser, section, "home_azimuth_deg"),
         home_elevation_deg=_get_optional_float(parser, section, "home_elevation_deg"),
@@ -279,6 +329,24 @@ def _get_text(
     return parser.get(section, option, fallback=fallback)
 
 
+CAT_DEVICE_FIELDS = [
+    "name",
+    "connectivity",
+    "host",
+    "port",
+    "serial_port",
+    "baud",
+    "model_id",
+    "timeout_s",
+    "capability_comm",
+    "capability_ptt",
+    "capability_vfo",
+    "capability_shared",
+    "capability_last_test_utc",
+    "capability_notes",
+]
+
+
 SETTINGS_SCHEMA: dict[str, list[str]] = {
     "server": ["host", "port", "gui_resources_caching"],
     "station": ["name", "grid_locator", "latitude_deg", "longitude_deg", "elevation_m"],
@@ -286,28 +354,17 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
     "profiles": ["satellites_file"],
     "my_satellites": ["min_pass_elevation_deg", "autotrack_next_pass"],
     "rx": [
-        "connectivity",
-        "host",
-        "port",
-        "serial_port",
-        "baud",
-        "model_id",
+        "device_id",
         "target_vfo",
         "cat_debug_logging",
         "write_enabled",
-        "timeout_s",
     ],
     "tx": [
-        "connectivity",
-        "host",
-        "port",
-        "serial_port",
-        "baud",
-        "model_id",
+        "device_id",
         "target_vfo",
+        "shared_local_split_mode",
         "cat_debug_logging",
         "write_enabled",
-        "timeout_s",
     ],
     "rotator": [
         "connectivity",
@@ -391,12 +448,16 @@ def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str,
     if not loaded:
         raise FileNotFoundError(f"Config file not found: {path}")
 
+    cat_devices = _load_cat_devices(parser)
     settings: dict[str, dict[str, str]] = {}
     for section, keys in SETTINGS_SCHEMA.items():
         settings[section] = {}
         section_exists = parser.has_section(section)
         for key in keys:
-            raw_value = parser.get(section, key, fallback="") if section_exists else ""
+            if key == "device_id" and section in {"rx", "tx"}:
+                raw_value = _resolve_role_device_id(parser, section, cat_devices)
+            else:
+                raw_value = parser.get(section, key, fallback="") if section_exists else ""
             if section == "tle" and key == "source_url":
                 settings[section][key] = _decode_source_url(raw_value)
             elif section == "station" and key == "grid_locator":
@@ -414,9 +475,11 @@ def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str,
 
 def save_settings(
     settings: dict[str, dict[str, Any]],
+    cat_devices: list[dict[str, Any]] | None = None,
     path: Path | str = DEFAULT_CONFIG_PATH,
 ) -> None:
     current = load_settings(path)
+    current_cat_devices = load_cat_devices(path)
     for section, values in settings.items():
         if section not in SETTINGS_SCHEMA:
             continue
@@ -439,14 +502,46 @@ def save_settings(
                 else:
                     current[section][key] = "" if value is None else str(value)
 
-    _apply_station_grid_locator(current)
+    if cat_devices is not None:
+        current_cat_devices = _normalize_cat_devices(cat_devices)
 
-    rendered = _render_settings(current)
+    _apply_station_grid_locator(current)
+    _validate_role_device_assignments(current, current_cat_devices)
+
+    rendered = _render_settings(current, current_cat_devices)
     Path(path).write_text(rendered, encoding="utf-8")
     load_config(path)
 
 
-def _render_settings(settings: dict[str, dict[str, str]]) -> str:
+def _validate_role_device_assignments(
+    settings: dict[str, dict[str, str]],
+    cat_devices: list[dict[str, str]],
+) -> None:
+    rx_device_id = str(settings.get("rx", {}).get("device_id", "")).strip()
+    tx_device_id = str(settings.get("tx", {}).get("device_id", "")).strip()
+    if not rx_device_id or not tx_device_id or rx_device_id != tx_device_id:
+        return
+
+    device_by_id = {
+        str(device.get("device_id", "")).strip(): device
+        for device in cat_devices
+        if str(device.get("device_id", "")).strip()
+    }
+    shared_capable = (
+        str(device_by_id.get(rx_device_id, {}).get("capability_shared", "")).strip().lower()
+        == "true"
+    )
+    if not shared_capable:
+        raise ValueError(
+            "The selected CAT device cannot be assigned to both RX and TX. "
+            "Save the device and use a shared-capable local radio for dual-role operation."
+        )
+
+
+def _render_settings(
+    settings: dict[str, dict[str, str]],
+    cat_devices: list[dict[str, str]],
+) -> str:
     lines: list[str] = []
 
     def section(name: str) -> dict[str, str]:
@@ -471,6 +566,13 @@ def _render_settings(settings: dict[str, dict[str, str]]) -> str:
     values = section("profiles")
     _append_keys(lines, values, SETTINGS_SCHEMA["profiles"])
 
+    for cat_device in cat_devices:
+        lines.append("")
+        lines.append(f"[{CAT_DEVICE_SECTION_PREFIX}{cat_device['device_id']}]")
+        for key in CAT_DEVICE_FIELDS:
+            lines.append(f"{key} = {cat_device.get(key, '')}")
+
+    lines.append("")
     values = section("my_satellites")
     _append_keys(lines, values, SETTINGS_SCHEMA["my_satellites"])
     for key in sorted(key for key in values if key.startswith("satellite_")):
@@ -480,26 +582,21 @@ def _render_settings(settings: dict[str, dict[str, str]]) -> str:
         lines.append("")
         values = section(role)
         lines.append(f"enabled = {values['enabled']}")
-        lines.append(
-            "# Set below to local for USB/serial connected devices and network for rigctld/Hamlib devices."
-        )
-        lines.append(f"connectivity = {values['connectivity']}")
-        lines.append("# If connectivity is set to network, these values below are used.")
-        lines.append(f"host = {values['host']}")
-        lines.append(f"port = {values['port']}")
-        lines.append("# If connectivity is set to local, these values below are used.")
-        lines.append(f"serial_port = {values['serial_port']}")
-        lines.append(f"baud = {values['baud']}")
-        lines.append(f"model_id = {values['model_id']}")
+        lines.append("# Assign a configured CAT device from the My CAT Devices inventory.")
+        lines.append(f"device_id = {values['device_id']}")
         lines.append(
             f"# Select which VFO Hamlib should control for {role.upper()}: current, A, or B."
         )
         lines.append(f"target_vfo = {values['target_vfo']}")
+        if role == "tx":
+            lines.append(
+                "# When RX and TX share the same local radio, enable rig split mode for TX updates."
+            )
+            lines.append(f"shared_local_split_mode = {values['shared_local_split_mode']}")
         lines.append("# Enable verbose CAT/Hamlib command logging for this role.")
         lines.append(f"cat_debug_logging = {values['cat_debug_logging']}")
         lines.append("# Enable frequency writes for this role.")
         lines.append(f"write_enabled = {values['write_enabled']}")
-        lines.append(f"timeout_s = {values['timeout_s']}")
 
     lines.append("")
     values = section("rotator")
@@ -567,3 +664,229 @@ def _apply_station_grid_locator(settings: dict[str, dict[str, str]]) -> None:
     station["grid_locator"] = locator
     station["latitude_deg"] = str(latitude_deg)
     station["longitude_deg"] = str(longitude_deg)
+
+
+def load_cat_devices(
+    path: Path | str = DEFAULT_CONFIG_PATH,
+) -> list[dict[str, str]]:
+    parser = ConfigParser()
+    loaded = parser.read(Path(path))
+    if not loaded:
+        raise FileNotFoundError(f"Config file not found: {path}")
+    return [
+        {
+            "device_id": device.device_id,
+            "name": device.name,
+            "connectivity": device.connectivity,
+            "host": device.host,
+            "port": str(device.port),
+            "serial_port": device.serial_port,
+            "baud": "" if device.baud is None else str(device.baud),
+            "model_id": "" if device.model_id is None else str(device.model_id),
+            "timeout_s": str(device.timeout_s),
+            "capability_comm": _load_cat_device_metadata(
+                parser, device.device_id, "capability_comm"
+            ),
+            "capability_ptt": _load_cat_device_metadata(
+                parser, device.device_id, "capability_ptt"
+            ),
+            "capability_vfo": _load_cat_device_metadata(
+                parser, device.device_id, "capability_vfo"
+            ),
+            "capability_shared": _load_cat_device_metadata(
+                parser, device.device_id, "capability_shared"
+            ),
+            "capability_last_test_utc": _load_cat_device_metadata(
+                parser, device.device_id, "capability_last_test_utc"
+            ),
+            "capability_notes": _load_cat_device_metadata(
+                parser, device.device_id, "capability_notes"
+            ),
+        }
+        for device in _load_cat_devices(parser).values()
+    ]
+
+
+def _load_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig]:
+    explicit: dict[str, CatDeviceConfig] = {}
+    for section in parser.sections():
+        if not section.startswith(CAT_DEVICE_SECTION_PREFIX):
+            continue
+        device_id = section.removeprefix(CAT_DEVICE_SECTION_PREFIX).strip()
+        if not device_id:
+            continue
+        explicit[device_id] = CatDeviceConfig(
+            device_id=device_id,
+            name=parser.get(section, "name", fallback=device_id),
+            connectivity=parser.get(section, "connectivity", fallback="network"),
+            host=parser.get(section, "host", fallback=""),
+            port=_get_int(parser, section, "port", fallback=0),
+            serial_port=parser.get(section, "serial_port", fallback=""),
+            baud=_get_optional_int(parser, section, "baud"),
+            model_id=_get_optional_int(parser, section, "model_id"),
+            timeout_s=_get_float(parser, section, "timeout_s", fallback=2.0),
+        )
+    if explicit:
+        return explicit
+    return _build_legacy_cat_devices(parser)
+
+
+def _load_cat_device_metadata(
+    parser: ConfigParser,
+    device_id: str,
+    option: str,
+) -> str:
+    section = f"{CAT_DEVICE_SECTION_PREFIX}{device_id}"
+    if not parser.has_section(section):
+        return ""
+    return parser.get(section, option, fallback="")
+
+
+def _build_legacy_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig]:
+    legacy_devices: dict[str, CatDeviceConfig] = {}
+    seen_by_signature: dict[tuple[str, str, int, str, int | None, int | None], str] = {}
+    for role in ("rx", "tx"):
+        if not parser.has_section(role):
+            continue
+        connectivity = parser.get(role, "connectivity", fallback="").strip()
+        if connectivity not in {"network", "local"}:
+            continue
+        host = parser.get(role, "host", fallback="").strip()
+        port = _get_int(parser, role, "port", fallback=0)
+        serial_port = parser.get(role, "serial_port", fallback="").strip()
+        baud = _get_optional_int(parser, role, "baud")
+        model_id = _get_optional_int(parser, role, "model_id")
+        if connectivity == "network" and (not host or not port):
+            continue
+        if connectivity == "local" and (not serial_port or not baud or not model_id):
+            continue
+        signature = (connectivity, host, port, serial_port, baud, model_id)
+        existing_id = seen_by_signature.get(signature)
+        if existing_id:
+            existing = legacy_devices[existing_id]
+            if "Shared" not in existing.name:
+                legacy_devices[existing_id] = CatDeviceConfig(
+                    device_id=existing.device_id,
+                    name="Legacy Shared CAT Device",
+                    connectivity=existing.connectivity,
+                    host=existing.host,
+                    port=existing.port,
+                    serial_port=existing.serial_port,
+                    baud=existing.baud,
+                    model_id=existing.model_id,
+                    timeout_s=existing.timeout_s,
+                )
+            continue
+        device_id = f"legacy-{role}"
+        if device_id in legacy_devices:
+            device_id = f"legacy-{role}-{len(legacy_devices) + 1}"
+        seen_by_signature[signature] = device_id
+        legacy_devices[device_id] = CatDeviceConfig(
+            device_id=device_id,
+            name=f"Legacy {role.upper()} Device",
+            connectivity=connectivity,
+            host=host,
+            port=port,
+            serial_port=serial_port,
+            baud=baud,
+            model_id=model_id,
+            timeout_s=_get_float(parser, role, "timeout_s", fallback=2.0),
+        )
+    return legacy_devices
+
+
+def _resolve_role_device_id(
+    parser: ConfigParser,
+    role: str,
+    cat_devices: dict[str, CatDeviceConfig],
+) -> str:
+    explicit = parser.get(role, "device_id", fallback="").strip()
+    if explicit:
+        return explicit
+    connectivity = parser.get(role, "connectivity", fallback="").strip()
+    host = parser.get(role, "host", fallback="").strip()
+    port = _get_int(parser, role, "port", fallback=0)
+    serial_port = parser.get(role, "serial_port", fallback="").strip()
+    baud = _get_optional_int(parser, role, "baud")
+    model_id = _get_optional_int(parser, role, "model_id")
+    for device in cat_devices.values():
+        if (
+            device.connectivity == connectivity
+            and device.host == host
+            and device.port == port
+            and device.serial_port == serial_port
+            and device.baud == baud
+            and device.model_id == model_id
+        ):
+            return device.device_id
+    return ""
+
+
+def _normalize_cat_devices(cat_devices: list[dict[str, Any]]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for index, raw_device in enumerate(cat_devices, start=1):
+        device_id = str(raw_device.get("device_id", "")).strip().lower()
+        if not device_id:
+            device_id = f"cat-device-{index}"
+        device_id = "".join(
+            character if character.isalnum() or character in {"-", "_"} else "-"
+            for character in device_id
+        ).strip("-_")
+        if not device_id:
+            device_id = f"cat-device-{index}"
+        suffix = 2
+        base_id = device_id
+        while device_id in seen_ids:
+            device_id = f"{base_id}-{suffix}"
+            suffix += 1
+        seen_ids.add(device_id)
+        connectivity = str(raw_device.get("connectivity", "network")).strip() or "network"
+        normalized.append(
+            {
+                "device_id": device_id,
+                "name": str(raw_device.get("name", "")).strip() or device_id,
+                "connectivity": connectivity,
+                "host": str(raw_device.get("host", "")).strip(),
+                "port": str(parse_int_value(raw_device.get("port"), 0)),
+                "serial_port": str(raw_device.get("serial_port", "")).strip(),
+                "baud": stringify_optional_int(raw_device.get("baud")),
+                "model_id": stringify_optional_int(raw_device.get("model_id")),
+                "timeout_s": str(parse_float_value(raw_device.get("timeout_s"), 2.0)),
+                "capability_comm": stringify_capability_value(raw_device.get("capability_comm")),
+                "capability_ptt": stringify_capability_value(raw_device.get("capability_ptt")),
+                "capability_vfo": stringify_capability_value(raw_device.get("capability_vfo")),
+                "capability_shared": stringify_capability_value(raw_device.get("capability_shared")),
+                "capability_last_test_utc": str(raw_device.get("capability_last_test_utc", "")).strip(),
+                "capability_notes": str(raw_device.get("capability_notes", "")).strip(),
+            }
+        )
+    return normalized
+
+
+def parse_int_value(value: Any, fallback: int) -> int:
+    text = str(value).strip()
+    if not text:
+        return fallback
+    return int(text)
+
+
+def parse_float_value(value: Any, fallback: float) -> float:
+    text = str(value).strip()
+    if not text:
+        return fallback
+    return float(text)
+
+
+def stringify_optional_int(value: Any) -> str:
+    text = str(value).strip()
+    if not text:
+        return ""
+    return str(int(text))
+
+
+def stringify_capability_value(value: Any) -> str:
+    text = str(value).strip().lower()
+    if text not in {"true", "false"}:
+        return ""
+    return text

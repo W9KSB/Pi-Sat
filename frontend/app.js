@@ -17,6 +17,8 @@ let hamlibRadioModels = [];
 let hamlibRotatorModels = [];
 let serialDevices = [];
 let automationScripts = [];
+let catDevicesCache = [];
+let currentSettingsState = {};
 let qthTimezone = 'UTC';
 let rotatorControlEnabled = false;
 let mapRefreshPending = false;
@@ -41,7 +43,7 @@ const hiddenSettingsKeys = {
   station: new Set(['latitude_deg', 'longitude_deg']),
   my_satellites: new Set(['autotrack_next_pass']),
   rx: new Set(['cat_debug_logging', 'write_enabled']),
-  tx: new Set(['cat_debug_logging', 'write_enabled']),
+  tx: new Set(['cat_debug_logging', 'write_enabled', 'shared_local_split_mode']),
   rotator: new Set(['home_azimuth_deg', 'home_elevation_deg', 'cat_debug_logging', 'write_enabled']),
   tle: new Set(['cache_dir']),
   profiles: new Set(['satellites_file']),
@@ -1456,8 +1458,25 @@ async function loadSettings() {
     hamlibRotatorModels = rotatorModels;
     serialDevices = devices;
     automationScripts = scripts;
+    currentSettingsState = result.settings || {};
+    catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : [];
     form.replaceChildren();
-    Object.entries(result.schema).forEach(([section, keys]) => {
+    const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'safety'];
+    orderedSections.forEach((section) => {
+      if (section === 'device_roles') {
+        form.appendChild(buildCatDevicesSection(catDevicesCache));
+        form.appendChild(
+          buildDeviceRolesSection(
+            result.settings?.rx || {},
+            result.settings?.tx || {},
+          ),
+        );
+        return;
+      }
+      const keys = result.schema?.[section];
+      if (!keys || section === 'my_satellites' || ['rx', 'tx'].includes(section)) {
+        return;
+      }
       if (section === 'my_satellites') {
         return;
       }
@@ -1471,18 +1490,282 @@ async function loadSettings() {
         ? buildAdvancedSettingsSection(visibleKeys, result.settings[section] || {})
         : buildSettingsSection(section, visibleKeys, result.settings[section] || {});
 
-      if (['rx', 'tx', 'rotator'].includes(section)) {
+      if (section === 'rotator') {
         fieldset.appendChild(buildDeviceTestControls(section));
       }
 
       form.appendChild(fieldset);
     });
+    applyCatDeviceConnectivityState();
     applyConnectivityState();
-    bindConnectivityState();
+    document
+      .querySelector('[name="rotator.connectivity"]')
+      ?.addEventListener('change', applyConnectivityState);
     status.textContent = '';
   } catch (error) {
     status.textContent = 'Settings load failed.';
   }
+}
+
+function buildCatDevicesSection(catDevices) {
+  const fieldset = document.createElement('fieldset');
+  fieldset.className = 'cat-devices-settings';
+
+  const legend = document.createElement('legend');
+  legend.textContent = 'My Devices';
+  fieldset.appendChild(legend);
+
+  const note = document.createElement('div');
+  note.className = 'automation-settings-note';
+  note.textContent = 'Add local USB radios or network Hamlib endpoints here, then assign them to RX or TX below. Devices are checked when saved to determine which role or roles they can safely fill. A device must expose the required Hamlib capabilities before it can be used for both RX and TX.';
+  fieldset.appendChild(note);
+
+  const list = document.createElement('div');
+  list.className = 'cat-device-list';
+  list.id = 'cat-device-list';
+  if (!catDevices.length) {
+    list.appendChild(buildCatDeviceCard(createEmptyCatDevice()));
+  } else {
+    catDevices.forEach((device) => list.appendChild(buildCatDeviceCard({ ...device, _saved: true })));
+  }
+  fieldset.appendChild(list);
+
+  const actions = document.createElement('div');
+  actions.className = 'settings-section-actions';
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn btn-outline-primary btn-sm';
+  button.textContent = 'Add Device';
+  button.addEventListener('click', () => {
+    document.getElementById('cat-device-list')?.appendChild(
+      buildCatDeviceCard(createEmptyCatDevice()),
+    );
+    applyCatDeviceConnectivityState();
+  });
+
+  actions.appendChild(button);
+  fieldset.appendChild(actions);
+  return fieldset;
+}
+
+function buildCatDeviceCard(device) {
+  const card = document.createElement('section');
+  card.className = 'cat-device-card';
+  card.dataset.deviceId = String(device.device_id || '');
+  card.dataset.saved = device._saved ? 'true' : 'false';
+  card.dataset.savedDeviceId = device._saved ? String(device.device_id || '') : '';
+  applyCatDeviceCapabilitiesToCard(card, device);
+
+  const header = document.createElement('div');
+  header.className = 'cat-device-card-header';
+
+  const title = document.createElement('div');
+  title.className = 'cat-device-card-title';
+  title.textContent = device.name || 'New Device';
+  header.appendChild(title);
+  card.appendChild(header);
+
+  const body = document.createElement('div');
+  body.className = 'cat-device-body';
+
+  const config = document.createElement('div');
+  config.className = 'cat-device-config';
+
+  const topGrid = document.createElement('div');
+  topGrid.className = 'cat-device-top-grid';
+  topGrid.append(
+    buildCatDeviceField('Name', 'name', device.name || '', { inputClass: 'compact-input' }),
+    buildCatDeviceField('Device ID', 'device_id', device.device_id || '', { inputClass: 'compact-input' }),
+    buildCatDeviceField('Connectivity', 'connectivity', device.connectivity || '', { type: 'connectivity' }),
+    buildCatDeviceField('Timeout (s)', 'timeout_s', device.timeout_s || '2.0', { inputMode: 'decimal', compactClass: 'settings-row-compact-sm' }),
+  );
+  config.appendChild(topGrid);
+
+  const detailGrid = document.createElement('div');
+  detailGrid.className = 'cat-device-detail-grid';
+  detailGrid.append(
+    buildCatDeviceField('Host', 'host', device.host || ''),
+    buildCatDeviceField('Port', 'port', device.port || '', { inputMode: 'numeric', compactClass: 'settings-row-compact-md' }),
+    buildCatDeviceField('Serial Port', 'serial_port', device.serial_port || '', { type: 'serial_port' }),
+    buildCatDeviceField('Baud', 'baud', device.baud || '', { inputMode: 'numeric', compactClass: 'settings-row-compact-md' }),
+    buildCatDeviceField('Model ID', 'model_id', device.model_id || '', { type: 'hamlib_model' }),
+  );
+  config.appendChild(detailGrid);
+  body.appendChild(config);
+
+  const capabilityChart = document.createElement('div');
+  capabilityChart.className = 'device-capability-chart';
+  capabilityChart.dataset.capabilityChart = 'true';
+  body.appendChild(capabilityChart);
+
+  const actions = document.createElement('div');
+  actions.className = 'cat-device-actions-column';
+
+  const buttons = document.createElement('div');
+  buttons.className = 'cat-device-action-buttons';
+
+  const saveButton = document.createElement('button');
+  saveButton.type = 'button';
+  saveButton.className = 'btn btn-outline-primary btn-sm';
+  saveButton.textContent = 'Save';
+  saveButton.addEventListener('click', () => saveCatDevice(card));
+
+  const removeButton = document.createElement('button');
+  removeButton.type = 'button';
+  removeButton.className = 'btn btn-outline-danger btn-sm';
+  removeButton.textContent = 'Remove';
+  removeButton.addEventListener('click', () => removeCatDevice(card));
+
+  buttons.append(saveButton, removeButton);
+  actions.appendChild(buttons);
+
+  const status = document.createElement('div');
+  status.className = 'settings-section-status';
+  status.dataset.catDeviceStatus = 'true';
+  actions.appendChild(status);
+
+  body.appendChild(actions);
+  card.appendChild(body);
+
+  renderCatDeviceCapabilityChart(card);
+  attachCatDeviceFieldHandlers(card);
+  return card;
+}
+
+function buildCatDeviceField(label, key, value, options = {}) {
+  const row = document.createElement('label');
+  row.className = 'settings-row';
+  row.dataset.catDeviceKey = key;
+  if (options.compactClass) {
+    row.classList.add(options.compactClass);
+  }
+
+  const labelText = document.createElement('span');
+  labelText.className = 'form-label mb-0';
+  labelText.textContent = label;
+  row.appendChild(labelText);
+
+  let control;
+  if (options.type === 'connectivity') {
+    control = document.createElement('select');
+    control.className = 'form-select';
+    [
+      ['', 'Select connectivity'],
+      ['network', 'network'],
+      ['local', 'local'],
+    ].forEach(([optionValue, optionLabel]) => {
+      const option = document.createElement('option');
+      option.value = optionValue;
+      option.textContent = optionLabel;
+      control.appendChild(option);
+    });
+    control.value = value || '';
+  } else if (options.type === 'serial_port') {
+    control = buildSerialPortSelect(value);
+  } else if (options.type === 'hamlib_model') {
+    control = buildHamlibModelSelect(value);
+  } else {
+    control = document.createElement('input');
+    control.className = `form-control ${options.inputClass || ''}`.trim();
+    control.value = value;
+    if (options.inputMode) {
+      control.inputMode = options.inputMode;
+    }
+  }
+
+  control.dataset.catDeviceField = key;
+  row.appendChild(control);
+  if (options.type === 'serial_port' && control.dataset.deviceMissing === 'true') {
+    const warning = document.createElement('span');
+    warning.className = 'settings-inline-warning';
+    warning.textContent = 'Selected device not connected.';
+    row.appendChild(warning);
+  }
+  return row;
+}
+
+function attachCatDeviceFieldHandlers(card) {
+  const nameInput = card.querySelector('[data-cat-device-field="name"]');
+  const idInput = card.querySelector('[data-cat-device-field="device_id"]');
+  const title = card.querySelector('.cat-device-card-title');
+  const connectivity = card.querySelector('[data-cat-device-field="connectivity"]');
+  card.querySelectorAll('[data-cat-device-field]').forEach((element) => {
+    element.addEventListener('change', () => {
+      markCatDeviceDirty(card);
+    });
+    if (element.tagName === 'INPUT') {
+      element.addEventListener('input', () => {
+        markCatDeviceDirty(card);
+      });
+    }
+  });
+  nameInput?.addEventListener('input', () => {
+    title.textContent = nameInput.value.trim() || 'New Device';
+  });
+  idInput?.addEventListener('input', () => {
+    idInput.value = idInput.value.toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+    card.dataset.deviceId = idInput.value.trim();
+  });
+  connectivity?.addEventListener('change', () => {
+    applyCatDeviceConnectivityState();
+  });
+}
+
+function markCatDeviceDirty(card) {
+  if (!card) {
+    return;
+  }
+  const status = card.querySelector('[data-cat-device-status]');
+  if (card.dataset.saved === 'true' && status && !status.textContent.trim()) {
+    status.textContent = 'Unsaved changes.';
+    status.classList.remove('is-error');
+  }
+}
+
+function buildRoleAssignmentSection(section, sectionSettings) {
+  const fieldset = document.createElement('fieldset');
+  const legend = document.createElement('legend');
+  legend.textContent = formatSectionLegend(section);
+  fieldset.appendChild(legend);
+
+  fieldset.appendChild(
+    buildSettingControl(section, 'device_id', sectionSettings.device_id ?? ''),
+  );
+  fieldset.appendChild(
+    buildSettingControl(section, 'target_vfo', sectionSettings.target_vfo ?? 'current'),
+  );
+  return fieldset;
+}
+
+function buildDeviceRolesSection(rxSettings, txSettings) {
+  const fieldset = document.createElement('fieldset');
+  fieldset.className = 'device-roles-settings';
+
+  const legend = document.createElement('legend');
+  legend.textContent = 'Device Roles';
+  fieldset.appendChild(legend);
+
+  const layout = document.createElement('div');
+  layout.className = 'device-roles-layout';
+
+  const rxColumn = document.createElement('div');
+  rxColumn.className = 'device-role-column';
+  rxColumn.append(
+    buildRoleAssignmentSection('rx', rxSettings),
+    buildDeviceTestControls('rx'),
+  );
+
+  const txColumn = document.createElement('div');
+  txColumn.className = 'device-role-column';
+  txColumn.append(
+    buildRoleAssignmentSection('tx', txSettings),
+    buildDeviceTestControls('tx'),
+  );
+
+  layout.append(rxColumn, txColumn);
+  fieldset.appendChild(layout);
+  return fieldset;
 }
 
 function buildSettingsSection(section, visibleKeys, sectionSettings) {
@@ -1969,8 +2252,11 @@ function buildDeviceTestControls(section) {
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'btn btn-outline-primary btn-sm';
-  button.textContent = `Test ${formatSectionLabel(section)}`;
+  button.textContent = `Test ${formatSectionLabel(section)} Device`;
   button.addEventListener('click', () => testDevice(section));
+  if (section === 'rx' || section === 'tx') {
+    button.dataset.roleTestButton = section;
+  }
 
   const status = document.createElement('span');
   status.className = 'settings-section-status';
@@ -1994,6 +2280,78 @@ function collectSectionSettings(section) {
     settings[key] = element.value;
   });
   return settings;
+}
+
+function createEmptyCatDevice() {
+  const nextNumber = document.querySelectorAll('.cat-device-card').length + 1;
+  return {
+    device_id: `device-${nextNumber}`,
+    name: `Device ${nextNumber}`,
+    connectivity: '',
+    host: '',
+    port: '4532',
+    serial_port: '',
+    baud: '',
+    model_id: '',
+    timeout_s: '2.0',
+  };
+}
+
+function refreshRoleDeviceSelectors() {
+  ['rx', 'tx'].forEach((section) => {
+    const select = document.querySelector(`select[name="${section}.device_id"]`);
+    if (!select) {
+      return;
+    }
+    const currentValue = select.value;
+    const otherSection = section === 'rx' ? 'tx' : 'rx';
+    const otherSelectedDeviceId = document.querySelector(`select[name="${otherSection}.device_id"]`)?.value || '';
+    const replacement = buildCatDeviceSelect(currentValue, {
+      allowNetwork: section !== 'tx',
+      role: section,
+      otherSelectedDeviceId,
+    });
+    replacement.name = select.name;
+    replacement.addEventListener('change', () => {
+      if (!currentSettingsState[section]) {
+        currentSettingsState[section] = {};
+      }
+      currentSettingsState[section].device_id = replacement.value;
+      refreshRoleDeviceSelectors();
+    });
+    select.replaceWith(replacement);
+  });
+  updateRoleTestButtons();
+}
+
+function applyCatDeviceConnectivityState() {
+  document.querySelectorAll('.cat-device-card').forEach((card) => {
+    const connectivity = card.querySelector('[data-cat-device-field="connectivity"]');
+    if (!connectivity) {
+      return;
+    }
+    const connectivityValue = String(connectivity.value || '').trim().toLowerCase();
+    const isLocal = connectivityValue === 'local';
+    const isNetwork = connectivityValue === 'network';
+    toggleCatDeviceField(card, 'host', !isNetwork, !isNetwork);
+    toggleCatDeviceField(card, 'port', !isNetwork, !isNetwork);
+    toggleCatDeviceField(card, 'serial_port', !isLocal, !isLocal);
+    toggleCatDeviceField(card, 'baud', !isLocal, !isLocal);
+    toggleCatDeviceField(card, 'model_id', !isLocal, !isLocal);
+  });
+}
+
+function toggleCatDeviceField(card, key, disabled, hidden = disabled) {
+  const element = card.querySelector(`[data-cat-device-field="${key}"]`);
+  if (!element) {
+    return;
+  }
+  element.disabled = disabled;
+  const row = element.closest('.settings-row');
+  if (row) {
+    row.classList.toggle('control-disabled', disabled);
+    row.hidden = hidden;
+  }
 }
 
 function setDeviceTestStatus(section, message, isError = false) {
@@ -2038,6 +2396,7 @@ async function testDevice(section) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         settings: collectSectionSettings(section),
+        cat_devices: catDevicesCache,
       }),
     });
     const result = await response.json();
@@ -2051,6 +2410,204 @@ async function testDevice(section) {
     setDeviceTestStatus(section, message, true);
     addLog(message);
   }
+}
+
+function updateRoleTestButtons() {
+  ['rx', 'tx'].forEach((section) => {
+    const button = document.querySelector(`[data-role-test-button="${section}"]`);
+    const status = document.getElementById(`test-status-${section}`);
+    if (!button) {
+      return;
+    }
+    const selectedDeviceId = document.querySelector(`select[name="${section}.device_id"]`)?.value || '';
+    const selectedDevice = catDevicesCache.find((device) => String(device.device_id) === String(selectedDeviceId));
+    const deviceTestAvailable = section === 'rx'
+      ? Boolean(selectedDevice)
+      : selectedDevice?.connectivity === 'local';
+    button.disabled = !deviceTestAvailable;
+    if (!deviceTestAvailable) {
+      button.title = section === 'tx'
+        ? 'TX device test is only available for local devices.'
+        : 'Select an RX device to test.';
+      if (status) {
+        status.textContent = section === 'tx'
+          ? 'Select a local device. Network devices are RX-only.'
+          : 'Select an RX device to test.';
+        status.classList.remove('is-error');
+      }
+      return;
+    }
+    button.title = '';
+    if (status && status.textContent.includes('Select an RX device')) {
+      status.textContent = '';
+    }
+    if (status && status.textContent.includes('TX device test is only available')) {
+      status.textContent = '';
+    }
+    if (status && status.textContent.includes('Network devices are RX-only')) {
+      status.textContent = '';
+    }
+  });
+}
+
+function collectCatDeviceFromCard(card) {
+  const values = {};
+  card.querySelectorAll('[data-cat-device-field]').forEach((element) => {
+    values[element.dataset.catDeviceField] = element.value;
+  });
+  return {
+    device_id: String(values.device_id || '').trim(),
+    name: String(values.name || '').trim(),
+    connectivity: String(values.connectivity || '').trim(),
+    host: String(values.host || '').trim(),
+    port: String(values.port || '').trim(),
+    serial_port: String(values.serial_port || '').trim(),
+    baud: String(values.baud || '').trim(),
+    model_id: String(values.model_id || '').trim(),
+    timeout_s: String(values.timeout_s || '').trim() || '2.0',
+  };
+}
+
+async function saveCatDevice(card) {
+  const status = card.querySelector('[data-cat-device-status]');
+  const device = collectCatDeviceFromCard(card);
+  if (!device.name || !device.device_id || !device.connectivity) {
+    if (status) {
+      status.textContent = 'Name, Device ID, and Connectivity are required.';
+      status.classList.add('is-error');
+    }
+    return;
+  }
+  if (device.connectivity === 'network' && (!device.host || !device.port)) {
+    if (status) {
+      status.textContent = 'Host and Port are required for network devices.';
+      status.classList.add('is-error');
+    }
+    return;
+  }
+  if (device.connectivity === 'local' && (!device.serial_port || !device.model_id)) {
+    if (status) {
+      status.textContent = 'Serial Port and Model ID are required for local devices.';
+      status.classList.add('is-error');
+    }
+    return;
+  }
+
+  if (status) {
+    status.textContent = 'Saving device...';
+    status.classList.remove('is-error');
+  }
+  try {
+    const response = await fetch('/api/cat-devices', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        original_device_id: card.dataset.savedDeviceId || '',
+        device,
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      if (status) {
+        status.textContent = result.detail || 'Device save failed.';
+        status.classList.add('is-error');
+      }
+      addLog(result.detail || 'Device save failed.');
+      return;
+    }
+    catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : catDevicesCache;
+    addLog(result.message || 'Device saved.');
+    await loadSettings();
+  } catch (error) {
+    if (status) {
+      status.textContent = 'Device save failed.';
+      status.classList.add('is-error');
+    }
+    addLog('Device save failed.');
+  }
+}
+
+async function removeCatDevice(card) {
+  const savedDeviceId = String(card.dataset.savedDeviceId || '').trim();
+  if (!savedDeviceId) {
+    card.remove();
+    return;
+  }
+  const status = card.querySelector('[data-cat-device-status]');
+  if (status) {
+    status.textContent = 'Removing device...';
+    status.classList.remove('is-error');
+  }
+  try {
+    const response = await fetch(`/api/cat-devices/${encodeURIComponent(savedDeviceId)}`, {
+      method: 'DELETE',
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      if (status) {
+        status.textContent = result.detail || 'Device removal failed.';
+        status.classList.add('is-error');
+      }
+      addLog(result.detail || 'Device removal failed.');
+      return;
+    }
+    catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : catDevicesCache;
+    addLog(result.message || 'Device removed.');
+    await loadSettings();
+  } catch (error) {
+    if (status) {
+      status.textContent = 'Device removal failed.';
+      status.classList.add('is-error');
+    }
+    addLog('Device removal failed.');
+  }
+}
+
+function applyCatDeviceCapabilitiesToCard(card, device) {
+  card.dataset.capabilityComm = normalizeCapabilityValue(device.capability_comm);
+  card.dataset.capabilityPtt = normalizeCapabilityValue(device.capability_ptt);
+  card.dataset.capabilityVfo = normalizeCapabilityValue(device.capability_vfo);
+  card.dataset.capabilityShared = normalizeCapabilityValue(device.capability_shared);
+  card.dataset.capabilityLastTestUtc = String(device.capability_last_test_utc || '').trim();
+  card.dataset.capabilityNotes = String(device.capability_notes || '').trim();
+}
+
+function normalizeCapabilityValue(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'true' || normalized === 'false') {
+    return normalized;
+  }
+  return '';
+}
+
+function renderCatDeviceCapabilityChart(card) {
+  const container = card.querySelector('[data-capability-chart="true"]');
+  if (!container) {
+    return;
+  }
+  container.replaceChildren();
+  const items = [
+    ['Rig CTL', card.dataset.capabilityComm],
+    ['PTT', card.dataset.capabilityPtt],
+    ['VFO', card.dataset.capabilityVfo],
+    ['Shared RX/TX', card.dataset.capabilityShared],
+  ];
+  items.forEach(([label, value]) => {
+    const item = document.createElement('div');
+    item.className = 'device-capability-item';
+    const icon = document.createElement('span');
+    icon.className = `device-capability-icon capability-${value || 'unknown'}`;
+    icon.textContent = value === 'true' ? '✓' : value === 'false' ? '✕' : '?';
+    const text = document.createElement('span');
+    text.className = 'device-capability-label';
+    text.textContent = label;
+    item.append(icon, text);
+    container.appendChild(item);
+  });
+  const notes = document.createElement('div');
+  notes.className = 'device-capability-notes';
+  notes.textContent = card.dataset.capabilityNotes || 'Save device to populate device support when reachable.';
+  container.appendChild(notes);
 }
 
 function buildSatellitePassList(passes) {
@@ -2234,7 +2791,24 @@ function buildSettingControl(section, key, value) {
     return row;
   }
 
-  if (key === 'connectivity') {
+  if (key === 'device_id' && (section === 'rx' || section === 'tx')) {
+    const otherSection = section === 'rx' ? 'tx' : 'rx';
+    const otherSelectedDeviceId = document.querySelector(`select[name="${otherSection}.device_id"]`)?.value
+      || currentSettingsState?.[otherSection]?.device_id
+      || '';
+    control = buildCatDeviceSelect(value, {
+      allowNetwork: section !== 'tx',
+      role: section,
+      otherSelectedDeviceId,
+    });
+    control.addEventListener('change', () => {
+      if (!currentSettingsState[section]) {
+        currentSettingsState[section] = {};
+      }
+      currentSettingsState[section].device_id = control.value;
+      refreshRoleDeviceSelectors();
+    });
+  } else if (key === 'connectivity') {
     control = document.createElement('select');
     control.className = 'form-select';
     ['network', 'local'].forEach((optionValue) => {
@@ -2244,10 +2818,8 @@ function buildSettingControl(section, key, value) {
       control.appendChild(option);
     });
     control.value = value || 'network';
-  } else if (key === 'serial_port' && (section === 'rx' || section === 'tx' || section === 'rotator')) {
+  } else if (key === 'serial_port' && section === 'rotator') {
     control = buildSerialPortSelect(value);
-  } else if (key === 'model_id' && (section === 'rx' || section === 'tx')) {
-    control = buildHamlibModelSelect(value);
   } else if (key === 'model_id' && section === 'rotator') {
     control = buildHamlibRotatorModelSelect(value);
   } else if (key === 'target_vfo' && (section === 'rx' || section === 'tx')) {
@@ -2289,7 +2861,7 @@ function buildSettingControl(section, key, value) {
   row.append(labelText, control);
   if (
     key === 'serial_port'
-    && (section === 'rx' || section === 'tx' || section === 'rotator')
+    && section === 'rotator'
     && control.dataset.deviceMissing === 'true'
   ) {
     const warning = document.createElement('span');
@@ -2369,7 +2941,56 @@ function buildHamlibModelSelect(value) {
   hamlibRadioModels.forEach((model) => {
     const option = document.createElement('option');
     option.value = String(model.model_id);
-    option.textContent = `${model.model_id} - ${model.label}`;
+    option.textContent = model.label;
+    control.appendChild(option);
+  });
+  control.value = selectedValue;
+  return control;
+}
+
+function buildCatDeviceSelect(value, options = {}) {
+  const control = document.createElement('select');
+  control.className = 'form-select';
+  const allowNetwork = options.allowNetwork !== false;
+  const role = String(options.role || '').toLowerCase();
+  const otherSelectedDeviceId = String(options.otherSelectedDeviceId || '');
+
+  const blank = document.createElement('option');
+  blank.value = '';
+  blank.textContent = catDevicesCache.length
+    ? 'Select CAT device'
+    : 'No CAT devices configured';
+  control.appendChild(blank);
+
+  const selectedValue = String(value || '');
+  const selectableDevices = catDevicesCache.filter((device) => {
+    const connectivity = String(device.connectivity || '').toLowerCase();
+    if (!allowNetwork && connectivity !== 'local') {
+      return false;
+    }
+    const deviceId = String(device.device_id || '');
+    if (
+      otherSelectedDeviceId
+      && deviceId === otherSelectedDeviceId
+      && role
+      && String(device.capability_shared || '').toLowerCase() !== 'true'
+    ) {
+      return deviceId === selectedValue;
+    }
+    return true;
+  });
+  const hasSelectedValue = selectableDevices.some((device) => String(device.device_id) === selectedValue);
+  if (selectedValue && !hasSelectedValue) {
+    const current = document.createElement('option');
+    current.value = selectedValue;
+    current.textContent = `${selectedValue} (not available)`;
+    control.appendChild(current);
+  }
+
+  selectableDevices.forEach((device) => {
+    const option = document.createElement('option');
+    option.value = String(device.device_id);
+    option.textContent = `${device.name} [${device.device_id}]`;
     control.appendChild(option);
   });
   control.value = selectedValue;
@@ -2420,7 +3041,7 @@ function buildHamlibRotatorModelSelect(value) {
   hamlibRotatorModels.forEach((model) => {
     const option = document.createElement('option');
     option.value = String(model.model_id);
-    option.textContent = `${model.model_id} - ${model.label}`;
+    option.textContent = model.label;
     control.appendChild(option);
   });
   control.value = selectedValue;
@@ -2476,6 +3097,7 @@ async function saveSettings(event) {
       status.textContent = result.detail || 'Settings save failed.';
       return;
     }
+    catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : catDevicesCache;
     status.textContent = 'Settings saved and connections reloaded.';
     loadStatus();
     await loadSettings();
@@ -2586,6 +3208,7 @@ function formatSettingLabel(key) {
     port: 'Port',
     baud: 'Baud',
     model_id: 'Model ID',
+    device_id: 'Assigned Device',
     serial_port: 'Serial Port',
     write_enabled: 'Write Enabled',
     timeout_s: 'Timeout (s)',
@@ -3378,17 +4001,8 @@ function formatDuration(totalSeconds) {
   return `${remainder}s`;
 }
 
-function bindConnectivityState() {
-  ['rx', 'tx', 'rotator'].forEach((section) => {
-    const connectivity = document.querySelector(`[name="${section}.connectivity"]`);
-    if (connectivity) {
-      connectivity.addEventListener('change', applyConnectivityState);
-    }
-  });
-}
-
 function applyConnectivityState() {
-  ['rx', 'tx', 'rotator'].forEach((section) => {
+  ['rotator'].forEach((section) => {
     const connectivity = document.querySelector(`[name="${section}.connectivity"]`);
     if (!connectivity) {
       return;
@@ -3399,9 +4013,6 @@ function applyConnectivityState() {
     setSettingDisabled(section, 'serial_port', !isLocal);
     setSettingDisabled(section, 'baud', !isLocal);
     setSettingDisabled(section, 'model_id', !isLocal);
-    if (section === 'rx' || section === 'tx') {
-      setSettingDisabled(section, 'target_vfo', !isLocal);
-    }
   });
 }
 

@@ -32,6 +32,7 @@ from pi_sat_controller.backend.automation_scripts import (
 from pi_sat_controller.backend.config import (
     PROJECT_ROOT,
     SETTINGS_SCHEMA,
+    load_cat_devices,
     load_config,
     load_my_satellites,
     load_settings,
@@ -44,6 +45,7 @@ from pi_sat_controller.backend.device_support import (
     build_rotator_client,
     build_rx_manager,
     load_hamlib_model_caches,
+    run_cat_device_test,
     run_device_test,
     uses_same_local_radio,
 )
@@ -64,6 +66,10 @@ from pi_sat_controller.backend.radio.radio_manager import (
     disabled_radio_snapshot,
 )
 from pi_sat_controller.backend.radio.local_hamlib_client import LocalHamlibClient
+from pi_sat_controller.backend.radio.shared_radio_controller import (
+    SharedLocalRadioController,
+    SharedRadioRoleClient,
+)
 from pi_sat_controller.backend.runtime_fallbacks import (
     DisabledTrackingSdrManager,
     FailedRadioManager,
@@ -221,6 +227,32 @@ def _build_hamlib_rotator_models_payload() -> dict[str, object]:
         "error": hamlib_rotator_models_error,
     }
 
+
+def _clear_split_for_single_role_radios(
+    config,
+    rx_manager,
+    tx_manager,
+    shared_local_radio: bool,
+) -> None:
+    if shared_local_radio:
+        return
+
+    if config.rx.enabled and config.rx.connectivity == "local":
+        radio_manager = getattr(rx_manager, "radio_manager", None)
+        if radio_manager is not None and hasattr(radio_manager, "try_set_split_mode_disabled"):
+            radio_manager.try_set_split_mode_disabled(
+                source="startup.rx_single_role",
+                force=True,
+            )
+
+    if config.tx.enabled and config.tx.connectivity == "local":
+        if tx_manager is not None and hasattr(tx_manager, "try_set_split_mode_disabled"):
+            tx_manager.try_set_split_mode_disabled(
+                source="startup.tx_single_role",
+                force=True,
+            )
+
+
 def _get_or_create_rx_tracking_manager(
     norad_id: int | None = None,
     transponder_index: int = 0,
@@ -332,21 +364,42 @@ def _reload_runtime_config() -> None:
     ) = load_hamlib_model_caches(LOGGER)
     config = load_config()
     failure_threshold = max(1, config.safety.device_offline_failure_threshold)
-    shared_local_client = None
-    if uses_same_local_radio(config):
-        shared_local_client = LocalHamlibClient(
-            model_id=config.rx.model_id or config.tx.model_id or 0,
-            serial_port=config.rx.serial_port or config.tx.serial_port,
-            baud=config.rx.baud or config.tx.baud or 0,
-            timeout_s=max(config.rx.timeout_s, config.tx.timeout_s),
-            debug_logging=bool(config.rx.cat_debug_logging or config.tx.cat_debug_logging),
-            role_label="shared",
-        )
+    shared_local_radio = uses_same_local_radio(config)
+    shared_local_split_mode = (
+        shared_local_radio and bool(config.tx.shared_local_split_mode)
+    )
+    shared_rx_client = None
+    shared_tx_client = None
+    shared_setup_error: str | None = None
+    if shared_local_radio:
+        try:
+            shared_local_client = LocalHamlibClient(
+                model_id=config.rx.model_id or config.tx.model_id or 0,
+                serial_port=config.rx.serial_port or config.tx.serial_port,
+                baud=config.rx.baud or config.tx.baud or 0,
+                timeout_s=max(config.rx.timeout_s, config.tx.timeout_s),
+                debug_logging=bool(config.rx.cat_debug_logging or config.tx.cat_debug_logging),
+                role_label="shared",
+                vfo_mode=True,
+            )
+            shared_controller = SharedLocalRadioController(
+                client=shared_local_client,
+                rx_vfo=config.rx.target_vfo,
+                tx_vfo=config.tx.target_vfo,
+                split_enabled=shared_local_split_mode,
+            )
+            shared_rx_client = SharedRadioRoleClient(shared_controller, "rx")
+            shared_tx_client = SharedRadioRoleClient(shared_controller, "tx")
+        except Exception as exc:
+            shared_setup_error = str(exc)
+            LOGGER.warning("Shared local radio setup failed: %s", exc)
     if config.rx.enabled:
         try:
+            if shared_setup_error:
+                raise RuntimeError(shared_setup_error)
             sdr_manager = build_rx_manager(
                 config.rx,
-                shared_local_client,
+                shared_rx_client,
                 failure_threshold=failure_threshold,
             )
             sdr_manager.start()
@@ -356,9 +409,10 @@ def _reload_runtime_config() -> None:
             sdr_manager = FailedTrackingSdrManager(error)
     if config.tx.enabled:
         try:
-            shared_local_radio = uses_same_local_radio(config)
+            if shared_setup_error:
+                raise RuntimeError(shared_setup_error)
             tx_radio_manager = RadioManager(
-                client=build_radio_client(config.tx, "TX", shared_local_client),
+                client=build_radio_client(config.tx, "TX", shared_tx_client),
                 enabled=config.tx.enabled,
                 write_enabled=config.tx.write_enabled,
                 target_vfo=config.tx.target_vfo,
@@ -367,6 +421,10 @@ def _reload_runtime_config() -> None:
                 restore_vfo_after_write=(
                     config.rx.target_vfo if shared_local_radio else None
                 ),
+                split_mode_vfo=(
+                    config.tx.target_vfo if shared_local_split_mode else None
+                ),
+                poll_target_vfo=False,
             )
         except Exception as exc:
             error = f"TX startup failed: {exc}"
@@ -392,6 +450,12 @@ def _reload_runtime_config() -> None:
                 enabled=config.rotator.enabled,
                 write_enabled=config.rotator.write_enabled,
             )
+    _clear_split_for_single_role_radios(
+        config,
+        sdr_manager,
+        tx_radio_manager,
+        shared_local_radio,
+    )
     try:
         _ensure_pass_cache()
     except Exception:
@@ -914,11 +978,18 @@ register_settings_api(
     logger=LOGGER,
     settings_schema=SETTINGS_SCHEMA,
     load_settings=load_settings,
+    load_cat_devices=load_cat_devices,
     save_settings=save_settings,
     reload_runtime_config=_reload_runtime_config,
     reload_rotator_config_only=_reload_rotator_config_only,
     list_serial_devices=_list_serial_devices,
-    run_device_test=lambda role, overrides: run_device_test(role, overrides, LOGGER),
+    run_device_test=lambda role, overrides, cat_devices=None: run_device_test(
+        role,
+        overrides,
+        LOGGER,
+        cat_devices,
+    ),
+    run_cat_device_test=lambda device: run_cat_device_test(device, LOGGER),
     list_automation_scripts=lambda: [script.to_dict() for script in list_automation_scripts()],
     run_automation_script_test=lambda event_name, script_name: _run_automation_script_test(
         event_name,

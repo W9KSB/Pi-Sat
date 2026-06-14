@@ -23,6 +23,7 @@ class LocalHamlibClient:
         target_vfo: str | None = None,
         debug_logging: bool = False,
         role_label: str = "rx",
+        vfo_mode: bool = False,
     ) -> None:
         self.model_id = model_id
         self.serial_port = serial_port
@@ -31,23 +32,53 @@ class LocalHamlibClient:
         self.target_vfo = target_vfo
         self.debug_logging = debug_logging
         self.role_label = role_label
+        self.vfo_mode = vfo_mode
         self._lock = RLock()
         self._daemon: subprocess.Popen[str] | None = None
         self._daemon_port: int | None = None
         self._client: PersistentRigctldClient | None = None
         self._log_thread: Thread | None = None
+        self._connection_generation = 0
+
+    @property
+    def connection_generation(self) -> int:
+        return self._connection_generation
+
+    def ensure_connected(self) -> int:
+        with self._lock:
+            self._ensure_client()
+            return self._connection_generation
 
     def get_frequency(self) -> int:
         with self._lock:
             client = self._ensure_client()
             return client.get_frequency()
 
+    def get_ptt(self) -> bool:
+        with self._lock:
+            client = self._ensure_client()
+            return client.get_ptt()
+
+    def get_vfo(self) -> str:
+        with self._lock:
+            client = self._ensure_client()
+            return client.get_vfo()
+
     def get_frequency_on_vfo(self, vfo: str | None) -> int:
         with self._lock:
             client = self._ensure_client()
             if vfo:
+                if self.vfo_mode:
+                    return client.get_frequency_on_vfo(vfo)
                 client.select_vfo(vfo)
             return client.get_frequency()
+
+    def get_ptt_on_vfo(self, vfo: str) -> bool:
+        with self._lock:
+            client = self._ensure_client()
+            if self.vfo_mode:
+                return client.get_ptt_on_vfo(vfo)
+            return client.get_ptt()
 
     def set_frequency(self, frequency_hz: int) -> None:
         with self._lock:
@@ -77,6 +108,9 @@ class LocalHamlibClient:
     def set_frequency_on_vfo(self, vfo: str | None, frequency_hz: int) -> None:
         with self._lock:
             client = self._ensure_client()
+            if vfo and self.vfo_mode:
+                client.set_frequency_on_vfo(vfo, frequency_hz)
+                return
             if vfo:
                 client.select_vfo(vfo)
             try:
@@ -144,10 +178,41 @@ class LocalHamlibClient:
             client = self._ensure_client()
             client.set_mode(mode, passband_hz)
 
+    def set_split(self, enabled: bool, tx_vfo: str | None = None) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            client.set_split(enabled, tx_vfo)
+
+    def set_split_on_vfo(
+        self,
+        rx_vfo: str,
+        enabled: bool,
+        tx_vfo: str | None = None,
+    ) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            if self.vfo_mode:
+                client.set_split_on_vfo(rx_vfo, enabled, tx_vfo)
+                return
+            client.set_split(enabled, tx_vfo)
+
+    def set_split_frequency(self, frequency_hz: int) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            client.set_split_frequency(frequency_hz)
+
+    def set_split_mode(self, mode: str, passband_hz: int = 0) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            client.set_split_mode(mode, passband_hz)
+
     def set_mode_on_vfo(self, vfo: str | None, mode: str, passband_hz: int = 0) -> None:
         with self._lock:
             client = self._ensure_client()
             if vfo:
+                if self.vfo_mode:
+                    client.set_mode_on_vfo(vfo, mode, passband_hz)
+                    return
                 client.select_vfo(vfo)
             client.set_mode(mode, passband_hz)
 
@@ -204,6 +269,8 @@ class LocalHamlibClient:
             "-t",
             str(port),
         ]
+        if self.vfo_mode:
+            command.insert(1, "-o")
         if self.debug_logging:
             command.insert(1, "-vvvvv")
         LOGGER.info(
@@ -247,12 +314,16 @@ class LocalHamlibClient:
             )
             try:
                 client.connect()
+                if self.vfo_mode and not client.check_vfo_mode():
+                    client.close()
+                    raise RuntimeError("rigctld did not enable VFO-addressed command mode")
             except Exception as exc:
                 last_error = exc
                 sleep(0.1)
                 continue
             self._client = client
             self._daemon_port = port
+            self._connection_generation += 1
             LOGGER.info("local_hamlib role=%s rigctld_ready port=%s", self.role_label, port)
             return client
         raise RuntimeError(f"rigctld startup timed out: {last_error}")

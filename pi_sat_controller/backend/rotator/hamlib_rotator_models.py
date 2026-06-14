@@ -22,12 +22,18 @@ def parse_rotctl_model_list(output: str) -> list[HamlibRotatorModel]:
         line = raw_line.strip()
         if not line:
             continue
-        first, _, rest = line.partition(" ")
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        first = parts[0]
         try:
             model_id = int(first)
         except ValueError:
             continue
-        label = " ".join(rest.split()) if rest else str(model_id)
+        manufacturer = parts[1]
+        model_name = parts[2]
+        label_parts = [part for part in (manufacturer, model_name) if part]
+        label = " ".join(label_parts) if label_parts else str(model_id)
         models.append(HamlibRotatorModel(model_id=model_id, label=label))
     return models
 

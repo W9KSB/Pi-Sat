@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
-from pi_sat_controller.backend.config import DeviceConfig, load_settings
+from pi_sat_controller.backend.config import DeviceConfig, load_cat_devices, load_settings
 from pi_sat_controller.backend.radio.hamlib_client import HamlibClient
 from pi_sat_controller.backend.radio.hamlib_models import load_hamlib_radio_models
 from pi_sat_controller.backend.radio.local_hamlib_client import LocalHamlibClient
@@ -41,23 +42,87 @@ def parse_float_setting(value: Any, fallback: float | None = None) -> float | No
     return float(text)
 
 
-def device_config_from_settings(role: str, overrides: dict[str, Any]) -> DeviceConfig:
+def _device_config_from_cat_device_entry(device_settings: dict[str, Any]) -> DeviceConfig:
+    return DeviceConfig(
+        enabled=True,
+        device_id=str(device_settings.get("device_id", "")).strip() or None,
+        connectivity=str(device_settings.get("connectivity", "network")).strip() or "network",
+        host=str(device_settings.get("host", "")).strip(),
+        port=parse_int_setting(device_settings.get("port"), 0) or 0,
+        serial_port=str(device_settings.get("serial_port", "")).strip(),
+        baud=parse_int_setting(device_settings.get("baud")),
+        model_id=parse_int_setting(device_settings.get("model_id")),
+        target_vfo=None,
+        shared_local_split_mode=False,
+        write_enabled=False,
+        timeout_s=parse_float_setting(device_settings.get("timeout_s"), 2.0) or 2.0,
+        cat_debug_logging=False,
+    )
+
+
+def device_config_from_settings(
+    role: str,
+    overrides: dict[str, Any],
+    cat_device_overrides: list[dict[str, Any]] | None = None,
+) -> DeviceConfig:
     settings = load_settings()
     section_settings = dict(settings.get(role, {}))
     section_settings.update(
         {str(key): "" if value is None else str(value) for key, value in overrides.items()}
     )
+    cat_devices = {
+        str(device["device_id"]): device
+        for device in (cat_device_overrides if cat_device_overrides is not None else load_cat_devices())
+        if str(device.get("device_id", "")).strip()
+    }
+    base_device = cat_devices.get(str(section_settings.get("device_id", "")).strip())
+    base_device_config = (
+        _device_config_from_cat_device_entry(base_device) if base_device is not None else None
+    )
     return DeviceConfig(
         enabled=parse_bool_setting(section_settings.get("enabled"), False),
-        connectivity=str(section_settings.get("connectivity", "network")).strip() or "network",
-        host=str(section_settings.get("host", "")).strip(),
-        port=parse_int_setting(section_settings.get("port"), 0) or 0,
-        serial_port=str(section_settings.get("serial_port", "")).strip(),
-        baud=parse_int_setting(section_settings.get("baud")),
-        model_id=parse_int_setting(section_settings.get("model_id")),
+        device_id=str(section_settings.get("device_id", "")).strip() or None,
+        connectivity=(
+            base_device_config.connectivity
+            if base_device_config is not None
+            else str(section_settings.get("connectivity", "network")).strip() or "network"
+        ),
+        host=(
+            base_device_config.host
+            if base_device_config is not None
+            else str(section_settings.get("host", "")).strip()
+        ),
+        port=(
+            base_device_config.port
+            if base_device_config is not None
+            else parse_int_setting(section_settings.get("port"), 0) or 0
+        ),
+        serial_port=(
+            base_device_config.serial_port
+            if base_device_config is not None
+            else str(section_settings.get("serial_port", "")).strip()
+        ),
+        baud=(
+            base_device_config.baud
+            if base_device_config is not None
+            else parse_int_setting(section_settings.get("baud"))
+        ),
+        model_id=(
+            base_device_config.model_id
+            if base_device_config is not None
+            else parse_int_setting(section_settings.get("model_id"))
+        ),
         target_vfo=str(section_settings.get("target_vfo", "")).strip() or None,
+        shared_local_split_mode=parse_bool_setting(
+            section_settings.get("shared_local_split_mode"),
+            False,
+        ),
         write_enabled=parse_bool_setting(section_settings.get("write_enabled"), False),
-        timeout_s=parse_float_setting(section_settings.get("timeout_s"), 2.0) or 2.0,
+        timeout_s=(
+            base_device_config.timeout_s
+            if base_device_config is not None
+            else parse_float_setting(section_settings.get("timeout_s"), 2.0) or 2.0
+        ),
         cat_debug_logging=parse_bool_setting(
             section_settings.get("cat_debug_logging"),
             False,
@@ -91,6 +156,8 @@ def device_endpoint_details(role: str, device_config: DeviceConfig) -> dict[str,
 
 def build_radio_client(device_config, role: str, shared_local_client=None):
     if device_config.connectivity == "network":
+        if role.strip().lower() == "tx":
+            raise ValueError("TX currently supports local devices only.")
         return HamlibClient(
             host=device_config.host,
             port=device_config.port,
@@ -170,6 +237,7 @@ def build_rx_manager(
                 write_enabled=device_config.write_enabled,
                 target_vfo=device_config.target_vfo,
                 failure_threshold=failure_threshold,
+                poll_target_vfo=False,
             ),
             poll_interval_s=1.0,
         )
@@ -180,8 +248,11 @@ def run_device_test(
     role: str,
     overrides: dict[str, Any],
     logger: logging.Logger,
+    cat_device_overrides: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
-    device_config = device_config_from_settings(role, overrides)
+    device_config = device_config_from_settings(role, overrides, cat_device_overrides)
+    if role == "tx" and device_config.connectivity != "local":
+        raise ValueError("TX device test is only available for local devices.")
     device_config = replace(
         device_config,
         timeout_s=min(max(float(device_config.timeout_s), 0.5), 5.0),
@@ -225,6 +296,109 @@ def run_device_test(
                 client.close()
             except Exception:
                 logger.exception("Temporary device test client cleanup failed role=%s", role)
+
+
+def run_cat_device_test(
+    device_settings: dict[str, Any],
+    logger: logging.Logger,
+) -> dict[str, object]:
+    device_config = replace(
+        _device_config_from_cat_device_entry(device_settings),
+        timeout_s=min(
+            max(float(parse_float_setting(device_settings.get("timeout_s"), 2.0) or 2.0), 0.5),
+            5.0,
+        ),
+    )
+    details = device_endpoint_details("rx", device_config)
+    client = None
+    try:
+        client = build_radio_client(device_config, "CAT Device")
+        frequency_hz = client.get_frequency()
+        details["frequency_hz"] = frequency_hz
+        capability_comm = True
+        capability_ptt = _probe_capability(client.get_ptt)
+        capability_vfo = _probe_capability(client.get_vfo)
+        capability_shared = (
+            device_config.connectivity == "local"
+            and capability_ptt
+            and capability_vfo
+        )
+        details["capability_comm"] = capability_comm
+        details["capability_ptt"] = capability_ptt
+        details["capability_vfo"] = capability_vfo
+        details["capability_shared"] = capability_shared
+        details["capability_last_test_utc"] = datetime.now(timezone.utc).isoformat()
+        details["capability_notes"] = _build_capability_notes(
+            capability_comm,
+            capability_ptt,
+            capability_vfo,
+            capability_shared,
+            device_config.connectivity,
+        )
+        return {
+            "ok": True,
+            "message": "Capability test complete.",
+            "details": details,
+        }
+    except Exception as exc:
+        logger.warning("CAT device test failed error=%s", exc)
+        details["error"] = str(exc)
+        details["capability_comm"] = False
+        details["capability_ptt"] = False
+        details["capability_vfo"] = False
+        details["capability_shared"] = False
+        details["capability_last_test_utc"] = datetime.now(timezone.utc).isoformat()
+        details["capability_notes"] = "Communication failed."
+        return {
+            "ok": False,
+            "message": "Capability test failed.",
+            "details": details,
+        }
+    finally:
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                logger.exception("Temporary CAT device test client cleanup failed")
+
+
+def _probe_capability(probe) -> bool:
+    try:
+        probe()
+        return True
+    except Exception as exc:
+        message = str(exc).lower()
+        if (
+            "feature not available" in message
+            or "rprt -" in message
+            or "rejected ptt read" in message
+            or "rejected vfo read" in message
+        ):
+            return False
+        raise
+
+
+def _build_capability_notes(
+    capability_comm: bool,
+    capability_ptt: bool,
+    capability_vfo: bool,
+    capability_shared: bool,
+    connectivity: str,
+) -> str:
+    if not capability_comm:
+        return "Communication failed."
+    if connectivity != "local":
+        return "Network devices are RX-only at this time."
+    if capability_shared:
+        return "Supports shared RX and TX capability checks."
+    missing: list[str] = []
+    if not capability_ptt:
+        missing.append("PTT detection")
+    if not capability_vfo:
+        missing.append("active VFO detection")
+    if not missing:
+        return "Basic CAT communication succeeded."
+    return f"Missing {' and '.join(missing)}. Single role capable only."
 
 
 def load_hamlib_model_caches(

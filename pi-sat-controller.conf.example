@@ -27,41 +27,28 @@ satellite_44909 = RS-44
 
 [rx]
 enabled = false
-# Set below to local for USB/serial connected devices and network for rigctld/Hamlib devices.
-connectivity = network
-# If connectivity is set to network, these values below are used.
-host = 127.0.0.1
-port = 4532
-# If connectivity is set to local, these values below are used.
-serial_port = 
-baud = 
-model_id = 
+# Assign a configured CAT device from the My CAT Devices inventory.
+device_id = 
 # Select which VFO Hamlib should control for RX: current, A, or B.
 target_vfo = current
 # Enable verbose CAT/Hamlib command logging for this role.
 cat_debug_logging = false
 # Enable frequency writes for this role.
 write_enabled = false
-timeout_s = 2.0
 
 [tx]
 enabled = false
-# Set below to local for USB/serial connected devices and network for rigctld/Hamlib devices.
-connectivity = local
-# If connectivity is set to network, these values below are used.
-host = 127.0.0.1
-port = 4533
-# If connectivity is set to local, these values below are used.
-serial_port = 
-baud = 
-model_id = 
+# Assign a configured CAT device from the My CAT Devices inventory.
+device_id = 
 # Select which VFO Hamlib should control for TX: current, A, or B.
 target_vfo = current
+# For one local radio serving both RX and TX, enable Hamlib split operation.
+# This remains a config-file-only compatibility option.
+shared_local_split_mode = false
 # Enable verbose CAT/Hamlib command logging for this role.
 cat_debug_logging = false
 # Enable frequency writes for this role.
 write_enabled = false
-timeout_s = 2.0
 
 [rotator]
 enabled = false

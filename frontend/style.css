@@ -920,6 +920,164 @@ dd {
   background: #111820;
 }
 
+.settings-form fieldset.cat-devices-settings {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.8rem;
+}
+
+.settings-form fieldset.device-roles-settings {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.8rem;
+}
+
+.device-roles-layout {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.device-role-column {
+  display: grid;
+  gap: 0.8rem;
+  align-content: start;
+}
+
+.device-role-column fieldset {
+  min-width: 0;
+}
+
+.cat-device-list {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.cat-device-card {
+  display: grid;
+  gap: 0.8rem;
+  padding: 0.9rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0.45rem;
+  background: #0b1118;
+}
+
+.cat-device-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.cat-device-card-title {
+  color: #fff;
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+.cat-device-card-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.cat-device-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 210px 120px;
+  gap: 1rem;
+  align-items: start;
+}
+
+.cat-device-config {
+  display: grid;
+  gap: 0.8rem;
+  min-width: 0;
+}
+
+.cat-device-top-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.15fr) minmax(180px, 1.15fr) minmax(150px, 0.95fr) minmax(90px, 0.55fr);
+  gap: 0.8rem;
+  align-items: start;
+}
+
+.cat-device-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(190px, 1.25fr) minmax(110px, 0.7fr) minmax(190px, 1.25fr) minmax(110px, 0.7fr) minmax(190px, 1.2fr);
+  gap: 0.8rem;
+  align-items: start;
+}
+
+.device-capability-chart {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.45rem;
+  align-items: start;
+  align-content: start;
+}
+
+.device-capability-item {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 1.5rem;
+}
+
+.device-capability-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.2rem;
+  height: 1.2rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.device-capability-icon.capability-true {
+  color: #062313;
+  background: #59d66f;
+}
+
+.device-capability-icon.capability-false {
+  color: #2b0b0b;
+  background: #ff8e8e;
+}
+
+.device-capability-icon.capability-unknown {
+  color: #1d2730;
+  background: #a9bccd;
+}
+
+.device-capability-label {
+  color: #d4dee7;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.device-capability-notes {
+  color: var(--app-muted);
+  font-size: 0.8rem;
+  margin-top: 0.25rem;
+}
+
+.cat-device-actions-column {
+  display: grid;
+  gap: 0.65rem;
+  align-content: start;
+  justify-items: stretch;
+}
+
+.cat-device-action-buttons {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.cat-device-action-buttons .btn {
+  width: 100%;
+}
+
 .automation-settings-note {
   color: var(--app-muted);
   font-size: 0.83rem;
@@ -1171,6 +1329,22 @@ button:disabled {
 
   .automation-settings-layout {
     grid-template-columns: 1fr;
+  }
+
+  .device-roles-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .cat-device-body {
+    grid-template-columns: 1fr;
+  }
+
+  .cat-device-top-grid {
+    grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+  }
+
+  .cat-device-detail-grid {
+    grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
   }
 }
 

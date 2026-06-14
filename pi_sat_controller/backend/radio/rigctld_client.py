@@ -7,6 +7,20 @@ from types import TracebackType
 LOGGER = logging.getLogger(__name__)
 
 
+def _parse_boolean_response(response: str, command_name: str) -> bool:
+    value = response.splitlines()[0].strip() if response else ""
+    if value in {"0", "1", "2", "3"}:
+        return value != "0"
+    raise RuntimeError(f"rigctld rejected {command_name}: {response or 'empty response'}")
+
+
+def _parse_vfo_response(response: str) -> str:
+    value = response.splitlines()[0].strip().upper() if response else ""
+    if value and not value.startswith("RPRT"):
+        return value
+    raise RuntimeError(f"rigctld rejected VFO read: {response or 'empty response'}")
+
+
 class RigctldClient:
     def __init__(
         self,
@@ -50,6 +64,15 @@ class RigctldClient:
     def get_frequency(self) -> int:
         return int(self._request("f"))
 
+    def get_ptt(self) -> bool:
+        return _parse_boolean_response(self._request("t"), "PTT read")
+
+    def get_vfo(self) -> str:
+        return _parse_vfo_response(self._request("v"))
+
+    def check_vfo_mode(self) -> bool:
+        return self._request("chk_vfo").strip().upper() == "CHKVFO 1"
+
     def set_frequency(self, frequency_hz: int) -> None:
         response = self._request(f"F {frequency_hz}")
         if response and response != "RPRT 0":
@@ -59,6 +82,24 @@ class RigctldClient:
         response = self._request(f"M {mode} {passband_hz}")
         if response and response != "RPRT 0":
             raise RuntimeError(f"rigctld rejected mode set: {response}")
+
+    def set_split(self, enabled: bool, tx_vfo: str | None = None) -> None:
+        command = f"S {1 if enabled else 0}"
+        if tx_vfo:
+            command = f"{command} {tx_vfo}"
+        response = self._request(command)
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected split set: {response}")
+
+    def set_split_frequency(self, frequency_hz: int) -> None:
+        response = self._request(f"I {frequency_hz}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected split frequency set: {response}")
+
+    def set_split_mode(self, mode: str, passband_hz: int = 0) -> None:
+        response = self._request(f"X {mode} {passband_hz}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected split mode set: {response}")
 
     def select_vfo(self, vfo: str) -> None:
         response = self._request(f"V {vfo}")
@@ -137,15 +178,71 @@ class PersistentRigctldClient:
     def get_frequency(self) -> int:
         return int(self._request("f"))
 
+    def get_frequency_on_vfo(self, vfo: str) -> int:
+        return int(self._request(f"f {vfo}"))
+
+    def get_ptt(self) -> bool:
+        return _parse_boolean_response(self._request("t"), "PTT read")
+
+    def get_ptt_on_vfo(self, vfo: str) -> bool:
+        return _parse_boolean_response(self._request(f"t {vfo}"), "PTT read")
+
+    def get_vfo(self) -> str:
+        return _parse_vfo_response(self._request("v"))
+
+    def check_vfo_mode(self) -> bool:
+        return self._request("chk_vfo").strip().upper() == "CHKVFO 1"
+
     def set_frequency(self, frequency_hz: int) -> None:
         response = self._request(f"F {frequency_hz}")
         if response and response != "RPRT 0":
             raise RuntimeError(f"rigctld rejected frequency set: {response}")
 
+    def set_frequency_on_vfo(self, vfo: str, frequency_hz: int) -> None:
+        response = self._request(f"F {vfo} {frequency_hz}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected VFO frequency set: {response}")
+
     def set_mode(self, mode: str, passband_hz: int = 0) -> None:
         response = self._request(f"M {mode} {passband_hz}")
         if response and response != "RPRT 0":
             raise RuntimeError(f"rigctld rejected mode set: {response}")
+
+    def set_mode_on_vfo(self, vfo: str, mode: str, passband_hz: int = 0) -> None:
+        response = self._request(f"M {vfo} {mode} {passband_hz}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected VFO mode set: {response}")
+
+    def set_split(self, enabled: bool, tx_vfo: str | None = None) -> None:
+        command = f"S {1 if enabled else 0}"
+        if tx_vfo:
+            command = f"{command} {tx_vfo}"
+        response = self._request(command)
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected split set: {response}")
+
+    def set_split_on_vfo(
+        self,
+        rx_vfo: str,
+        enabled: bool,
+        tx_vfo: str | None = None,
+    ) -> None:
+        command = f"S {rx_vfo} {1 if enabled else 0}"
+        if tx_vfo:
+            command = f"{command} {tx_vfo}"
+        response = self._request(command)
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected VFO split set: {response}")
+
+    def set_split_frequency(self, frequency_hz: int) -> None:
+        response = self._request(f"I {frequency_hz}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected split frequency set: {response}")
+
+    def set_split_mode(self, mode: str, passband_hz: int = 0) -> None:
+        response = self._request(f"X {mode} {passband_hz}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected split mode set: {response}")
 
     def select_vfo(self, vfo: str) -> None:
         response = self._request(f"V {vfo}")
