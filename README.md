@@ -19,6 +19,8 @@ I had a few use cases for myself that existing software was not doing for me, so
 
 Want more infomation about how you can get started? Be sure to check out the wiki: [Pi-sat Controller Wiki](https://github.com/W9KSB/Pi-Sat/wiki) 
 
+<p align="center"><strong><em>Note: Pi-Sat is operational and has been validated here with real radios, SDRs, rotators, and live passes. I do not own every hardware combination supported by Hamlib, so community testing is important. If you confirm compatibility or hit a hardware-specific issue, please post it in the <a href="https://github.com/W9KSB/Pi-Sat/issues">Issues</a> section.</em></strong></p>
+
 <p align="center">
   <img alt="Dashboard" src="https://www.w9ksb.com/wp-content/uploads/2026/06/Dashboard.jpg">
 </p>
