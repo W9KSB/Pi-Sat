@@ -102,6 +102,7 @@ class RxTrackingManager:
         self._tx_session_ready = False
         self._last_pass_active = False
         self._last_commanded_rx_hz: int | None = None
+        self._last_commanded_tx_hz: int | None = None
         self._last_commanded_at = 0.0
         self._last_snapshot = RxTrackingSnapshot(
             active=False,
@@ -202,6 +203,7 @@ class RxTrackingManager:
         )
 
         commanded_rx_hz = self._last_commanded_rx_hz
+        commanded_tx_hz = self._last_commanded_tx_hz
         errors: list[str] = []
         if write_rx:
             self._ensure_rx_session_state(errors)
@@ -214,7 +216,15 @@ class RxTrackingManager:
                     self._last_commanded_rx_hz = plan.downlink_hz
                     self._last_commanded_at = monotonic()
 
-        if not self._rx_only and plan.uplink_hz is not None and self.tx_radio_manager:
+        if (
+            not self._rx_only
+            and plan.uplink_hz is not None
+            and self.tx_radio_manager
+            and (
+                commanded_tx_hz is None
+                or abs(commanded_tx_hz - plan.uplink_hz) > self.deadband_hz
+            )
+        ):
             self._ensure_tx_session_state(errors)
             tx_state = self.tx_radio_manager.try_set_frequency(
                 plan.uplink_hz,
@@ -222,6 +232,10 @@ class RxTrackingManager:
             )
             if tx_state.error:
                 errors.append(tx_state.error)
+            else:
+                commanded_tx_hz = plan.uplink_hz
+                with self._lock:
+                    self._last_commanded_tx_hz = plan.uplink_hz
 
         with self._lock:
             self._last_snapshot = RxTrackingSnapshot(
@@ -295,6 +309,7 @@ class RxTrackingManager:
             user_uplink_offset = self._user_uplink_offset_hz
             sync_offsets = False if self._rx_only else self._sync_offsets
             last_commanded = self._last_commanded_rx_hz
+            last_commanded_tx_hz = self._last_commanded_tx_hz
             last_commanded_at = self._last_commanded_at
 
         if (
@@ -327,6 +342,7 @@ class RxTrackingManager:
         )
 
         commanded_rx_hz = self._last_commanded_rx_hz
+        commanded_tx_hz = self._last_commanded_tx_hz
         errors: list[str] = []
         if write_devices and (
             current_rx_hz is None or abs(current_rx_hz - plan.downlink_hz) > self.deadband_hz
@@ -361,6 +377,10 @@ class RxTrackingManager:
             and not self._rx_only
             and plan.uplink_hz is not None
             and self.tx_radio_manager
+            and (
+                last_commanded_tx_hz is None
+                or abs(last_commanded_tx_hz - plan.uplink_hz) > self.deadband_hz
+            )
         ):
             self._ensure_tx_session_state(errors)
             tx_state = self.tx_radio_manager.try_set_frequency(
@@ -369,6 +389,10 @@ class RxTrackingManager:
             )
             if tx_state.error:
                 errors.append(tx_state.error)
+            else:
+                commanded_tx_hz = plan.uplink_hz
+                with self._lock:
+                    self._last_commanded_tx_hz = plan.uplink_hz
 
         with self._lock:
             if write_devices:
@@ -453,12 +477,13 @@ class RxTrackingManager:
     def _ensure_tx_session_state(self, errors: list[str] | None = None) -> None:
         if self._tx_session_ready or self.tx_radio_manager is None:
             return
-        vfo_state = self.tx_radio_manager.try_set_vfo(
-            self.tx_radio_manager.target_vfo,
-            source="rx_tracking.session_setup",
-        )
-        if errors is not None and vfo_state.error:
-            errors.append(vfo_state.error)
+        if not getattr(self.tx_radio_manager, "restore_vfo_after_write", None):
+            vfo_state = self.tx_radio_manager.try_set_vfo(
+                self.tx_radio_manager.target_vfo,
+                source="rx_tracking.session_setup",
+            )
+            if errors is not None and vfo_state.error:
+                errors.append(vfo_state.error)
         mode_state = self.tx_radio_manager.try_set_mode(
             self.transponder.uplink_mode,
             source="rx_tracking.session_setup",

@@ -356,12 +356,17 @@ def _reload_runtime_config() -> None:
             sdr_manager = FailedTrackingSdrManager(error)
     if config.tx.enabled:
         try:
+            shared_local_radio = uses_same_local_radio(config)
             tx_radio_manager = RadioManager(
                 client=build_radio_client(config.tx, "TX", shared_local_client),
                 enabled=config.tx.enabled,
                 write_enabled=config.tx.write_enabled,
                 target_vfo=config.tx.target_vfo,
                 failure_threshold=failure_threshold,
+                read_poll_enabled=not shared_local_radio,
+                restore_vfo_after_write=(
+                    config.rx.target_vfo if shared_local_radio else None
+                ),
             )
         except Exception as exc:
             error = f"TX startup failed: {exc}"

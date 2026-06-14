@@ -42,6 +42,13 @@ class LocalHamlibClient:
             client = self._ensure_client()
             return client.get_frequency()
 
+    def get_frequency_on_vfo(self, vfo: str | None) -> int:
+        with self._lock:
+            client = self._ensure_client()
+            if vfo:
+                client.select_vfo(vfo)
+            return client.get_frequency()
+
     def set_frequency(self, frequency_hz: int) -> None:
         with self._lock:
             client = self._ensure_client()
@@ -67,10 +74,99 @@ class LocalHamlibClient:
                     return
                 raise
 
+    def set_frequency_on_vfo(self, vfo: str | None, frequency_hz: int) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            if vfo:
+                client.select_vfo(vfo)
+            try:
+                client.set_frequency(frequency_hz)
+                return
+            except Exception as exc:
+                LOGGER.warning(
+                    "local_hamlib role=%s frequency ack failed model_id=%s serial_port=%s vfo=%s target_hz=%s error=%s",
+                    self.role_label,
+                    self.model_id,
+                    self.serial_port,
+                    vfo,
+                    frequency_hz,
+                    exc,
+                )
+                current_frequency = client.get_frequency()
+                if current_frequency == frequency_hz:
+                    LOGGER.info(
+                        "local_hamlib role=%s frequency verified_by_readback vfo=%s target_hz=%s",
+                        self.role_label,
+                        vfo,
+                        frequency_hz,
+                    )
+                    return
+                raise
+
+    def set_frequency_on_vfo_and_restore(
+        self,
+        vfo: str | None,
+        frequency_hz: int,
+        restore_vfo: str | None,
+    ) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            if vfo:
+                client.select_vfo(vfo)
+            try:
+                try:
+                    client.set_frequency(frequency_hz)
+                except Exception as exc:
+                    LOGGER.warning(
+                        "local_hamlib role=%s frequency ack failed model_id=%s serial_port=%s vfo=%s target_hz=%s error=%s",
+                        self.role_label,
+                        self.model_id,
+                        self.serial_port,
+                        vfo,
+                        frequency_hz,
+                        exc,
+                    )
+                    current_frequency = client.get_frequency()
+                    if current_frequency != frequency_hz:
+                        raise
+                    LOGGER.info(
+                        "local_hamlib role=%s frequency verified_by_readback vfo=%s target_hz=%s",
+                        self.role_label,
+                        vfo,
+                        frequency_hz,
+                    )
+            finally:
+                if restore_vfo:
+                    client.select_vfo(restore_vfo)
+
     def set_mode(self, mode: str, passband_hz: int = 0) -> None:
         with self._lock:
             client = self._ensure_client()
             client.set_mode(mode, passband_hz)
+
+    def set_mode_on_vfo(self, vfo: str | None, mode: str, passband_hz: int = 0) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            if vfo:
+                client.select_vfo(vfo)
+            client.set_mode(mode, passband_hz)
+
+    def set_mode_on_vfo_and_restore(
+        self,
+        vfo: str | None,
+        mode: str,
+        passband_hz: int = 0,
+        restore_vfo: str | None = None,
+    ) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            if vfo:
+                client.select_vfo(vfo)
+            try:
+                client.set_mode(mode, passband_hz)
+            finally:
+                if restore_vfo:
+                    client.select_vfo(restore_vfo)
 
     def select_vfo(self, vfo: str) -> None:
         with self._lock:
