@@ -406,6 +406,9 @@ async function loadSatellites() {
 
 async function loadSdrFrequency() {
   const frequencyElement = document.getElementById('rx-frequency');
+  if (!frequencyElement) {
+    return;
+  }
 
   try {
     const response = await fetch('/api/devices/sdr/frequency');

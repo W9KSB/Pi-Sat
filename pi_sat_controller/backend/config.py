@@ -439,7 +439,7 @@ def save_my_satellites(
     )
     for satellite in satellites:
         settings["my_satellites"][f"satellite_{satellite.norad_id}"] = satellite.name
-    save_settings(settings, path)
+    save_settings(settings, path=path, validate_role_assignments=False)
 
 
 def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str, str]]:
@@ -477,6 +477,7 @@ def save_settings(
     settings: dict[str, dict[str, Any]],
     cat_devices: list[dict[str, Any]] | None = None,
     path: Path | str = DEFAULT_CONFIG_PATH,
+    validate_role_assignments: bool = True,
 ) -> None:
     current = load_settings(path)
     current_cat_devices = load_cat_devices(path)
@@ -506,7 +507,8 @@ def save_settings(
         current_cat_devices = _normalize_cat_devices(cat_devices)
 
     _apply_station_grid_locator(current)
-    _validate_role_device_assignments(current, current_cat_devices)
+    if validate_role_assignments:
+        _validate_role_device_assignments(current, current_cat_devices)
 
     rendered = _render_settings(current, current_cat_devices)
     Path(path).write_text(rendered, encoding="utf-8")
