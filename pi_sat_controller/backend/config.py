@@ -66,6 +66,7 @@ class CatDeviceConfig:
     baud: int | None
     model_id: int | None
     timeout_s: float
+    satmode_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class DeviceConfig:
     write_enabled: bool
     timeout_s: float
     shared_local_split_mode: bool = False
+    satmode_enabled: bool = False
     cat_debug_logging: bool = False
     min_elevation_deg: float | None = None
     home_azimuth_deg: float | None = None
@@ -243,6 +245,7 @@ def _load_device(
             "shared_local_split_mode",
             False,
         ),
+        satmode_enabled=base_device.satmode_enabled if base_device else False,
         cat_debug_logging=_get_bool(parser, section, "cat_debug_logging", False),
         write_enabled=_get_bool(parser, section, "write_enabled"),
         timeout_s=(
@@ -342,6 +345,9 @@ CAT_DEVICE_FIELDS = [
     "capability_ptt",
     "capability_vfo",
     "capability_shared",
+    "capability_satmode",
+    "capability_targets",
+    "satmode_enabled",
     "capability_last_test_utc",
     "capability_notes",
 ]
@@ -584,11 +590,9 @@ def _render_settings(
         lines.append("")
         values = section(role)
         lines.append(f"enabled = {values['enabled']}")
-        lines.append("# Assign a configured CAT device from the My CAT Devices inventory.")
+        lines.append("# Assign a configured device from the My Devices inventory.")
         lines.append(f"device_id = {values['device_id']}")
-        lines.append(
-            f"# Select which VFO Hamlib should control for {role.upper()}: current, A, or B."
-        )
+        lines.append(f"# Select which Hamlib target should control {role.upper()}.")
         lines.append(f"target_vfo = {values['target_vfo']}")
         if role == "tx":
             lines.append(
@@ -698,6 +702,15 @@ def load_cat_devices(
             "capability_shared": _load_cat_device_metadata(
                 parser, device.device_id, "capability_shared"
             ),
+            "capability_satmode": _load_cat_device_metadata(
+                parser, device.device_id, "capability_satmode"
+            ),
+            "capability_targets": _load_cat_device_metadata(
+                parser, device.device_id, "capability_targets"
+            ),
+            "satmode_enabled": _load_cat_device_metadata(
+                parser, device.device_id, "satmode_enabled"
+            ),
             "capability_last_test_utc": _load_cat_device_metadata(
                 parser, device.device_id, "capability_last_test_utc"
             ),
@@ -727,6 +740,7 @@ def _load_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig]:
             baud=_get_optional_int(parser, section, "baud"),
             model_id=_get_optional_int(parser, section, "model_id"),
             timeout_s=_get_float(parser, section, "timeout_s", fallback=2.0),
+            satmode_enabled=_get_bool(parser, section, "satmode_enabled", False),
         )
     if explicit:
         return explicit
@@ -777,6 +791,7 @@ def _build_legacy_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig
                     baud=existing.baud,
                     model_id=existing.model_id,
                     timeout_s=existing.timeout_s,
+                    satmode_enabled=existing.satmode_enabled,
                 )
             continue
         device_id = f"legacy-{role}"
@@ -793,6 +808,7 @@ def _build_legacy_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig
             baud=baud,
             model_id=model_id,
             timeout_s=_get_float(parser, role, "timeout_s", fallback=2.0),
+            satmode_enabled=False,
         )
     return legacy_devices
 
@@ -859,6 +875,9 @@ def _normalize_cat_devices(cat_devices: list[dict[str, Any]]) -> list[dict[str, 
                 "capability_ptt": stringify_capability_value(raw_device.get("capability_ptt")),
                 "capability_vfo": stringify_capability_value(raw_device.get("capability_vfo")),
                 "capability_shared": stringify_capability_value(raw_device.get("capability_shared")),
+                "capability_satmode": stringify_capability_value(raw_device.get("capability_satmode")),
+                "capability_targets": str(raw_device.get("capability_targets", "")).strip(),
+                "satmode_enabled": stringify_capability_value(raw_device.get("satmode_enabled")),
                 "capability_last_test_utc": str(raw_device.get("capability_last_test_utc", "")).strip(),
                 "capability_notes": str(raw_device.get("capability_notes", "")).strip(),
             }

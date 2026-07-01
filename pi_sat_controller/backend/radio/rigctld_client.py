@@ -106,6 +106,11 @@ class RigctldClient:
         if response and response != "RPRT 0":
             raise RuntimeError(f"rigctld rejected VFO select: {response}")
 
+    def set_satmode(self, enabled: bool) -> None:
+        response = self._request(f"U SATMODE {1 if enabled else 0}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected SATMODE set: {response}")
+
 
 class PersistentRigctldClient:
     def __init__(
@@ -248,6 +253,11 @@ class PersistentRigctldClient:
         response = self._request(f"V {vfo}")
         if response and response != "RPRT 0":
             raise RuntimeError(f"rigctld rejected VFO select: {response}")
+
+    def set_satmode(self, enabled: bool) -> None:
+        response = self._request(f"U SATMODE {1 if enabled else 0}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected SATMODE set: {response}")
 
     def __enter__(self) -> "PersistentRigctldClient":
         self.connect()

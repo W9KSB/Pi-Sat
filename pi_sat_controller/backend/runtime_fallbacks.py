@@ -52,6 +52,10 @@ class FailedTrackingSdrManager:
 class FailedRadioManager:
     """Fallback TX manager used when startup cannot build the real device path."""
 
+    target_vfo = None
+    restore_vfo_after_write = None
+    split_mode_vfo = None
+
     def __init__(self, error: str) -> None:
         self.error = error
         self.client = None
@@ -83,6 +87,18 @@ class FailedRadioManager:
         raise RuntimeError(self.error)
 
     def try_set_vfo(self, vfo: str | None, source: str = ""):
+        return self.snapshot()
+
+    def set_split_mode_enabled(self, tx_vfo: str | None, source: str = ""):
+        raise RuntimeError(self.error)
+
+    def try_set_split_mode_enabled(self, tx_vfo: str | None, source: str = ""):
+        return self.snapshot()
+
+    def set_split_mode_disabled(self, source: str = "", force: bool = False):
+        raise RuntimeError(self.error)
+
+    def try_set_split_mode_disabled(self, source: str = "", force: bool = False):
         return self.snapshot()
 
 

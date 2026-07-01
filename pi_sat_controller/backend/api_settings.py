@@ -171,6 +171,9 @@ def register_settings_api(
                     "capability_ptt",
                     "capability_vfo",
                     "capability_shared",
+                    "capability_satmode",
+                    "capability_targets",
+                    "satmode_enabled",
                     "capability_last_test_utc",
                     "capability_notes",
                 ):
@@ -232,6 +235,9 @@ def register_settings_api(
                         "capability_ptt",
                         "capability_vfo",
                         "capability_shared",
+                        "capability_satmode",
+                        "capability_targets",
+                        "satmode_enabled",
                         "capability_last_test_utc",
                     )
                 ) if existing_device else False

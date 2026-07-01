@@ -1595,6 +1595,7 @@ function buildCatDeviceCard(device) {
     buildCatDeviceField('Model ID', 'model_id', device.model_id || '', { type: 'hamlib_model' }),
   );
   config.appendChild(detailGrid);
+  config.appendChild(buildCatDeviceSatModeRow(device));
   body.appendChild(config);
 
   const capabilityChart = document.createElement('div');
@@ -1688,6 +1689,41 @@ function buildCatDeviceField(label, key, value, options = {}) {
   return row;
 }
 
+function buildCatDeviceSatModeRow(device) {
+  const row = document.createElement('label');
+  row.className = 'settings-row settings-row-toggle cat-device-satmode-row';
+  row.dataset.catDeviceSatmodeRow = 'true';
+  row.hidden = true;
+
+  const labelText = document.createElement('span');
+  labelText.className = 'form-label mb-0';
+  labelText.textContent = 'SAT Mode';
+
+  const hidden = document.createElement('input');
+  hidden.type = 'hidden';
+  hidden.dataset.catDeviceField = 'satmode_enabled';
+  hidden.value = String(device.satmode_enabled || '').trim().toLowerCase() === 'true'
+    ? 'true'
+    : 'false';
+
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.className = 'form-check-input';
+  checkbox.setAttribute('role', 'switch');
+  checkbox.dataset.catDeviceSatmodeToggle = 'true';
+  checkbox.checked = hidden.value === 'true';
+  checkbox.addEventListener('change', () => {
+    hidden.value = checkbox.checked ? 'true' : 'false';
+  });
+
+  const switchWrap = document.createElement('span');
+  switchWrap.className = 'form-check form-switch mb-0';
+  switchWrap.appendChild(checkbox);
+
+  row.append(labelText, hidden, switchWrap);
+  return row;
+}
+
 function attachCatDeviceFieldHandlers(card) {
   const nameInput = card.querySelector('[data-cat-device-field="name"]');
   const idInput = card.querySelector('[data-cat-device-field="device_id"]');
@@ -1702,6 +1738,11 @@ function attachCatDeviceFieldHandlers(card) {
         markCatDeviceDirty(card);
       });
     }
+  });
+  card.querySelectorAll('[data-cat-device-satmode-toggle]').forEach((element) => {
+    element.addEventListener('change', () => {
+      markCatDeviceDirty(card);
+    });
   });
   nameInput?.addEventListener('input', () => {
     title.textContent = nameInput.value.trim() || 'New Device';
@@ -2324,7 +2365,30 @@ function refreshRoleDeviceSelectors() {
     });
     select.replaceWith(replacement);
   });
+  refreshRoleTargetSelectors();
   updateRoleTestButtons();
+}
+
+function refreshRoleTargetSelectors() {
+  ['rx', 'tx'].forEach((section) => {
+    const select = document.querySelector(`select[name="${section}.target_vfo"]`);
+    if (!select) {
+      return;
+    }
+    const currentValue = select.value;
+    const deviceId = document.querySelector(`select[name="${section}.device_id"]`)?.value
+      || currentSettingsState?.[section]?.device_id
+      || '';
+    const replacement = buildVfoSelect(currentValue, deviceId);
+    replacement.name = select.name;
+    replacement.addEventListener('change', () => {
+      if (!currentSettingsState[section]) {
+        currentSettingsState[section] = {};
+      }
+      currentSettingsState[section].target_vfo = replacement.value;
+    });
+    select.replaceWith(replacement);
+  });
 }
 
 function applyCatDeviceConnectivityState() {
@@ -2468,6 +2532,7 @@ function collectCatDeviceFromCard(card) {
     baud: String(values.baud || '').trim(),
     model_id: String(values.model_id || '').trim(),
     timeout_s: String(values.timeout_s || '').trim() || '2.0',
+    satmode_enabled: String(values.satmode_enabled || '').trim(),
   };
 }
 
@@ -2571,6 +2636,9 @@ function applyCatDeviceCapabilitiesToCard(card, device) {
   card.dataset.capabilityPtt = normalizeCapabilityValue(device.capability_ptt);
   card.dataset.capabilityVfo = normalizeCapabilityValue(device.capability_vfo);
   card.dataset.capabilityShared = normalizeCapabilityValue(device.capability_shared);
+  card.dataset.capabilitySatmode = normalizeCapabilityValue(device.capability_satmode);
+  card.dataset.capabilityTargets = String(device.capability_targets || '').trim();
+  card.dataset.satmodeEnabled = normalizeCapabilityValue(device.satmode_enabled);
   card.dataset.capabilityLastTestUtc = String(device.capability_last_test_utc || '').trim();
   card.dataset.capabilityNotes = String(device.capability_notes || '').trim();
 }
@@ -2594,6 +2662,7 @@ function renderCatDeviceCapabilityChart(card) {
     ['PTT', card.dataset.capabilityPtt],
     ['VFO', card.dataset.capabilityVfo],
     ['Shared RX/TX', card.dataset.capabilityShared],
+    ['SAT Mode', card.dataset.capabilitySatmode],
   ];
   items.forEach(([label, value]) => {
     const item = document.createElement('div');
@@ -2611,6 +2680,26 @@ function renderCatDeviceCapabilityChart(card) {
   notes.className = 'device-capability-notes';
   notes.textContent = card.dataset.capabilityNotes || 'Save device to populate device support when reachable.';
   container.appendChild(notes);
+  updateCatDeviceSatModeControl(card);
+}
+
+function updateCatDeviceSatModeControl(card) {
+  const row = card.querySelector('[data-cat-device-satmode-row="true"]');
+  const checkbox = card.querySelector('[data-cat-device-satmode-toggle="true"]');
+  const hidden = card.querySelector('[data-cat-device-field="satmode_enabled"]');
+  if (!row || !checkbox || !hidden) {
+    return;
+  }
+  const supported = card.dataset.capabilitySatmode === 'true';
+  row.hidden = !supported;
+  if (!supported) {
+    hidden.value = '';
+    checkbox.checked = false;
+    return;
+  }
+  const enabled = String(card.dataset.satmodeEnabled || hidden.value || '').toLowerCase() === 'true';
+  hidden.value = enabled ? 'true' : 'false';
+  checkbox.checked = enabled;
 }
 
 function buildSatellitePassList(passes) {
@@ -2826,7 +2915,14 @@ function buildSettingControl(section, key, value) {
   } else if (key === 'model_id' && section === 'rotator') {
     control = buildHamlibRotatorModelSelect(value);
   } else if (key === 'target_vfo' && (section === 'rx' || section === 'tx')) {
-    control = buildVfoSelect(value);
+    const deviceId = currentSettingsState?.[section]?.device_id || '';
+    control = buildVfoSelect(value, deviceId);
+    control.addEventListener('change', () => {
+      if (!currentSettingsState[section]) {
+        currentSettingsState[section] = {};
+      }
+      currentSettingsState[section].target_vfo = control.value;
+    });
   } else if (section === 'station' && key === 'grid_locator') {
     control = document.createElement('input');
     control.className = 'form-control compact-input';
@@ -2961,8 +3057,8 @@ function buildCatDeviceSelect(value, options = {}) {
   const blank = document.createElement('option');
   blank.value = '';
   blank.textContent = catDevicesCache.length
-    ? 'Select CAT device'
-    : 'No CAT devices configured';
+    ? 'Select device'
+    : 'No devices configured';
   control.appendChild(blank);
 
   const selectedValue = String(value || '');
@@ -3051,21 +3147,89 @@ function buildHamlibRotatorModelSelect(value) {
   return control;
 }
 
-function buildVfoSelect(value) {
+function getCatDeviceById(deviceId) {
+  return catDevicesCache.find((device) => String(device.device_id || '') === String(deviceId || ''));
+}
+
+function getDeviceTargetOptions(deviceId) {
+  const device = getCatDeviceById(deviceId);
+  const options = [['current', 'Current VFO']];
+  const rawTargets = String(device?.capability_targets || '')
+    .split(',')
+    .map((target) => target.trim().toUpperCase())
+    .filter(Boolean);
+  const uniqueTargets = [...new Set(rawTargets)];
+  const hasMain = uniqueTargets.includes('MAIN');
+  const hasSub = uniqueTargets.includes('SUB');
+  uniqueTargets.forEach((target) => {
+    if (hasMain && (target === 'MAINA' || target === 'MAINB')) {
+      return;
+    }
+    if (hasSub && (target === 'SUBA' || target === 'SUBB')) {
+      return;
+    }
+    options.push([target, formatHamlibTargetLabel(target)]);
+  });
+  return options;
+}
+
+function buildVfoSelect(value, deviceId = '') {
   const control = document.createElement('select');
   control.className = 'form-select';
-  [
-    ['current', 'Current VFO'],
-    ['A', 'VFO A'],
-    ['B', 'VFO B'],
-  ].forEach(([optionValue, optionLabel]) => {
+  const selectedValue = canonicalizeDeviceTargetValue(value);
+  const options = getDeviceTargetOptions(deviceId);
+  options.forEach(([optionValue, optionLabel]) => {
     const option = document.createElement('option');
     option.value = optionValue;
     option.textContent = optionLabel;
     control.appendChild(option);
   });
-  control.value = String(value || 'current');
+  const validValues = new Set(options.map(([optionValue]) => optionValue));
+  if (selectedValue && !validValues.has(selectedValue)) {
+    const current = document.createElement('option');
+    current.value = selectedValue;
+    current.textContent = formatHamlibTargetLabel(selectedValue);
+    control.appendChild(current);
+  }
+  control.value = validValues.has(selectedValue) ? selectedValue : selectedValue || 'current';
   return control;
+}
+
+function canonicalizeDeviceTargetValue(value) {
+  const normalized = String(value || 'current').trim().toUpperCase();
+  if (!normalized || normalized === 'CURRENT') {
+    return 'current';
+  }
+  if (normalized === 'A') {
+    return 'VFOA';
+  }
+  if (normalized === 'B') {
+    return 'VFOB';
+  }
+  return normalized;
+}
+
+function formatHamlibTargetLabel(target) {
+  const normalized = String(target || '').trim().toUpperCase();
+  if (!normalized || normalized === 'CURRENT') {
+    return 'Current VFO';
+  }
+  if (normalized === 'VFOA') {
+    return 'VFO A';
+  }
+  if (normalized === 'VFOB') {
+    return 'VFO B';
+  }
+  if (normalized === 'VFOC') {
+    return 'VFO C';
+  }
+  if (normalized === 'MAIN') {
+    return 'Main';
+  }
+  if (normalized === 'SUB') {
+    return 'Sub';
+  }
+  return normalized;
 }
 
 async function saveSettings(event) {
@@ -3689,9 +3853,16 @@ function drawMapLegend(ctx, width, height) {
     || ''
   ).trim();
   const showActiveLabel = activeLabel && activeLabel !== 'None';
-  const legendWidth = showActiveLabel ? 248 : 174;
+  const legendX = 10;
+  const legendY = height - 22;
+  const activeLabelText = activeLabel.toUpperCase();
+  ctx.font = '10px Arial';
+  const legendContentWidth = showActiveLabel
+    ? 202 + ctx.measureText(activeLabelText).width - legendX + 8
+    : 174;
+  const legendWidth = Math.max(0, Math.min(width - (legendX * 2), Math.ceil(legendContentWidth)));
   ctx.fillStyle = 'rgba(4, 12, 19, 0.84)';
-  ctx.fillRect(10, height - 20, legendWidth, 12);
+  ctx.fillRect(legendX, legendY, legendWidth, 16);
   ctx.strokeStyle = '#2bb7ff';
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -3699,7 +3870,6 @@ function drawMapLegend(ctx, width, height) {
   ctx.lineTo(40, height - 14);
   ctx.stroke();
   ctx.fillStyle = '#d5e4f1';
-  ctx.font = '10px Arial';
   ctx.fillText('GROUND TRACK', 44, height - 11);
   ctx.fillStyle = '#59d66f';
   ctx.beginPath();
@@ -3719,7 +3889,7 @@ function drawMapLegend(ctx, width, height) {
     ctx.fill();
     ctx.stroke();
     ctx.fillStyle = '#d5e4f1';
-    ctx.fillText(activeLabel.toUpperCase(), 202, height - 11);
+    ctx.fillText(activeLabelText, 202, height - 11);
   }
 }
 

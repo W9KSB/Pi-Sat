@@ -87,6 +87,10 @@ class SharedLocalRadioController:
         with self._lock:
             self._ensure_configured_locked(force_split=True)
 
+    def set_satmode(self, enabled: bool) -> None:
+        with self._lock:
+            self.client.set_satmode(enabled)
+
     def _ensure_configured_locked(self, force_split: bool = False) -> None:
         generation = self.client.ensure_connected()
         if generation == self._configured_generation and not force_split:
@@ -164,6 +168,9 @@ class SharedRadioRoleClient:
     def set_split(self, enabled: bool, _tx_vfo: str | None = None) -> None:
         if enabled:
             self.controller.enable_split()
+
+    def set_satmode(self, enabled: bool) -> None:
+        self.controller.set_satmode(enabled)
 
     def set_split_frequency(self, frequency_hz: int) -> None:
         self.controller.set_frequency("tx", frequency_hz)

@@ -9,7 +9,7 @@ from pi_sat_controller.backend.config import DeviceConfig, load_cat_devices, loa
 from pi_sat_controller.backend.radio.hamlib_client import HamlibClient
 from pi_sat_controller.backend.radio.hamlib_models import load_hamlib_radio_models
 from pi_sat_controller.backend.radio.local_hamlib_client import LocalHamlibClient
-from pi_sat_controller.backend.radio.radio_manager import RadioManager
+from pi_sat_controller.backend.radio.radio_manager import RadioManager, normalize_hamlib_vfo
 from pi_sat_controller.backend.rotator.hamlib_rotator_models import (
     load_hamlib_rotator_models,
 )
@@ -54,6 +54,7 @@ def _device_config_from_cat_device_entry(device_settings: dict[str, Any]) -> Dev
         model_id=parse_int_setting(device_settings.get("model_id")),
         target_vfo=None,
         shared_local_split_mode=False,
+        satmode_enabled=parse_bool_setting(device_settings.get("satmode_enabled"), False),
         write_enabled=False,
         timeout_s=parse_float_setting(device_settings.get("timeout_s"), 2.0) or 2.0,
         cat_debug_logging=False,
@@ -116,6 +117,11 @@ def device_config_from_settings(
         shared_local_split_mode=parse_bool_setting(
             section_settings.get("shared_local_split_mode"),
             False,
+        ),
+        satmode_enabled=(
+            base_device_config.satmode_enabled
+            if base_device_config is not None
+            else False
         ),
         write_enabled=parse_bool_setting(section_settings.get("write_enabled"), False),
         timeout_s=(
@@ -315,9 +321,12 @@ def run_cat_device_test(
         client = build_radio_client(device_config, "CAT Device")
         frequency_hz = client.get_frequency()
         details["frequency_hz"] = frequency_hz
+        caps_output = _load_hamlib_caps_output(device_config)
+        capability_targets = _parse_capability_targets_from_caps(caps_output)
+        capability_satmode = _detect_satmode_support_from_caps(caps_output)
         capability_comm = True
         capability_ptt = _probe_capability(client.get_ptt)
-        capability_vfo = _probe_capability(client.get_vfo)
+        capability_vfo = bool(capability_targets)
         capability_shared = (
             device_config.connectivity == "local"
             and capability_ptt
@@ -327,12 +336,19 @@ def run_cat_device_test(
         details["capability_ptt"] = capability_ptt
         details["capability_vfo"] = capability_vfo
         details["capability_shared"] = capability_shared
+        details["capability_satmode"] = capability_satmode
+        details["capability_targets"] = ",".join(capability_targets)
+        details["satmode_enabled"] = _normalize_satmode_enabled(
+            device_settings.get("satmode_enabled"),
+            capability_satmode,
+        )
         details["capability_last_test_utc"] = datetime.now(timezone.utc).isoformat()
         details["capability_notes"] = _build_capability_notes(
             capability_comm,
             capability_ptt,
             capability_vfo,
             capability_shared,
+            capability_satmode,
             device_config.connectivity,
         )
         return {
@@ -347,6 +363,9 @@ def run_cat_device_test(
         details["capability_ptt"] = False
         details["capability_vfo"] = False
         details["capability_shared"] = False
+        details["capability_satmode"] = False
+        details["capability_targets"] = ""
+        details["satmode_enabled"] = ""
         details["capability_last_test_utc"] = datetime.now(timezone.utc).isoformat()
         details["capability_notes"] = "Communication failed."
         return {
@@ -383,22 +402,104 @@ def _build_capability_notes(
     capability_ptt: bool,
     capability_vfo: bool,
     capability_shared: bool,
+    capability_satmode: bool,
     connectivity: str,
 ) -> str:
     if not capability_comm:
         return "Communication failed."
     if connectivity != "local":
         return "Network devices are RX-only at this time."
+    notes: list[str] = []
     if capability_shared:
-        return "Supports shared RX and TX capability checks."
+        notes.append("Supports shared RX and TX role assignment.")
+    if capability_satmode:
+        notes.append("SAT mode control is available.")
+    if notes:
+        return " ".join(notes)
     missing: list[str] = []
     if not capability_ptt:
         missing.append("PTT detection")
     if not capability_vfo:
-        missing.append("active VFO detection")
+        missing.append("targetable VFO support")
     if not missing:
         return "Basic CAT communication succeeded."
     return f"Missing {' and '.join(missing)}. Single role capable only."
+
+
+def _normalize_satmode_enabled(value: Any, capability_satmode: bool) -> str:
+    if not capability_satmode:
+        return ""
+    text = str(value or "").strip().lower()
+    if text in {"true", "false"}:
+        return text
+    return "false"
+
+
+def _load_hamlib_caps_output(device_config: DeviceConfig) -> str:
+    if device_config.connectivity != "local" or not device_config.model_id:
+        return ""
+
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["rigctl", "-m", str(device_config.model_id), "-u"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=min(max(float(device_config.timeout_s), 1.0), 5.0),
+        )
+    except Exception:
+        return ""
+
+    if result.returncode != 0:
+        return ""
+
+    return result.stdout
+
+
+def _detect_satmode_support_from_caps(caps_output: str) -> bool:
+    for raw_line in caps_output.splitlines():
+        line = raw_line.strip().upper()
+        if line.startswith("GET FUNCTIONS:") or line.startswith("SET FUNCTIONS:"):
+            if "SATMODE" in line:
+                return True
+    return False
+
+
+def _parse_capability_targets_from_caps(caps_output: str) -> list[str]:
+    raw_targets: list[str] = []
+    raw_seen: set[str] = set()
+    for raw_line in caps_output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("VFO list:"):
+            continue
+        for token in line.removeprefix("VFO list:").strip().split():
+            normalized = normalize_hamlib_vfo(token) or token.strip().upper()
+            if not (
+                normalized.startswith("VFO")
+                or normalized.startswith("MAIN")
+                or normalized.startswith("SUB")
+            ):
+                continue
+            if normalized in raw_seen:
+                continue
+            raw_seen.add(normalized)
+            raw_targets.append(normalized)
+    preferred_targets: list[str] = []
+    seen: set[str] = set()
+    has_main = "MAIN" in raw_seen
+    has_sub = "SUB" in raw_seen
+    for target in raw_targets:
+        if has_main and target in {"MAINA", "MAINB"}:
+            continue
+        if has_sub and target in {"SUBA", "SUBB"}:
+            continue
+        if target in seen:
+            continue
+        seen.add(target)
+        preferred_targets.append(target)
+    return preferred_targets
 
 
 def load_hamlib_model_caches(

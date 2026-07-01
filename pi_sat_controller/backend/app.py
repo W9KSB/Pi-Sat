@@ -253,6 +253,51 @@ def _clear_split_for_single_role_radios(
             )
 
 
+def _apply_satmode_for_configured_radios(
+    config,
+    rx_manager,
+    tx_manager,
+    shared_local_radio: bool,
+    shared_local_client: LocalHamlibClient | None,
+) -> None:
+    if shared_local_radio:
+        if shared_local_client is None:
+            return
+        try:
+            shared_local_client.set_satmode(bool(config.rx.satmode_enabled or config.tx.satmode_enabled))
+        except Exception as exc:
+            LOGGER.warning("Unable to apply SAT mode for shared local radio: %s", exc)
+        return
+
+    applied_signatures: set[tuple[str, int | None, int | None]] = set()
+    candidates = [
+        (config.rx, getattr(getattr(rx_manager, "radio_manager", None), "client", None)),
+        (config.tx, getattr(tx_manager, "client", None)),
+    ]
+    for device_config, client in candidates:
+        if not device_config.enabled or device_config.connectivity != "local" or client is None:
+            continue
+        if not hasattr(client, "set_satmode"):
+            continue
+        signature = (
+            device_config.serial_port,
+            device_config.model_id,
+            device_config.baud,
+        )
+        if signature in applied_signatures:
+            continue
+        try:
+            client.set_satmode(bool(device_config.satmode_enabled))
+            applied_signatures.add(signature)
+        except Exception as exc:
+            LOGGER.warning(
+                "Unable to apply SAT mode for local radio serial_port=%s model_id=%s: %s",
+                device_config.serial_port,
+                device_config.model_id,
+                exc,
+            )
+
+
 def _get_or_create_rx_tracking_manager(
     norad_id: int | None = None,
     transponder_index: int = 0,
@@ -368,6 +413,7 @@ def _reload_runtime_config() -> None:
     shared_local_split_mode = (
         shared_local_radio and bool(config.tx.shared_local_split_mode)
     )
+    shared_local_client: LocalHamlibClient | None = None
     shared_rx_client = None
     shared_tx_client = None
     shared_setup_error: str | None = None
@@ -455,6 +501,13 @@ def _reload_runtime_config() -> None:
         sdr_manager,
         tx_radio_manager,
         shared_local_radio,
+    )
+    _apply_satmode_for_configured_radios(
+        config,
+        sdr_manager,
+        tx_radio_manager,
+        shared_local_radio,
+        shared_local_client,
     )
     try:
         _ensure_pass_cache()

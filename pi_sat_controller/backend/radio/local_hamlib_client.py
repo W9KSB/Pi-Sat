@@ -238,6 +238,11 @@ class LocalHamlibClient:
             client = self._ensure_client()
             client.select_vfo(vfo)
 
+    def set_satmode(self, enabled: bool) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            client.set_satmode(enabled)
+
     def close(self) -> None:
         with self._lock:
             if self._client is not None:
