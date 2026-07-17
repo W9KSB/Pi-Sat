@@ -8,12 +8,13 @@ tracking, orbital, and data-ingest behavior lives in the backend submodules.
 """
 
 from collections import deque
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, time, timedelta, timezone
 import logging
 import math
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock, RLock, Thread
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -40,6 +41,7 @@ from pi_sat_controller.backend.config import (
     save_settings,
 )
 from pi_sat_controller.backend.controller.rx_tracking import RxTrackingManager
+from pi_sat_controller.backend.controller.autotrack import AutotrackCoordinator
 from pi_sat_controller.backend.device_support import (
     build_radio_client,
     build_rotator_client,
@@ -156,6 +158,9 @@ pass_cache_refreshed_at_utc: str | None = None
 pass_refresh_stop = Event()
 pass_refresh_thread: Thread | None = None
 pass_refresh_in_progress = False
+autotrack_stop = Event()
+autotrack_thread: Thread | None = None
+tracking_command_lock = RLock()
 transponder_refresh_stop = Event()
 transponder_refresh_thread: Thread | None = None
 hamlib_radio_models_cache: list[dict[str, object]] = []
@@ -173,11 +178,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         LOGGER.exception("Initial TLE/pass refresh failed; continuing startup without pass data")
     _start_pass_refresh_scheduler()
+    _start_autotrack_scheduler()
     _start_transponder_refresh_scheduler()
     try:
         yield
     finally:
         _stop_pass_refresh_scheduler()
+        _stop_autotrack_scheduler()
         _stop_transponder_refresh_scheduler()
         _shutdown_runtime()
 
@@ -200,13 +207,10 @@ def _build_status_payload() -> dict[str, object]:
         "devices": {
             "rx_enabled": config.rx.enabled,
             "rx_connectivity": config.rx.connectivity,
-            "rx_write_enabled": config.rx.write_enabled,
             "tx_enabled": config.tx.enabled,
             "tx_connectivity": config.tx.connectivity,
-            "tx_write_enabled": config.tx.write_enabled,
             "rotator_enabled": config.rotator.enabled,
             "rotator_connectivity": config.rotator.connectivity,
-            "rotator_write_enabled": config.rotator.write_enabled,
         },
         "satellite_count": len(satellites),
     }
@@ -378,10 +382,66 @@ def _get_or_create_rx_tracking_manager(
     return rx_tracking_manager
 
 
-def _shutdown_runtime() -> None:
+def _start_rx_tracking_manager(
+    norad_id: int | None,
+    transponder_index: int,
+    sync_offsets: bool | None,
+    source: str,
+) -> RxTrackingManager:
+    """Serializes target changes so concurrent browsers cannot create zombie trackers."""
+
+    with tracking_command_lock:
+        previous_norad = (
+            rx_tracking_manager.satellite.norad_id
+            if rx_tracking_manager is not None
+            else None
+        )
+        manager = _get_or_create_rx_tracking_manager(norad_id, transponder_index)
+        if sync_offsets is not None:
+            manager.set_offset_sync(sync_offsets)
+        manager.start()
+        LOGGER.info(
+            "Tracking target accepted source=%s previous_norad=%s norad=%s profile=%s",
+            source,
+            previous_norad,
+            manager.satellite.norad_id,
+            manager.transponder.name,
+        )
+        return manager
+
+
+def _mutate_rx_tracking_manager(
+    norad_id: int | None,
+    transponder_index: int,
+    action: Callable[[RxTrackingManager], Any],
+) -> Any:
+    """Applies a command only if the browser still references the shared target."""
+
+    with tracking_command_lock:
+        manager = rx_tracking_manager
+        if manager is None:
+            raise HTTPException(status_code=409, detail="Start tracking before changing it.")
+        if norad_id is not None and manager.satellite.norad_id != norad_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Tracking target changed in another browser; wait for sync and try again.",
+            )
+        if (
+            transponder_index < 0
+            or transponder_index >= len(manager.satellite.transponders)
+            or manager.transponder != manager.satellite.transponders[transponder_index]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Tracking profile changed in another browser; wait for sync and try again.",
+            )
+        return action(manager)
+
+
+def _shutdown_runtime(preserve_tracking_manager: bool = False) -> None:
     global rotator_manager, rx_tracking_manager, sdr_manager, tx_radio_manager
 
-    if rx_tracking_manager is not None:
+    if not preserve_tracking_manager and rx_tracking_manager is not None:
         rx_tracking_manager.shutdown()
         rx_tracking_manager = None
     if rotator_manager is not None and hasattr(rotator_manager.client, "close"):
@@ -400,7 +460,7 @@ def _reload_runtime_config() -> None:
     global hamlib_radio_models_cache, hamlib_radio_models_error
     global hamlib_rotator_models_cache, hamlib_rotator_models_error
 
-    _shutdown_runtime()
+    _shutdown_runtime(preserve_tracking_manager=True)
     (
         hamlib_radio_models_cache,
         hamlib_radio_models_error,
@@ -460,7 +520,7 @@ def _reload_runtime_config() -> None:
             tx_radio_manager = RadioManager(
                 client=build_radio_client(config.tx, "TX", shared_tx_client),
                 enabled=config.tx.enabled,
-                write_enabled=config.tx.write_enabled,
+                write_enabled=True,
                 target_vfo=config.tx.target_vfo,
                 failure_threshold=failure_threshold,
                 read_poll_enabled=not shared_local_radio,
@@ -481,7 +541,7 @@ def _reload_runtime_config() -> None:
             rotator_manager = RotatorManager(
                 client=build_rotator_client(config.rotator),
                 enabled=config.rotator.enabled,
-                write_enabled=config.rotator.write_enabled,
+                write_enabled=True,
                 min_elevation_deg=config.rotator.min_elevation_deg or 0.0,
                 home_azimuth_deg=config.rotator.home_azimuth_deg or 0.0,
                 home_elevation_deg=config.rotator.home_elevation_deg or 0.0,
@@ -494,7 +554,7 @@ def _reload_runtime_config() -> None:
             rotator_manager = FailedRotatorManager(
                 error,
                 enabled=config.rotator.enabled,
-                write_enabled=config.rotator.write_enabled,
+                write_enabled=True,
             )
     _clear_split_for_single_role_radios(
         config,
@@ -509,6 +569,16 @@ def _reload_runtime_config() -> None:
         shared_local_radio,
         shared_local_client,
     )
+    if rx_tracking_manager is not None:
+        rx_tracking_manager.update_runtime_dependencies(
+            sdr_manager=sdr_manager or DisabledTrackingSdrManager(),
+            tx_radio_manager=tx_radio_manager,
+            rotator_manager=rotator_manager,
+        )
+        try:
+            rx_tracking_manager.refresh_snapshot_only()
+        except Exception:
+            LOGGER.exception("Tracking snapshot refresh failed after runtime reload")
     try:
         _ensure_pass_cache()
     except Exception:
@@ -520,15 +590,31 @@ def _reload_rotator_config_only() -> None:
 
     config = load_config()
     failure_threshold = max(1, config.safety.device_offline_failure_threshold)
-    if rotator_manager is not None and hasattr(rotator_manager.client, "close"):
-        rotator_manager.client.close()
+    previous_rotator_manager = rotator_manager
     rotator_manager = None
+    if rx_tracking_manager is not None:
+        rx_tracking_manager.rotator_manager = None
+    if previous_rotator_manager is not None:
+        if not config.rotator.enabled:
+            try:
+                shutdown = getattr(previous_rotator_manager, "shutdown", None)
+                if shutdown is not None:
+                    shutdown()
+                else:
+                    previous_rotator_manager.stop()
+            except Exception:
+                LOGGER.exception("Failed to shut down rotator during control disable")
+        if config.rotator.enabled and hasattr(previous_rotator_manager.client, "close"):
+            try:
+                previous_rotator_manager.client.close()
+            except Exception:
+                LOGGER.exception("Failed to close rotator client during reload")
     if config.rotator.enabled:
         try:
             rotator_manager = RotatorManager(
                 client=build_rotator_client(config.rotator),
                 enabled=config.rotator.enabled,
-                write_enabled=config.rotator.write_enabled,
+                write_enabled=True,
                 min_elevation_deg=config.rotator.min_elevation_deg or 0.0,
                 home_azimuth_deg=config.rotator.home_azimuth_deg or 0.0,
                 home_elevation_deg=config.rotator.home_elevation_deg or 0.0,
@@ -541,10 +627,14 @@ def _reload_rotator_config_only() -> None:
             rotator_manager = FailedRotatorManager(
                 error,
                 enabled=config.rotator.enabled,
-                write_enabled=config.rotator.write_enabled,
+                write_enabled=True,
             )
     if rx_tracking_manager is not None:
         rx_tracking_manager.rotator_manager = rotator_manager
+        try:
+            rx_tracking_manager.refresh_snapshot_only()
+        except Exception:
+            LOGGER.exception("Tracking snapshot refresh failed after rotator reload")
 
 
 def _build_orbital_engine() -> SkyfieldEngine:
@@ -813,6 +903,86 @@ def _stop_pass_refresh_scheduler() -> None:
         pass_refresh_thread = None
 
 
+def _load_autotrack_options() -> tuple[set[int], bool]:
+    satellites, _, enabled = load_my_satellites()
+    return {satellite.norad_id for satellite in satellites}, enabled
+
+
+def _get_cached_passes() -> list[SatellitePass]:
+    with pass_cache_lock:
+        return list(pass_cache)
+
+
+def _start_autotrack_pass(satellite_pass: SatellitePass) -> bool:
+    with tracking_command_lock:
+        _, _, enabled = load_my_satellites()
+        if not enabled:
+            return False
+        current_sync = (
+            bool(rx_tracking_manager.snapshot().sync_offsets)
+            if rx_tracking_manager is not None
+            else True
+        )
+        _start_rx_tracking_manager(
+            satellite_pass.norad_id,
+            0,
+            current_sync,
+            "backend_autotrack",
+        )
+        return True
+
+
+autotrack_coordinator = AutotrackCoordinator(
+    load_options=_load_autotrack_options,
+    get_passes=_get_cached_passes,
+    start_pass=_start_autotrack_pass,
+    logger=LOGGER,
+)
+
+
+def _run_autotrack_scheduler() -> None:
+    """Runs the single authoritative upcoming-pass selection loop."""
+
+    while not autotrack_stop.is_set():
+        try:
+            autotrack_coordinator.tick()
+        except Exception:
+            LOGGER.exception("Autotrack evaluation failed")
+        if autotrack_stop.wait(1.0):
+            break
+
+
+def _start_autotrack_scheduler() -> None:
+    global autotrack_thread
+    if autotrack_thread is not None:
+        return
+    autotrack_stop.clear()
+    autotrack_thread = Thread(
+        target=_run_autotrack_scheduler,
+        name="autotrack-scheduler",
+        daemon=True,
+    )
+    autotrack_thread.start()
+
+
+def _stop_autotrack_scheduler() -> None:
+    global autotrack_thread
+    autotrack_stop.set()
+    if autotrack_thread is not None:
+        autotrack_thread.join(timeout=2.0)
+        autotrack_thread = None
+
+
+def _handle_autotrack_changed(enabled: bool) -> None:
+    autotrack_coordinator.reset()
+    if not enabled:
+        return
+    try:
+        autotrack_coordinator.tick()
+    except Exception:
+        LOGGER.exception("Autotrack evaluation failed after enable")
+
+
 def _refresh_transponder_profiles(reason: str = "manual") -> None:
     """Refreshes stored transponder profiles for the tracked satellite list."""
 
@@ -1017,7 +1187,9 @@ register_tracking_api(
     get_tx_radio_manager=lambda: tx_radio_manager,
     get_rx_tracking_manager=lambda: rx_tracking_manager,
     get_rotator_manager=lambda: rotator_manager,
-    get_or_create_rx_tracking_manager=_get_or_create_rx_tracking_manager,
+    start_rx_tracking_manager=_start_rx_tracking_manager,
+    mutate_rx_tracking_manager=_mutate_rx_tracking_manager,
+    get_autotrack_enabled=lambda: load_my_satellites()[2],
     disabled_sdr_snapshot=disabled_sdr_snapshot,
     disabled_radio_snapshot=disabled_radio_snapshot,
     disabled_rotator_snapshot=disabled_rotator_snapshot,
@@ -1065,6 +1237,7 @@ register_satellites_api(
     pass_cache_lock=pass_cache_lock,
     pass_to_dict=_pass_to_dict,
     get_pass_cache_refreshed_at_utc=lambda: pass_cache_refreshed_at_utc,
+    on_autotrack_changed=_handle_autotrack_changed,
 )
 
 register_qso_api(

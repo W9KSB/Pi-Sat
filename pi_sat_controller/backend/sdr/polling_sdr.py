@@ -109,6 +109,16 @@ class PollingSdrManager:
         except Exception:
             return self.snapshot()
 
+    def read_frequency_once(self) -> SdrDeviceSnapshot:
+        with self._client_lock:
+            try:
+                frequency_hz = self.client.get_frequency()
+            except Exception as exc:
+                self._mark_immediate_read_failure(exc)
+                raise
+
+        return self._store_read_frequency(frequency_hz)
+
     def _run(self) -> None:
         while not self._stop.is_set():
             self.poll_once()
@@ -117,23 +127,15 @@ class PollingSdrManager:
                 delay = max(self.poll_interval_s, min(15.0, self.poll_interval_s * 5))
             self._stop.wait(delay)
 
-    def poll_once(self) -> None:
+    def poll_once(self) -> SdrDeviceSnapshot:
         with self._client_lock:
             try:
                 frequency_hz = self.client.get_frequency()
             except Exception as exc:
                 self._record_error(exc)
-                return
+                return self.snapshot()
 
-        with self._state_lock:
-            was_connected = self._connected
-            self._connected = True
-            self._frequency_hz = frequency_hz
-            self._last_read_at_utc = _utc_now()
-            self._error = None
-            self._consecutive_failures = 0
-        if not was_connected:
-            LOGGER.info("RX polling connection restored")
+        return self._store_read_frequency(frequency_hz)
 
     def _record_error(self, exc: Exception) -> None:
         with self._state_lock:
@@ -145,6 +147,27 @@ class PollingSdrManager:
             self._error = str(exc)
         if previous_error != str(exc):
             LOGGER.warning("RX polling failed: %s", exc)
+
+    def _mark_immediate_read_failure(self, exc: Exception) -> None:
+        with self._state_lock:
+            previous_error = self._error
+            self._connected = False
+            self._error = str(exc)
+            self._consecutive_failures = max(self._consecutive_failures + 1, self._failure_threshold)
+        if previous_error != str(exc):
+            LOGGER.warning("RX read failed: %s", exc)
+
+    def _store_read_frequency(self, frequency_hz: int) -> SdrDeviceSnapshot:
+        with self._state_lock:
+            was_connected = self._connected
+            self._connected = True
+            self._frequency_hz = frequency_hz
+            self._last_read_at_utc = _utc_now()
+            self._error = None
+            self._consecutive_failures = 0
+        if not was_connected:
+            LOGGER.info("RX polling connection restored")
+        return self.snapshot()
 
 
 class PollingRadioFrequencyManager:
@@ -206,6 +229,18 @@ class PollingRadioFrequencyManager:
             enabled=state.enabled,
             connected=state.connected,
             frequency_hz=state.frequency_hz,
+            last_read_at_utc=state.last_read_at_utc,
+            last_write_at_utc=state.last_write_at_utc,
+            error=state.error,
+        )
+
+    def read_frequency_once(self) -> SdrDeviceSnapshot:
+        frequency_hz = self.radio_manager.get_frequency()
+        state = self.radio_manager.snapshot()
+        return SdrDeviceSnapshot(
+            enabled=state.enabled,
+            connected=state.connected,
+            frequency_hz=frequency_hz,
             last_read_at_utc=state.last_read_at_utc,
             last_write_at_utc=state.last_write_at_utc,
             error=state.error,

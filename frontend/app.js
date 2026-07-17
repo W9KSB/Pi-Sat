@@ -9,7 +9,6 @@ let managedSatellitesCache = [];
 let managedSatelliteProfilesByNorad = new Map();
 let managedSatellitePassesByNorad = new Map();
 let trackedSatelliteNorads = new Set();
-let activeAutotrackPassKey = null;
 let syncRxTx = true;
 let frontendLogMessages = [];
 let backendLogMessages = [];
@@ -21,6 +20,7 @@ let catDevicesCache = [];
 let currentSettingsState = {};
 let qthTimezone = 'UTC';
 let rotatorControlEnabled = false;
+let deviceControlUpdatePending = false;
 let mapRefreshPending = false;
 let mapRefreshRequestedAtMs = 0;
 let syncToggleUpdatePending = false;
@@ -42,9 +42,9 @@ const hiddenSettingsKeys = {
   server: new Set(['host', 'port', 'gui_resources_caching']),
   station: new Set(['latitude_deg', 'longitude_deg']),
   my_satellites: new Set(['autotrack_next_pass']),
-  rx: new Set(['cat_debug_logging', 'write_enabled']),
-  tx: new Set(['cat_debug_logging', 'write_enabled', 'shared_local_split_mode']),
-  rotator: new Set(['home_azimuth_deg', 'home_elevation_deg', 'cat_debug_logging', 'write_enabled']),
+  rx: new Set(['cat_debug_logging']),
+  tx: new Set(['cat_debug_logging', 'shared_local_split_mode']),
+  rotator: new Set(['home_azimuth_deg', 'home_elevation_deg', 'cat_debug_logging']),
   tle: new Set(['cache_dir']),
   profiles: new Set(['satellites_file']),
 };
@@ -264,26 +264,32 @@ async function refreshMonitorLogs() {
 }
 
 async function loadStatus() {
-  const response = await fetch('/api/status');
-  const status = await response.json();
+  try {
+    const response = await fetch('/api/status');
+    const status = await response.json();
 
-  document.getElementById('station').textContent =
-    `${status.station.name}: ${status.station.latitude_deg}, ${status.station.longitude_deg}`;
-  stationLatitudeDeg = Number(status.station.latitude_deg);
-  stationLongitudeDeg = Number(status.station.longitude_deg);
-  qthTimezone = status.station.timezone || 'UTC';
-  const rxToggle = document.getElementById('rx-control-toggle');
-  const txToggle = document.getElementById('tx-control-toggle');
-  const rotatorToggle = document.getElementById('rotator-control-toggle');
-  if (rxToggle) {
-    rxToggle.checked = Boolean(status.devices.rx_enabled);
-  }
-  if (txToggle) {
-    txToggle.checked = Boolean(status.devices.tx_enabled);
-  }
-  if (rotatorToggle) {
-    rotatorToggle.checked = Boolean(status.devices.rotator_enabled);
-    rotatorControlEnabled = rotatorToggle.checked;
+    document.getElementById('station').textContent =
+      `${status.station.name}: ${status.station.latitude_deg}, ${status.station.longitude_deg}`;
+    stationLatitudeDeg = Number(status.station.latitude_deg);
+    stationLongitudeDeg = Number(status.station.longitude_deg);
+    qthTimezone = status.station.timezone || 'UTC';
+    if (!deviceControlUpdatePending) {
+      const rxToggle = document.getElementById('rx-control-toggle');
+      const txToggle = document.getElementById('tx-control-toggle');
+      const rotatorToggle = document.getElementById('rotator-control-toggle');
+      if (rxToggle) {
+        rxToggle.checked = Boolean(status.devices.rx_enabled);
+      }
+      if (txToggle) {
+        txToggle.checked = Boolean(status.devices.tx_enabled);
+      }
+      if (rotatorToggle) {
+        rotatorToggle.checked = Boolean(status.devices.rotator_enabled);
+        rotatorControlEnabled = rotatorToggle.checked;
+      }
+    }
+  } catch (error) {
+    // Other polling paths surface connection failures; avoid repeating log noise here.
   }
 }
 
@@ -397,9 +403,7 @@ async function loadSatellites() {
 
   renderTrackFilter();
   renderQsoSatelliteOptions();
-  if (selectedSatelliteNorad) {
-    await selectSatelliteByNorad(selectedSatelliteNorad);
-  } else if (latestTracking?.norad_id) {
+  if (latestTracking?.norad_id) {
     restoreSelectionFromTracking();
   }
 }
@@ -428,13 +432,13 @@ async function loadSdrFrequency() {
 }
 
 async function stepSdrFrequency(event) {
-  const stepKhz = Number(event.currentTarget.dataset.rxStepKhz);
-  await stepTrackingOffset('rx', stepKhz * 1000);
+  const stepHz = Number(event.currentTarget.dataset.rxStepHz);
+  await stepTrackingOffset('rx', stepHz);
 }
 
 async function stepTxFrequency(event) {
-  const stepKhz = Number(event.currentTarget.dataset.txStepKhz);
-  await stepTrackingOffset('tx', stepKhz * 1000);
+  const stepHz = Number(event.currentTarget.dataset.txStepHz);
+  await stepTrackingOffset('tx', stepHz);
 }
 
 async function stepTrackingOffset(role, stepHz) {
@@ -542,7 +546,6 @@ async function loadPasses() {
     const selectedNorads = Array.from(trackedSatelliteNorads);
     if (!selectedNorads.length) {
       latestPasses = [];
-      activeAutotrackPassKey = null;
       renderPasses(latestPasses);
       return;
     }
@@ -553,9 +556,6 @@ async function loadPasses() {
     latestPasses = await response.json();
     qthTimezone = latestPasses[0]?.timezone || qthTimezone;
     renderPasses(latestPasses);
-    if (!selectedSatelliteNorad && !latestTracking?.norad_id && latestPasses.length) {
-      await selectSatelliteByNorad(latestPasses[0].norad_id);
-    }
   } catch (error) {
     list.textContent = 'Pass prediction failed.';
     addLog('Pass prediction failed.');
@@ -620,6 +620,8 @@ function renderTrackFilter() {
   }
   filter.replaceChildren();
   satellitesCache.forEach((satellite) => {
+    const row = document.createElement('div');
+    row.className = 'track-filter-item';
     const label = document.createElement('label');
     label.className = 'form-check';
     const checkbox = document.createElement('input');
@@ -641,7 +643,15 @@ function renderTrackFilter() {
     text.className = 'form-check-label';
     text.textContent = `${satellite.name} (${satellite.norad_id})`;
     label.append(checkbox, text);
-    filter.appendChild(label);
+    const trackButton = document.createElement('button');
+    trackButton.type = 'button';
+    trackButton.className = 'btn btn-success btn-sm flex-shrink-0 track-filter-track-now';
+    trackButton.textContent = 'Track Now';
+    trackButton.addEventListener('click', async () => {
+      await trackManagedSatelliteNow(satellite.norad_id);
+    });
+    row.append(label, trackButton);
+    filter.appendChild(row);
   });
 }
 
@@ -658,6 +668,7 @@ async function selectSatelliteByNorad(noradId, options = {}) {
   document.getElementById('selected-satellite').textContent = satellite.name;
   document.getElementById('selected-satellite-azimuth').textContent = 'Az --';
   document.getElementById('selected-satellite-elevation').textContent = 'El --';
+  document.getElementById('tracking-pass-state').textContent = '--';
   renderFrequencyProfileOptions(satellite);
   const result = await syncTrackingForSelection(options);
   if (
@@ -677,14 +688,23 @@ function restoreSelectionFromTracking() {
   if (!satellite) {
     return;
   }
-  const profileIndex = satellite.frequency_profiles.findIndex((profile) => {
-    return profile.name === latestTracking.transponder_name;
-  });
+  const sharedProfileIndex = Number(latestTracking.frequency_profile_index);
+  const hasSharedProfileIndex = latestTracking.frequency_profile_index !== null
+    && latestTracking.frequency_profile_index !== undefined
+    && Number.isInteger(sharedProfileIndex)
+    && sharedProfileIndex >= 0
+    && sharedProfileIndex < satellite.frequency_profiles.length;
+  const profileIndex = hasSharedProfileIndex
+    ? sharedProfileIndex
+    : satellite.frequency_profiles.findIndex((profile) => {
+      return profile.name === latestTracking.transponder_name;
+    });
   selectedSatelliteNorad = satellite.norad_id;
   selectedFrequencyProfileIndex = profileIndex >= 0 ? profileIndex : 0;
   document.getElementById('selected-satellite').textContent = satellite.name;
   document.getElementById('selected-satellite-azimuth').textContent = 'Az --';
   document.getElementById('selected-satellite-elevation').textContent = 'El --';
+  document.getElementById('tracking-pass-state').textContent = '--';
   renderFrequencyProfileOptions(satellite);
 }
 
@@ -797,33 +817,7 @@ function updateTxProfileState(profile) {
   }
 }
 
-function checkAutotrackNextPass() {
-  const autoTrackToggle = document.getElementById('auto-track-toggle');
-  if (autoTrackToggle && !autoTrackToggle.checked) {
-    return;
-  }
-  if (!latestPasses.length) {
-    return;
-  }
-  const nextPass = latestPasses[0];
-  const now = Date.now();
-  const aos = new Date(nextPass.aos_utc).getTime();
-  const los = new Date(nextPass.los_utc).getTime();
-  const passKey = `${nextPass.norad_id}:${nextPass.aos_utc}`;
-  if (now > los) {
-    activeAutotrackPassKey = null;
-  }
-  if (activeAutotrackPassKey === passKey) {
-    return;
-  }
-  activeAutotrackPassKey = passKey;
-  selectPass(nextPass, { source: 'auto' });
-}
-
 async function persistAutotrackSetting(enabled) {
-  if (!enabled) {
-    activeAutotrackPassKey = null;
-  }
   const response = await fetch('/api/my-satellites/options', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -853,11 +847,6 @@ async function setAutotrackEnabled(enabled, options = {}) {
       if (logOnEnable) {
         addLog('Autotrack enabled.');
       }
-      if (latestPasses.length) {
-        activeAutotrackPassKey = null;
-        await selectPass(latestPasses[0], { source: 'auto' });
-      }
-      checkAutotrackNextPass();
     } else if (logOnDisable) {
       addLog('Autotrack disabled.');
     }
@@ -1380,9 +1369,6 @@ function renderRotator(result) {
     formatNumber(result.target_elevation_deg, 2, ' deg');
   const manualEnabled = Boolean(result.manual_controls_enabled);
   setRotatorManualControlState(manualEnabled);
-  if (manualEnabled) {
-    syncRotatorManualInputs(result);
-  }
   logErrorState('rotator', result.error || '');
 }
 
@@ -1391,17 +1377,6 @@ function setRotatorManualControlState(enabled) {
   document.getElementById('rotator-manual-el').disabled = !enabled;
   document.getElementById('rotator-home-button').disabled = !enabled;
   document.getElementById('rotator-send-button').disabled = !enabled;
-}
-
-function syncRotatorManualInputs(result) {
-  const azInput = document.getElementById('rotator-manual-az');
-  const elInput = document.getElementById('rotator-manual-el');
-  if (Number.isFinite(Number(result.current_azimuth_deg))) {
-    azInput.value = Math.round(Number(result.current_azimuth_deg));
-  }
-  if (Number.isFinite(Number(result.current_elevation_deg))) {
-    elInput.value = Math.round(Number(result.current_elevation_deg));
-  }
 }
 
 async function sendManualRotatorPosition() {
@@ -1998,12 +1973,14 @@ function renderManagedSatelliteList() {
 
   managedSatellitesCache.forEach((satellite) => {
     const profiles = managedSatelliteProfilesByNorad.get(Number(satellite.norad_id)) || [];
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'list-group-item list-group-item-action d-flex justify-content-between align-items-start gap-3';
+    const item = document.createElement('div');
+    item.className = 'list-group-item my-satellite-row d-flex justify-content-between align-items-start gap-3';
     if (Number(satellite.norad_id) === Number(selectedManagedSatelliteNorad)) {
-      button.classList.add('active');
+      item.classList.add('active');
     }
+    const selectButton = document.createElement('button');
+    selectButton.type = 'button';
+    selectButton.className = 'my-satellite-select btn btn-link text-decoration-none text-start p-0';
     const label = document.createElement('div');
     label.className = 'text-start';
     const title = document.createElement('div');
@@ -2016,14 +1993,49 @@ function renderManagedSatelliteList() {
     const badge = document.createElement('span');
     badge.className = 'badge text-bg-secondary align-self-center';
     badge.textContent = `${profiles.length} profile${profiles.length === 1 ? '' : 's'}`;
-    button.append(label, badge);
-    button.addEventListener('click', () => {
+    selectButton.append(label, badge);
+    selectButton.addEventListener('click', () => {
       selectedManagedSatelliteNorad = Number(satellite.norad_id);
       renderManagedSatelliteList();
       renderManagedSatelliteDetail();
     });
-    list.appendChild(button);
+    const trackButton = document.createElement('button');
+    trackButton.type = 'button';
+    trackButton.className = 'btn btn-success btn-sm flex-shrink-0 my-satellite-track-now';
+    trackButton.textContent = 'Track Now';
+    trackButton.addEventListener('click', async () => {
+      selectedManagedSatelliteNorad = Number(satellite.norad_id);
+      renderManagedSatelliteList();
+      renderManagedSatelliteDetail();
+      await trackManagedSatelliteNow(satellite.norad_id);
+    });
+    item.append(selectButton, trackButton);
+    list.appendChild(item);
   });
+}
+
+async function trackManagedSatelliteNow(noradId) {
+  const satellite = satellitesCache.find((item) => {
+    return Number(item.norad_id) === Number(noradId);
+  });
+  if (!satellite) {
+    addLog(`Track Now unavailable for NORAD ${noradId}.`);
+    return;
+  }
+  const autotrackDisabled = await setAutotrackEnabled(false, {
+    persist: true,
+    logOnDisable: true,
+  });
+  if (!autotrackDisabled) {
+    return;
+  }
+  addLog(`Tracking ${satellite.name} now...`);
+  await selectSatelliteByNorad(satellite.norad_id);
+  await loadTracking(true);
+  if (pageFromHash() !== 'home') {
+    window.location.hash = 'home';
+    showPage('home');
+  }
 }
 
 function renderManagedSatelliteDetail() {
@@ -3269,7 +3281,6 @@ async function saveSettings(event) {
     loadStatus();
     await loadSettings();
     loadRotator();
-    syncTrackingForSelection();
   } catch (error) {
     status.textContent = 'Settings save failed.';
   }
@@ -3277,16 +3288,21 @@ async function saveSettings(event) {
 
 async function updateDeviceControl(event) {
   addLog('Updating device control...');
-  const toggleId = event.currentTarget.id;
+  const payloadKeyByToggleId = {
+    'rx-control-toggle': 'rx_enabled',
+    'tx-control-toggle': 'tx_enabled',
+    'rotator-control-toggle': 'rotator_enabled',
+  };
+  const payloadKey = payloadKeyByToggleId[event.currentTarget.id];
+  if (!payloadKey) {
+    return;
+  }
+  deviceControlUpdatePending = true;
   try {
     const response = await fetch('/api/device-controls', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        rx_enabled: document.getElementById('rx-control-toggle').checked,
-        tx_enabled: document.getElementById('tx-control-toggle').checked,
-        rotator_enabled: document.getElementById('rotator-control-toggle').checked,
-      }),
+      body: JSON.stringify({ [payloadKey]: event.currentTarget.checked }),
     });
     const result = await response.json();
     if (!response.ok) {
@@ -3298,12 +3314,11 @@ async function updateDeviceControl(event) {
     loadStatus();
     rotatorControlEnabled = document.getElementById('rotator-control-toggle').checked;
     loadRotator();
-    if (toggleId !== 'rotator-control-toggle') {
-      syncTrackingForSelection();
-    }
   } catch (error) {
     addLog('Device control update failed.');
     event.currentTarget.checked = !event.currentTarget.checked;
+  } finally {
+    deviceControlUpdatePending = false;
   }
 }
 
@@ -3330,7 +3345,6 @@ async function refreshTleData() {
 
 function isBooleanSetting(key) {
   return key === 'enabled'
-    || key === 'write_enabled'
     || key === 'cat_debug_logging'
     || key === 'return_home_after_pass'
     || key.startsWith('tx_inhibit');
@@ -3377,7 +3391,6 @@ function formatSettingLabel(key) {
     model_id: 'Model ID',
     device_id: 'Assigned Device',
     serial_port: 'Serial Port',
-    write_enabled: 'Write Enabled',
     timeout_s: 'Timeout (s)',
     grid_locator: 'Grid Locator',
     latitude_deg: 'Latitude (deg)',
@@ -3424,6 +3437,9 @@ function renderTracking(result) {
     return;
   }
   latestTracking = result;
+  if (sharedTrackingSelectionDiffers(result)) {
+    restoreSelectionFromTracking();
+  }
   const updateAtMs = Date.parse(result?.last_update_at_utc || '') || 0;
   if (
     Number(result.norad_id) === Number(selectedSatelliteNorad)
@@ -3440,10 +3456,16 @@ function renderTracking(result) {
     syncRxTx = result.sync_offsets;
     syncToggle.checked = result.sync_offsets;
   }
+  const autotrackToggle = document.getElementById('auto-track-toggle');
+  if (autotrackToggle && typeof result.autotrack_next_pass === 'boolean') {
+    autotrackToggle.checked = result.autotrack_next_pass;
+  }
   document.getElementById('selected-satellite-azimuth').textContent =
     `Az ${formatNumber(result.azimuth_deg, 2, ' deg')}`;
   document.getElementById('selected-satellite-elevation').textContent =
     `El ${formatNumber(result.elevation_deg, 2, ' deg')}`;
+  document.getElementById('tracking-pass-state').textContent =
+    result.pass_active ? 'Active' : 'Inactive';
   document.getElementById('tracking-rx-center').textContent =
     formatHz(result.downlink_center_hz);
   document.getElementById('tracking-rx-doppler').textContent =
@@ -3463,6 +3485,32 @@ function renderTracking(result) {
   renderTxReadoutsForSelectedProfile();
   logErrorState('tracking', result.error || '');
   drawMap();
+}
+
+function sharedTrackingSelectionDiffers(result) {
+  const sharedNorad = Number(result?.norad_id);
+  if (!Number.isFinite(sharedNorad)) {
+    return false;
+  }
+  if (sharedNorad !== Number(selectedSatelliteNorad)) {
+    return true;
+  }
+
+  const sharedProfileIndex = Number(result.frequency_profile_index);
+  if (
+    result.frequency_profile_index !== null
+    && result.frequency_profile_index !== undefined
+    && Number.isInteger(sharedProfileIndex)
+  ) {
+    return sharedProfileIndex !== selectedFrequencyProfileIndex;
+  }
+
+  const selectedProfile = getSelectedFrequencyProfile();
+  return Boolean(
+    result.transponder_name
+    && selectedProfile
+    && result.transponder_name !== selectedProfile.name
+  );
 }
 
 function renderTxReadoutsForSelectedProfile() {
@@ -3547,6 +3595,7 @@ function beginMapRefresh(noradId, satelliteName) {
   mapRefreshRequestedAtMs = Date.now();
   latestTracking = {
     active: true,
+    pass_active: false,
     norad_id: noradId,
     satellite_name: satelliteName,
     latitude_deg: null,
@@ -4273,10 +4322,10 @@ document
   .getElementById('sync-rx-tx-toggle')
   .addEventListener('change', updateSyncMode);
 document
-  .querySelectorAll('[data-rx-step-khz]')
+  .querySelectorAll('[data-rx-step-hz]')
   .forEach((button) => button.addEventListener('click', stepSdrFrequency));
 document
-  .querySelectorAll('[data-tx-step-khz]')
+  .querySelectorAll('[data-tx-step-hz]')
   .forEach((button) => button.addEventListener('click', stepTxFrequency));
 document
   .getElementById('reset-rx-offset')
@@ -4327,9 +4376,9 @@ document
   .addEventListener('click', sendRotatorHome);
 setInterval(loadSdrFrequency, 1000);
 setInterval(loadTracking, 1000);
+setInterval(loadStatus, 2000);
 setInterval(loadRotator, 2000);
 setInterval(loadPasses, 60000);
-setInterval(checkAutotrackNextPass, 1000);
 setInterval(() => {
   if (isDocumentVisible() && pageFromHash() === 'home') {
     drawMap();

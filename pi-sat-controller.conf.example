@@ -33,8 +33,6 @@ device_id =
 target_vfo = current
 # Enable verbose CAT/Hamlib command logging for this role.
 cat_debug_logging = false
-# Enable frequency writes for this role.
-write_enabled = false
 
 [tx]
 enabled = false
@@ -47,8 +45,6 @@ target_vfo = current
 shared_local_split_mode = false
 # Enable verbose CAT/Hamlib command logging for this role.
 cat_debug_logging = false
-# Enable frequency writes for this role.
-write_enabled = false
 
 [rotator]
 enabled = false
@@ -63,8 +59,6 @@ baud =
 model_id = 
 # Enable verbose rotator/Hamlib command logging for this role.
 cat_debug_logging = 
-# Enable rotator position writes. Keep false until hardware is ready.
-write_enabled = false
 timeout_s = 2.0
 min_elevation_deg = 0.0
 home_azimuth_deg = 0.0

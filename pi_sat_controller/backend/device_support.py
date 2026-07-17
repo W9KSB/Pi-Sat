@@ -55,7 +55,7 @@ def _device_config_from_cat_device_entry(device_settings: dict[str, Any]) -> Dev
         target_vfo=None,
         shared_local_split_mode=False,
         satmode_enabled=parse_bool_setting(device_settings.get("satmode_enabled"), False),
-        write_enabled=False,
+        write_enabled=True,
         timeout_s=parse_float_setting(device_settings.get("timeout_s"), 2.0) or 2.0,
         cat_debug_logging=False,
     )
@@ -123,7 +123,7 @@ def device_config_from_settings(
             if base_device_config is not None
             else False
         ),
-        write_enabled=parse_bool_setting(section_settings.get("write_enabled"), False),
+        write_enabled=True,
         timeout_s=(
             base_device_config.timeout_s
             if base_device_config is not None

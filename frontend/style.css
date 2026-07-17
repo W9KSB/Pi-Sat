@@ -292,9 +292,17 @@ body[data-dashboard-mode="mobile"] {
   padding: 0 0.75rem 0.75rem;
 }
 
+.track-filter-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
 .track-filter-options label {
   display: flex;
   align-items: center;
+  flex: 1 1 auto;
   gap: 0.5rem;
   color: var(--app-muted);
   font-size: 0.9rem;
@@ -302,6 +310,11 @@ body[data-dashboard-mode="mobile"] {
 
 .track-filter-options input {
   accent-color: var(--bs-primary);
+}
+
+.track-filter-track-now {
+  min-width: 6.75rem;
+  font-weight: 600;
 }
 
 .pass-panel {
@@ -695,6 +708,30 @@ dd {
   background: #0c1218;
   border-color: #283542;
   color: #f6f8fb;
+}
+
+.my-satellite-row {
+  padding: 0.7rem 0.85rem;
+}
+
+.my-satellite-select {
+  display: flex;
+  flex: 1 1 auto;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+  color: inherit;
+}
+
+.my-satellite-select:hover,
+.my-satellite-select:focus-visible {
+  color: inherit;
+}
+
+.my-satellite-track-now {
+  align-self: center;
+  min-width: 6.75rem;
+  font-weight: 600;
 }
 
 .my-satellite-list .list-group-item.active {

@@ -111,6 +111,7 @@
                     <div class="summary-box-label">Selected Satellite</div>
                     <div class="selected-satellite-row">
                       <strong id="selected-satellite">None</strong>
+                      <span id="tracking-pass-state" class="text-body-secondary small">--</span>
                       <span id="selected-satellite-azimuth" class="text-body-secondary small">Az --</span>
                       <span id="selected-satellite-elevation" class="text-body-secondary small">El --</span>
                     </div>
@@ -142,12 +143,12 @@
                         </dl>
                         <form id="rx-frequency-form" class="visually-hidden"></form>
                         <div class="step-controls" aria-label="RX frequency step controls">
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="-1000">-1000 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="-100">-100 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="-10">-10 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="10">+10 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="100">+100 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="1000">+1000 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="-1000">-1000 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="-100">-100 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="-10">-10 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="10">+10 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="100">+100 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="1000">+1000 Hz</button>
                         </div>
                       </div>
                     </div>
@@ -166,12 +167,12 @@
                           <div><dt>Target TX</dt><dd id="tracking-calculated-tx">--</dd></div>
                         </dl>
                         <div class="step-controls" aria-label="TX frequency step controls">
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="-1000">-1000 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="-100">-100 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="-10">-10 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="10">+10 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="100">+100 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="1000">+1000 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="-1000">-1000 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="-100">-100 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="-10">-10 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="10">+10 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="100">+100 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="1000">+1000 Hz</button>
                         </div>
                       </div>
                     </div>

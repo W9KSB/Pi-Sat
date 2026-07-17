@@ -21,6 +21,9 @@ class DisabledTrackingSdrManager:
     def try_set_frequency(self, frequency_hz: int):
         return disabled_sdr_snapshot()
 
+    def read_frequency_once(self):
+        raise RuntimeError(disabled_sdr_snapshot().error)
+
 
 class FailedTrackingSdrManager:
     """Fallback RX manager used when startup cannot build the real device path."""
@@ -47,6 +50,9 @@ class FailedTrackingSdrManager:
 
     def try_set_frequency(self, frequency_hz: int):
         return self.snapshot()
+
+    def read_frequency_once(self):
+        raise RuntimeError(self.error)
 
 
 class FailedRadioManager:

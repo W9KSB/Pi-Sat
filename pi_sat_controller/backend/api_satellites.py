@@ -34,6 +34,7 @@ def register_satellites_api(
     pass_cache_lock: Lock,
     pass_to_dict: Callable[[Any], dict[str, object]],
     get_pass_cache_refreshed_at_utc: Callable[[], str | None],
+    on_autotrack_changed: Callable[[bool], None],
 ) -> None:
     @app.get("/api/satellites")
     def get_satellites() -> list[dict[str, object]]:
@@ -199,6 +200,8 @@ def register_satellites_api(
         if "autotrack_next_pass" in payload:
             autotrack = bool(payload["autotrack_next_pass"])
         save_my_satellites(satellites, min_elevation, autotrack)
+        if "autotrack_next_pass" in payload:
+            on_autotrack_changed(autotrack)
         return get_my_satellites()
 
     @app.get("/api/my-satellites/passes")

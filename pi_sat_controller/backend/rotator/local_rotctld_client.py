@@ -47,7 +47,17 @@ class LocalRotctldClient:
 
     def close(self) -> None:
         with self._lock:
+            client = self._client
             self._client = None
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    LOGGER.debug(
+                        "local_rotctld role=%s quit command failed during close",
+                        self.role_label,
+                        exc_info=True,
+                    )
             if self._daemon is not None:
                 self._daemon.terminate()
                 try:

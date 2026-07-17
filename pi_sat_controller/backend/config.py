@@ -80,6 +80,7 @@ class DeviceConfig:
     baud: int | None
     model_id: int | None
     target_vfo: str | None
+    # Device writes are now controlled solely by the runtime enabled toggle.
     write_enabled: bool
     timeout_s: float
     shared_local_split_mode: bool = False
@@ -247,7 +248,7 @@ def _load_device(
         ),
         satmode_enabled=base_device.satmode_enabled if base_device else False,
         cat_debug_logging=_get_bool(parser, section, "cat_debug_logging", False),
-        write_enabled=_get_bool(parser, section, "write_enabled"),
+        write_enabled=True,
         timeout_s=(
             base_device.timeout_s
             if base_device
@@ -363,14 +364,12 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "device_id",
         "target_vfo",
         "cat_debug_logging",
-        "write_enabled",
     ],
     "tx": [
         "device_id",
         "target_vfo",
         "shared_local_split_mode",
         "cat_debug_logging",
-        "write_enabled",
     ],
     "rotator": [
         "connectivity",
@@ -380,7 +379,6 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "baud",
         "model_id",
         "cat_debug_logging",
-        "write_enabled",
         "timeout_s",
         "min_elevation_deg",
         "home_azimuth_deg",
@@ -601,8 +599,6 @@ def _render_settings(
             lines.append(f"shared_local_split_mode = {values['shared_local_split_mode']}")
         lines.append("# Enable verbose CAT/Hamlib command logging for this role.")
         lines.append(f"cat_debug_logging = {values['cat_debug_logging']}")
-        lines.append("# Enable frequency writes for this role.")
-        lines.append(f"write_enabled = {values['write_enabled']}")
 
     lines.append("")
     values = section("rotator")
@@ -620,8 +616,6 @@ def _render_settings(
     lines.append(f"model_id = {values['model_id']}")
     lines.append("# Enable verbose rotator/Hamlib command logging for this role.")
     lines.append(f"cat_debug_logging = {values['cat_debug_logging']}")
-    lines.append("# Enable rotator position writes. Keep false until hardware is ready.")
-    lines.append(f"write_enabled = {values['write_enabled']}")
     lines.append(f"timeout_s = {values['timeout_s']}")
     lines.append(f"min_elevation_deg = {values['min_elevation_deg']}")
     lines.append(f"home_azimuth_deg = {values['home_azimuth_deg']}")
