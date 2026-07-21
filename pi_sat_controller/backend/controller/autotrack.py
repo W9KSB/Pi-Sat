@@ -17,15 +17,20 @@ class AutotrackCoordinator:
         load_options: Callable[[], tuple[set[int], bool]],
         get_passes: Callable[[], list[SatellitePass]],
         start_pass: Callable[[SatellitePass], bool | None],
+        run_pre_aos: Callable[[SatellitePass], None],
         logger: logging.Logger,
         retry_interval_s: float = 30.0,
+        pre_aos_lead_s: float = 15.0,
     ) -> None:
         self._load_options = load_options
         self._get_passes = get_passes
         self._start_pass = start_pass
+        self._run_pre_aos = run_pre_aos
         self._logger = logger
         self._retry_interval = timedelta(seconds=max(1.0, retry_interval_s))
+        self._pre_aos_lead = timedelta(seconds=max(0.0, pre_aos_lead_s))
         self._handled_pass_key: tuple[int, str] | None = None
+        self._pre_aos_pass_key: tuple[int, str] | None = None
         self._last_attempt_key: tuple[int, str] | None = None
         self._last_attempt_at: datetime | None = None
         self._lock = Lock()
@@ -51,15 +56,23 @@ class AutotrackCoordinator:
         pass_key = (next_pass.norad_id, next_pass.aos_utc.isoformat())
         with self._lock:
             if self._handled_pass_key == pass_key:
-                return False
+                pass_already_started = True
+            else:
+                pass_already_started = False
             if (
-                self._last_attempt_key == pass_key
+                not pass_already_started
+                and self._last_attempt_key == pass_key
                 and self._last_attempt_at is not None
                 and now_utc - self._last_attempt_at < self._retry_interval
             ):
                 return False
-            self._last_attempt_key = pass_key
-            self._last_attempt_at = now_utc
+            if not pass_already_started:
+                self._last_attempt_key = pass_key
+                self._last_attempt_at = now_utc
+
+        if pass_already_started:
+            self._trigger_pre_aos_if_due(next_pass, pass_key, now_utc)
+            return False
 
         try:
             started = self._start_pass(next_pass)
@@ -76,6 +89,7 @@ class AutotrackCoordinator:
 
         with self._lock:
             self._handled_pass_key = pass_key
+        self._trigger_pre_aos_if_due(next_pass, pass_key, now_utc)
         self._logger.info(
             "Autotrack selected satellite=%s norad=%s aos=%s los=%s",
             next_pass.satellite_name,
@@ -85,6 +99,30 @@ class AutotrackCoordinator:
         )
         return True
 
+    def _trigger_pre_aos_if_due(
+        self,
+        satellite_pass: SatellitePass,
+        pass_key: tuple[int, str],
+        now_utc: datetime,
+    ) -> None:
+        if now_utc < satellite_pass.aos_utc - self._pre_aos_lead:
+            return
+        with self._lock:
+            if self._pre_aos_pass_key == pass_key:
+                return
+            self._pre_aos_pass_key = pass_key
+        try:
+            self._run_pre_aos(satellite_pass)
+        except Exception:
+            with self._lock:
+                self._pre_aos_pass_key = None
+            self._logger.exception(
+                "Pre-AOS automation failed satellite=%s norad=%s aos=%s",
+                satellite_pass.satellite_name,
+                satellite_pass.norad_id,
+                satellite_pass.aos_utc.isoformat(),
+            )
+
     def reset(self) -> None:
         """Forgets the handled pass after an explicit autotrack setting change."""
 
@@ -93,6 +131,7 @@ class AutotrackCoordinator:
     def _clear_state(self) -> None:
         with self._lock:
             self._handled_pass_key = None
+            self._pre_aos_pass_key = None
             self._last_attempt_key = None
             self._last_attempt_at = None
 

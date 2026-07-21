@@ -375,7 +375,7 @@ def _get_or_create_rx_tracking_manager(
         deadband_hz=config.safety.frequency_deadband_hz,
         rotator_manager=rotator_manager,
         tx_radio_manager=tx_radio_manager,
-        on_pass_start=lambda context: _trigger_automation_script_event("aos", context),
+        on_pass_start=None,
         on_pass_end=lambda context: _trigger_automation_script_event("los", context),
         interval_s=max(0.1, config.safety.tracking_update_interval_ms / 1000.0),
     )
@@ -932,10 +932,27 @@ def _start_autotrack_pass(satellite_pass: SatellitePass) -> bool:
         return True
 
 
+def _run_pre_aos_automation(satellite_pass: SatellitePass) -> None:
+    snapshot = rx_tracking_manager.snapshot() if rx_tracking_manager is not None else None
+    _trigger_automation_script_event(
+        "aos",
+        {
+            "event": "AOS",
+            "norad_id": satellite_pass.norad_id,
+            "satellite_name": satellite_pass.satellite_name,
+            "aos_utc": satellite_pass.aos_utc.isoformat(),
+            "los_utc": satellite_pass.los_utc.isoformat(),
+            "target_rx_hz": getattr(snapshot, "target_rx_hz", None),
+            "target_tx_hz": getattr(snapshot, "calculated_tx_hz", None),
+        },
+    )
+
+
 autotrack_coordinator = AutotrackCoordinator(
     load_options=_load_autotrack_options,
     get_passes=_get_cached_passes,
     start_pass=_start_autotrack_pass,
+    run_pre_aos=_run_pre_aos_automation,
     logger=LOGGER,
 )
 

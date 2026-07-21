@@ -36,10 +36,12 @@ class AutotrackCoordinatorTests(unittest.TestCase):
         self.configured_norads = {100, 200}
         self.passes: list[SatellitePass] = []
         self.started: list[int] = []
+        self.pre_aos: list[int] = []
         self.coordinator = AutotrackCoordinator(
             load_options=lambda: (set(self.configured_norads), self.enabled),
             get_passes=lambda: list(self.passes),
             start_pass=lambda satellite_pass: self.started.append(satellite_pass.norad_id),
+            run_pre_aos=lambda satellite_pass: self.pre_aos.append(satellite_pass.norad_id),
             logger=logging.getLogger(__name__),
             retry_interval_s=30.0,
         )
@@ -90,6 +92,7 @@ class AutotrackCoordinatorTests(unittest.TestCase):
             load_options=lambda: ({100}, True),
             get_passes=lambda: list(self.passes),
             start_pass=cancel_start,
+            run_pre_aos=lambda satellite_pass: self.pre_aos.append(satellite_pass.norad_id),
             logger=logging.getLogger(__name__),
             retry_interval_s=1.0,
         )
@@ -122,6 +125,7 @@ class AutotrackCoordinatorTests(unittest.TestCase):
             load_options=lambda: ({100}, True),
             get_passes=lambda: list(self.passes),
             start_pass=fail_start,
+            run_pre_aos=lambda satellite_pass: self.pre_aos.append(satellite_pass.norad_id),
             logger=logging.getLogger(f"{__name__}.expected_failure"),
             retry_interval_s=30.0,
         )
@@ -131,6 +135,30 @@ class AutotrackCoordinatorTests(unittest.TestCase):
         self.assertFalse(coordinator.tick(NOW + timedelta(seconds=29)))
         self.assertFalse(coordinator.tick(NOW + timedelta(seconds=30)))
         self.assertEqual(attempts, [100, 100])
+
+    def test_runs_pre_aos_once_at_fifteen_second_lead(self) -> None:
+        self.passes = [make_pass(100, aos_offset_s=60, los_offset_s=120)]
+
+        self.assertTrue(self.coordinator.tick(NOW))
+        self.assertFalse(self.coordinator.tick(NOW + timedelta(seconds=44)))
+        self.assertEqual(self.pre_aos, [])
+
+        self.assertFalse(self.coordinator.tick(NOW + timedelta(seconds=45)))
+        self.assertFalse(self.coordinator.tick(NOW + timedelta(seconds=46)))
+        self.assertEqual(self.pre_aos, [100])
+
+    def test_does_not_run_pre_aos_when_pass_start_is_cancelled(self) -> None:
+        self.passes = [make_pass(100, aos_offset_s=10, los_offset_s=120)]
+        coordinator = AutotrackCoordinator(
+            load_options=lambda: ({100}, True),
+            get_passes=lambda: list(self.passes),
+            start_pass=lambda satellite_pass: False,
+            run_pre_aos=lambda satellite_pass: self.pre_aos.append(satellite_pass.norad_id),
+            logger=logging.getLogger(__name__),
+        )
+
+        self.assertFalse(coordinator.tick(NOW))
+        self.assertEqual(self.pre_aos, [])
 
 
 if __name__ == "__main__":

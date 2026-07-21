@@ -71,7 +71,7 @@ class RigctldClient:
         return _parse_vfo_response(self._request("v"))
 
     def check_vfo_mode(self) -> bool:
-        return self._request("chk_vfo").strip().upper() == "CHKVFO 1"
+        return self._request(r"\chk_vfo").strip().upper() == "CHKVFO 1"
 
     def set_frequency(self, frequency_hz: int) -> None:
         response = self._request(f"F {frequency_hz}")
@@ -196,7 +196,7 @@ class PersistentRigctldClient:
         return _parse_vfo_response(self._request("v"))
 
     def check_vfo_mode(self) -> bool:
-        return self._request("chk_vfo").strip().upper() == "CHKVFO 1"
+        return self._request(r"\chk_vfo").strip().upper() == "CHKVFO 1"
 
     def set_frequency(self, frequency_hz: int) -> None:
         response = self._request(f"F {frequency_hz}")
