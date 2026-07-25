@@ -816,7 +816,7 @@ def _refresh_pass_cache(force_tle_download: bool) -> list[SatellitePass]:
             LOGGER.exception("Unable to build orbital engine during pass refresh")
             with pass_cache_lock:
                 return list(pass_cache)
-        satellites, min_elevation, _ = load_my_satellites()
+        satellites, min_elevation, _, _ = load_my_satellites()
         all_passes: list[SatellitePass] = []
         for satellite in satellites:
             try:
@@ -904,8 +904,8 @@ def _stop_pass_refresh_scheduler() -> None:
 
 
 def _load_autotrack_options() -> tuple[set[int], bool]:
-    satellites, _, enabled = load_my_satellites()
-    return {satellite.norad_id for satellite in satellites}, enabled
+    _, _, enabled, autotrack_norads = load_my_satellites()
+    return autotrack_norads, enabled
 
 
 def _get_cached_passes() -> list[SatellitePass]:
@@ -915,7 +915,7 @@ def _get_cached_passes() -> list[SatellitePass]:
 
 def _start_autotrack_pass(satellite_pass: SatellitePass) -> bool:
     with tracking_command_lock:
-        _, _, enabled = load_my_satellites()
+        _, _, enabled, _ = load_my_satellites()
         if not enabled:
             return False
         current_sync = (
@@ -1004,7 +1004,7 @@ def _refresh_transponder_profiles(reason: str = "manual") -> None:
     """Refreshes stored transponder profiles for the tracked satellite list."""
 
     config = load_config()
-    my_satellites, _, _ = load_my_satellites()
+    my_satellites, _, _, _ = load_my_satellites()
     existing_profiles = {
         satellite.norad_id: satellite
         for satellite in load_satellite_profiles(config.profiles.satellites_file)

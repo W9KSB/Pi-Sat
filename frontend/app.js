@@ -9,6 +9,7 @@ let managedSatellitesCache = [];
 let managedSatelliteProfilesByNorad = new Map();
 let managedSatellitePassesByNorad = new Map();
 let trackedSatelliteNorads = new Set();
+let trackFilterLoaded = false;
 let syncRxTx = true;
 let frontendLogMessages = [];
 let backendLogMessages = [];
@@ -613,7 +614,7 @@ function renderTrackFilter() {
   if (!filter) {
     return;
   }
-  if (!trackedSatelliteNorads.size) {
+  if (!trackFilterLoaded) {
     trackedSatelliteNorads = new Set(
       satellitesCache.map((satellite) => Number(satellite.norad_id))
     );
@@ -628,15 +629,27 @@ function renderTrackFilter() {
     checkbox.type = 'checkbox';
     checkbox.className = 'form-check-input';
     checkbox.checked = trackedSatelliteNorads.has(Number(satellite.norad_id));
-    checkbox.addEventListener('change', () => {
+    checkbox.addEventListener('change', async () => {
+      const noradId = Number(satellite.norad_id);
       if (checkbox.checked) {
-        trackedSatelliteNorads.add(Number(satellite.norad_id));
+        trackedSatelliteNorads.add(noradId);
       } else {
-        trackedSatelliteNorads.delete(Number(satellite.norad_id));
+        trackedSatelliteNorads.delete(noradId);
       }
       selectedSatelliteNorad = trackedSatelliteNorads.has(Number(selectedSatelliteNorad))
         ? selectedSatelliteNorad
         : null;
+      try {
+        await persistTrackFilter();
+      } catch (error) {
+        if (checkbox.checked) {
+          trackedSatelliteNorads.delete(noradId);
+        } else {
+          trackedSatelliteNorads.add(noradId);
+        }
+        checkbox.checked = !checkbox.checked;
+        addLog(error.message || 'Satellite filter update failed.');
+      }
       loadPasses();
     });
     const text = document.createElement('span');
@@ -828,6 +841,20 @@ async function persistAutotrackSetting(enabled) {
   const result = await response.json();
   if (!response.ok) {
     throw new Error(result.detail || 'Autotrack update failed.');
+  }
+}
+
+async function persistTrackFilter() {
+  const response = await fetch('/api/my-satellites/options', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      autotrack_norad_ids: Array.from(trackedSatelliteNorads),
+    }),
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.detail || 'Satellite filter update failed.');
   }
 }
 
@@ -2113,6 +2140,10 @@ async function loadMySatellites() {
       ])
     );
     managedSatellitesCache = result.satellites || [];
+    trackedSatelliteNorads = new Set(
+      (result.autotrack_norad_ids || []).map((noradId) => Number(noradId))
+    );
+    trackFilterLoaded = true;
     managedSatelliteProfilesByNorad = profilesByNorad;
     managedSatellitePassesByNorad = passesByNorad;
     document.getElementById('min-pass-elevation').value =
@@ -2126,6 +2157,7 @@ async function loadMySatellites() {
       passMinLabel.textContent = `(min el ${Number(result.min_pass_elevation_deg).toFixed(1)} deg)`;
     }
     ensureManagedSatelliteSelection();
+    renderTrackFilter();
     renderManagedSatelliteList();
     renderManagedSatelliteDetail();
     status.textContent = '';
@@ -3288,13 +3320,18 @@ async function saveSettings(event) {
 
 async function updateDeviceControl(event) {
   addLog('Updating device control...');
+  const toggle = event.currentTarget;
+  const requestedEnabled = toggle.checked;
+  toggle.blur();
+  toggle.disabled = true;
   const payloadKeyByToggleId = {
     'rx-control-toggle': 'rx_enabled',
     'tx-control-toggle': 'tx_enabled',
     'rotator-control-toggle': 'rotator_enabled',
   };
-  const payloadKey = payloadKeyByToggleId[event.currentTarget.id];
+  const payloadKey = payloadKeyByToggleId[toggle.id];
   if (!payloadKey) {
+    toggle.disabled = false;
     return;
   }
   deviceControlUpdatePending = true;
@@ -3302,12 +3339,12 @@ async function updateDeviceControl(event) {
     const response = await fetch('/api/device-controls', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [payloadKey]: event.currentTarget.checked }),
+      body: JSON.stringify({ [payloadKey]: requestedEnabled }),
     });
     const result = await response.json();
     if (!response.ok) {
       addLog(result.detail || 'Device control update failed.');
-      event.currentTarget.checked = !event.currentTarget.checked;
+      toggle.checked = !requestedEnabled;
       return;
     }
     addLog('Device control updated.');
@@ -3316,8 +3353,9 @@ async function updateDeviceControl(event) {
     loadRotator();
   } catch (error) {
     addLog('Device control update failed.');
-    event.currentTarget.checked = !event.currentTarget.checked;
+    toggle.checked = !requestedEnabled;
   } finally {
+    toggle.disabled = false;
     deviceControlUpdatePending = false;
   }
 }
@@ -4284,7 +4322,6 @@ document.getElementById('sync-rx-tx-toggle').checked = syncRxTx;
 loadSdrFrequency();
 loadRotator();
 loadSettings();
-loadMySatellites();
 initializePassControls();
 drawMap();
 worldMapImage.addEventListener('load', () => {
@@ -4317,7 +4354,7 @@ document
   .addEventListener('change', updateDeviceControl);
 document
   .getElementById('rotator-control-toggle')
-  .addEventListener('change', updateDeviceControl);
+  .addEventListener('input', updateDeviceControl);
 document
   .getElementById('sync-rx-tx-toggle')
   .addEventListener('change', updateSyncMode);
@@ -4397,6 +4434,7 @@ setInterval(() => {
 
 async function initializePassControls() {
   await loadTracking();
+  await loadMySatellites();
   await loadSatellites();
   await loadPasses();
   await loadTrackedSatelliteLocations();

@@ -359,7 +359,11 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
     "station": ["name", "grid_locator", "latitude_deg", "longitude_deg", "elevation_m"],
     "tle": ["source_url", "cache_dir", "stale_after_hours"],
     "profiles": ["satellites_file"],
-    "my_satellites": ["min_pass_elevation_deg", "autotrack_next_pass"],
+    "my_satellites": [
+        "min_pass_elevation_deg",
+        "autotrack_next_pass",
+        "autotrack_norad_ids",
+    ],
     "rx": [
         "device_id",
         "target_vfo",
@@ -400,13 +404,13 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
 
 def load_my_satellites(
     path: Path | str = DEFAULT_CONFIG_PATH,
-) -> tuple[list[MySatellite], float, bool]:
+) -> tuple[list[MySatellite], float, bool, set[int]]:
     parser = ConfigParser()
     loaded = parser.read(Path(path))
     if not loaded:
         raise FileNotFoundError(f"Config file not found: {path}")
     if not parser.has_section("my_satellites"):
-        return [], 10.0, False
+        return [], 10.0, False, set()
 
     satellites: list[MySatellite] = []
     for key, value in parser.items("my_satellites"):
@@ -418,10 +422,30 @@ def load_my_satellites(
             continue
         satellites.append(MySatellite(norad_id=norad_id, name=value.strip()))
 
+    satellites = sorted(satellites, key=lambda satellite: satellite.name.lower())
+    configured_norads = {satellite.norad_id for satellite in satellites}
+    raw_autotrack_norads = parser.get(
+        "my_satellites",
+        "autotrack_norad_ids",
+        fallback=None,
+    )
+    if raw_autotrack_norads is None:
+        autotrack_norads = configured_norads
+    else:
+        autotrack_norads = set()
+        for value in raw_autotrack_norads.split(","):
+            try:
+                norad_id = int(value.strip())
+            except ValueError:
+                continue
+            if norad_id in configured_norads:
+                autotrack_norads.add(norad_id)
+
     return (
-        sorted(satellites, key=lambda satellite: satellite.name.lower()),
+        satellites,
         parser.getfloat("my_satellites", "min_pass_elevation_deg", fallback=10.0),
         parser.getboolean("my_satellites", "autotrack_next_pass", fallback=True),
+        autotrack_norads,
     )
 
 
@@ -429,6 +453,7 @@ def save_my_satellites(
     satellites: list[MySatellite],
     min_pass_elevation_deg: float,
     autotrack_next_pass: bool,
+    autotrack_norad_ids: set[int],
     path: Path | str = DEFAULT_CONFIG_PATH,
 ) -> None:
     settings = load_settings(path)
@@ -440,6 +465,11 @@ def save_my_satellites(
     settings["my_satellites"]["min_pass_elevation_deg"] = str(min_pass_elevation_deg)
     settings["my_satellites"]["autotrack_next_pass"] = (
         "true" if autotrack_next_pass else "false"
+    )
+    configured_norads = {satellite.norad_id for satellite in satellites}
+    settings["my_satellites"]["autotrack_norad_ids"] = ",".join(
+        str(norad_id)
+        for norad_id in sorted(autotrack_norad_ids & configured_norads)
     )
     for satellite in satellites:
         settings["my_satellites"][f"satellite_{satellite.norad_id}"] = satellite.name

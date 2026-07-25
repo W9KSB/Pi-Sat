@@ -47,10 +47,38 @@ class FrontendSharedTrackingTests(unittest.TestCase):
 
     def test_device_control_updates_only_the_changed_toggle(self) -> None:
         self.assertIn(
-            "JSON.stringify({ [payloadKey]: event.currentTarget.checked })",
+            "JSON.stringify({ [payloadKey]: requestedEnabled })",
             self.source,
         )
         self.assertIn("setInterval(loadStatus, 2000);", self.source)
+
+    def test_device_toggle_clears_focus_before_waiting_for_backend(self) -> None:
+        handler = self.source[
+            self.source.index("async function updateDeviceControl(event)")
+            : self.source.index("async function refreshTleData()")
+        ]
+
+        self.assertLess(handler.index("toggle.blur();"), handler.index("await fetch("))
+        self.assertIn("toggle.disabled = true;", handler)
+        self.assertIn("toggle.disabled = false;", handler)
+        self.assertIn(
+            ".getElementById('rotator-control-toggle')\n  .addEventListener('input', updateDeviceControl);",
+            self.source,
+        )
+
+    def test_startup_restores_filter_before_loading_passes(self) -> None:
+        startup = self.source[
+            self.source.index("async function initializePassControls()"):
+        ]
+
+        self.assertLess(
+            startup.index("await loadMySatellites();"),
+            startup.index("await loadPasses();"),
+        )
+        self.assertNotIn(
+            "\nloadMySatellites();\ninitializePassControls();",
+            self.source,
+        )
 
 
 if __name__ == "__main__":
