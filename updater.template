@@ -35,13 +35,28 @@ echo "Updating Pi-Sat Controller in: ${REPO_ROOT}"
 
 cd "${REPO_ROOT}"
 
-sudo systemctl stop "${SERVICE_NAME}"
+service_stopped=0
+restore_service_on_failure() {
+  status=$?
+  if [ "${status}" -ne 0 ] && [ "${service_stopped}" -eq 1 ]; then
+    echo "Update failed after stopping ${SERVICE_NAME}; attempting to restart it."
+    sudo systemctl start "${SERVICE_NAME}" || true
+  fi
+  trap - EXIT
+  exit "${status}"
+}
+trap restore_service_on_failure EXIT
+
 git fetch --all --prune
+sudo systemctl stop "${SERVICE_NAME}"
+service_stopped=1
 git reset --hard origin/main
 . .venv/bin/activate
 python -m pip install -r requirements.txt
 sudo systemctl daemon-reload
 sudo systemctl start "${SERVICE_NAME}"
+service_stopped=0
+trap - EXIT
 
 echo ""
 echo "Update complete."

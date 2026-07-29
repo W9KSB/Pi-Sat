@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import requests
@@ -8,6 +9,10 @@ from pi_sat_controller.backend.models import TransponderProfile
 
 
 DEFAULT_TRANSPONDER_SOURCE_URL = "https://db.satnogs.org/api/transmitters/"
+_CTCSS_PATTERN = re.compile(
+    r"\bCTCSS(?:\s+TONE)?\s*[:=-]?\s*(\d{2,3}(?:\.\d)?)\s*HZ\b",
+    re.IGNORECASE,
+)
 
 
 class TransponderSourceClient:
@@ -64,5 +69,24 @@ def _transmitter_to_transponder(
         ratio=1.0,
         preferred_uplink=0 if is_rx_only else round((uplink_low + uplink_high) / 2),
         preferred_downlink=round((downlink_low + downlink_high) / 2),
-        tone=None,
+        tone=_extract_ctcss_tone(transmitter),
     )
+
+
+def _extract_ctcss_tone(transmitter: dict[str, Any]) -> float | None:
+    for key in ("ctcss", "tone", "uplink_ctcss", "uplink_tone"):
+        raw_value = transmitter.get(key)
+        if raw_value in (None, ""):
+            continue
+        try:
+            tone_hz = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if 50.0 <= tone_hz <= 300.0:
+            return tone_hz
+    description = str(transmitter.get("description") or "")
+    match = _CTCSS_PATTERN.search(description)
+    if match is None:
+        return None
+    tone_hz = float(match.group(1))
+    return tone_hz if 50.0 <= tone_hz <= 300.0 else None

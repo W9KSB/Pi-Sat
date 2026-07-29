@@ -179,6 +179,8 @@ class PollingRadioFrequencyManager:
         self.radio_manager = radio_manager
         self.poll_interval_s = poll_interval_s
         self._stop = Event()
+        self._background_polling_enabled = Event()
+        self._background_polling_enabled.set()
         self._thread: Thread | None = None
 
     def start(self) -> None:
@@ -194,6 +196,12 @@ class PollingRadioFrequencyManager:
             self._thread = None
         if hasattr(self.radio_manager.client, "close"):
             self.radio_manager.client.close()
+
+    def set_background_polling_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._background_polling_enabled.set()
+        else:
+            self._background_polling_enabled.clear()
 
     def snapshot(self) -> SdrDeviceSnapshot:
         state = self.radio_manager.snapshot()
@@ -246,8 +254,19 @@ class PollingRadioFrequencyManager:
             error=state.error,
         )
 
-    def set_mode(self, mode: str, source: str = "") -> SdrDeviceSnapshot:
-        state = self.radio_manager.set_mode(mode, source=source)
+    def set_mode(
+        self,
+        mode: str,
+        source: str = "",
+        force: bool = False,
+        passband_hz: int = 0,
+    ) -> SdrDeviceSnapshot:
+        state = self.radio_manager.set_mode(
+            mode,
+            passband_hz=passband_hz,
+            source=source,
+            force=force,
+        )
         return SdrDeviceSnapshot(
             enabled=state.enabled,
             connected=state.connected,
@@ -257,8 +276,19 @@ class PollingRadioFrequencyManager:
             error=state.error,
         )
 
-    def try_set_mode(self, mode: str, source: str = "") -> SdrDeviceSnapshot:
-        state = self.radio_manager.try_set_mode(mode, source=source)
+    def try_set_mode(
+        self,
+        mode: str,
+        source: str = "",
+        force: bool = False,
+        passband_hz: int = 0,
+    ) -> SdrDeviceSnapshot:
+        state = self.radio_manager.try_set_mode(
+            mode,
+            passband_hz=passband_hz,
+            source=source,
+            force=force,
+        )
         return SdrDeviceSnapshot(
             enabled=state.enabled,
             connected=state.connected,
@@ -292,6 +322,9 @@ class PollingRadioFrequencyManager:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            if not self._background_polling_enabled.is_set():
+                self._stop.wait(0.1)
+                continue
             self.poll_once()
             delay = self.poll_interval_s
             snapshot = self.snapshot()

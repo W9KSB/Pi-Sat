@@ -54,7 +54,6 @@ def _device_config_from_cat_device_entry(device_settings: dict[str, Any]) -> Dev
         model_id=parse_int_setting(device_settings.get("model_id")),
         target_vfo=None,
         shared_local_split_mode=False,
-        satmode_enabled=parse_bool_setting(device_settings.get("satmode_enabled"), False),
         write_enabled=True,
         timeout_s=parse_float_setting(device_settings.get("timeout_s"), 2.0) or 2.0,
         cat_debug_logging=False,
@@ -118,11 +117,6 @@ def device_config_from_settings(
             section_settings.get("shared_local_split_mode"),
             False,
         ),
-        satmode_enabled=(
-            base_device_config.satmode_enabled
-            if base_device_config is not None
-            else False
-        ),
         write_enabled=True,
         timeout_s=(
             base_device_config.timeout_s
@@ -181,14 +175,16 @@ def build_radio_client(device_config, role: str, shared_local_client=None):
             raise ValueError(f"{role} baud is required for local CAT control")
         if shared_local_client is not None:
             return shared_local_client
+        target_vfo = normalize_hamlib_vfo(device_config.target_vfo)
         return LocalHamlibClient(
             model_id=device_config.model_id,
             serial_port=device_config.serial_port,
             baud=device_config.baud,
             timeout_s=device_config.timeout_s,
-            target_vfo=device_config.target_vfo,
+            target_vfo=target_vfo,
             debug_logging=device_config.cat_debug_logging,
             role_label=role.lower(),
+            vfo_mode=target_vfo is not None,
         )
     raise ValueError(f"Unsupported TX connectivity: {device_config.connectivity}")
 
@@ -268,7 +264,12 @@ def run_device_test(
     try:
         if role in {"rx", "tx"}:
             client = build_radio_client(device_config, role.upper())
-            frequency_hz = client.get_frequency()
+            target_vfo = normalize_hamlib_vfo(device_config.target_vfo)
+            frequency_hz = (
+                client.get_frequency_on_vfo(target_vfo)
+                if target_vfo and hasattr(client, "get_frequency_on_vfo")
+                else client.get_frequency()
+            )
             details["frequency_hz"] = frequency_hz
             return {
                 "ok": True,
@@ -318,29 +319,79 @@ def run_cat_device_test(
     details = device_endpoint_details("rx", device_config)
     client = None
     try:
-        client = build_radio_client(device_config, "CAT Device")
-        frequency_hz = client.get_frequency()
-        details["frequency_hz"] = frequency_hz
         caps_output = _load_hamlib_caps_output(device_config)
         capability_targets = _parse_capability_targets_from_caps(caps_output)
-        capability_satmode = _detect_satmode_support_from_caps(caps_output)
+        if device_config.connectivity == "local" and len(capability_targets) >= 2:
+            client = LocalHamlibClient(
+                model_id=device_config.model_id or 0,
+                serial_port=device_config.serial_port,
+                baud=device_config.baud or 0,
+                timeout_s=device_config.timeout_s,
+                target_vfo=capability_targets[0],
+                debug_logging=device_config.cat_debug_logging,
+                role_label="cat-device-test",
+                vfo_mode=True,
+            )
+            client.ensure_connected()
+        else:
+            client = build_radio_client(device_config, "CAT Device")
+        vfo_test_target = (
+            capability_targets[0]
+            if isinstance(client, LocalHamlibClient) and client.vfo_mode
+            else None
+        )
+        frequency_hz = (
+            client.get_frequency_on_vfo(vfo_test_target)
+            if vfo_test_target
+            else client.get_frequency()
+        )
+        details["frequency_hz"] = frequency_hz
         capability_comm = True
-        capability_ptt = _probe_capability(client.get_ptt)
-        capability_vfo = bool(capability_targets)
+        capability_ptt = _probe_capability(
+            lambda: client.get_ptt_on_vfo(vfo_test_target)
+            if vfo_test_target
+            else client.get_ptt()
+        )
+        verified_targets: list[str] = []
+        target_frequencies: dict[str, int] = {}
+        if (
+            device_config.connectivity == "local"
+            and len(capability_targets) >= 2
+            and isinstance(client, LocalHamlibClient)
+        ):
+            for target in capability_targets:
+                try:
+                    target_frequency = client.get_frequency_on_vfo(target)
+                    client.set_frequency_on_vfo(target, target_frequency)
+                    readback = client.get_frequency_on_vfo(target)
+                    if abs(readback - target_frequency) > 100:
+                        raise RuntimeError(
+                            f"{target} write/read verification failed: "
+                            f"wrote {target_frequency}, read {readback}"
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "CAT device target probe failed target=%s error=%s",
+                        target,
+                        exc,
+                    )
+                    continue
+                verified_targets.append(target)
+                target_frequencies[target] = readback
+        capability_vfo = len(verified_targets) >= 2
         capability_shared = (
             device_config.connectivity == "local"
             and capability_ptt
             and capability_vfo
         )
+        if target_frequencies:
+            details["target_frequencies_hz"] = target_frequencies
         details["capability_comm"] = capability_comm
         details["capability_ptt"] = capability_ptt
         details["capability_vfo"] = capability_vfo
         details["capability_shared"] = capability_shared
-        details["capability_satmode"] = capability_satmode
-        details["capability_targets"] = ",".join(capability_targets)
-        details["satmode_enabled"] = _normalize_satmode_enabled(
-            device_settings.get("satmode_enabled"),
-            capability_satmode,
+        details["capability_targets"] = ",".join(
+            verified_targets if verified_targets else capability_targets
         )
         details["capability_last_test_utc"] = datetime.now(timezone.utc).isoformat()
         details["capability_notes"] = _build_capability_notes(
@@ -348,7 +399,6 @@ def run_cat_device_test(
             capability_ptt,
             capability_vfo,
             capability_shared,
-            capability_satmode,
             device_config.connectivity,
         )
         return {
@@ -363,9 +413,7 @@ def run_cat_device_test(
         details["capability_ptt"] = False
         details["capability_vfo"] = False
         details["capability_shared"] = False
-        details["capability_satmode"] = False
         details["capability_targets"] = ""
-        details["satmode_enabled"] = ""
         details["capability_last_test_utc"] = datetime.now(timezone.utc).isoformat()
         details["capability_notes"] = "Communication failed."
         return {
@@ -402,7 +450,6 @@ def _build_capability_notes(
     capability_ptt: bool,
     capability_vfo: bool,
     capability_shared: bool,
-    capability_satmode: bool,
     connectivity: str,
 ) -> str:
     if not capability_comm:
@@ -412,8 +459,6 @@ def _build_capability_notes(
     notes: list[str] = []
     if capability_shared:
         notes.append("Supports shared RX and TX role assignment.")
-    if capability_satmode:
-        notes.append("SAT mode control is available.")
     if notes:
         return " ".join(notes)
     missing: list[str] = []
@@ -424,15 +469,6 @@ def _build_capability_notes(
     if not missing:
         return "Basic CAT communication succeeded."
     return f"Missing {' and '.join(missing)}. Single role capable only."
-
-
-def _normalize_satmode_enabled(value: Any, capability_satmode: bool) -> str:
-    if not capability_satmode:
-        return ""
-    text = str(value or "").strip().lower()
-    if text in {"true", "false"}:
-        return text
-    return "false"
 
 
 def _load_hamlib_caps_output(device_config: DeviceConfig) -> str:
@@ -458,48 +494,27 @@ def _load_hamlib_caps_output(device_config: DeviceConfig) -> str:
     return result.stdout
 
 
-def _detect_satmode_support_from_caps(caps_output: str) -> bool:
-    for raw_line in caps_output.splitlines():
-        line = raw_line.strip().upper()
-        if line.startswith("GET FUNCTIONS:") or line.startswith("SET FUNCTIONS:"):
-            if "SATMODE" in line:
-                return True
-    return False
-
-
 def _parse_capability_targets_from_caps(caps_output: str) -> list[str]:
-    raw_targets: list[str] = []
-    raw_seen: set[str] = set()
+    targets: list[str] = []
+    seen: set[str] = set()
     for raw_line in caps_output.splitlines():
         line = raw_line.strip()
-        if not line.startswith("VFO list:"):
+        if not line.lower().startswith("vfo list:"):
             continue
-        for token in line.removeprefix("VFO list:").strip().split():
+        for token in line.partition(":")[2].strip().split():
             normalized = normalize_hamlib_vfo(token) or token.strip().upper()
+            comparison = normalized.upper()
             if not (
-                normalized.startswith("VFO")
-                or normalized.startswith("MAIN")
-                or normalized.startswith("SUB")
+                comparison.startswith("VFO")
+                or comparison.startswith("MAIN")
+                or comparison.startswith("SUB")
             ):
                 continue
-            if normalized in raw_seen:
+            if comparison in seen:
                 continue
-            raw_seen.add(normalized)
-            raw_targets.append(normalized)
-    preferred_targets: list[str] = []
-    seen: set[str] = set()
-    has_main = "MAIN" in raw_seen
-    has_sub = "SUB" in raw_seen
-    for target in raw_targets:
-        if has_main and target in {"MAINA", "MAINB"}:
-            continue
-        if has_sub and target in {"SUBA", "SUBB"}:
-            continue
-        if target in seen:
-            continue
-        seen.add(target)
-        preferred_targets.append(target)
-    return preferred_targets
+            seen.add(comparison)
+            targets.append(normalized)
+    return targets
 
 
 def load_hamlib_model_caches(

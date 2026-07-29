@@ -8,8 +8,12 @@ newline-delimited list for the UI and TLE manager.
 """
 
 from configparser import ConfigParser
+from contextlib import contextmanager
 from dataclasses import dataclass
+import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import RLock
 from typing import Any
 
 from pi_sat_controller.backend.maidenhead import lat_lon_to_locator, locator_to_lat_lon
@@ -20,6 +24,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "pi-sat-controller.conf"
 MULTI_URL_SEPARATOR = " || "
 CAT_DEVICE_SECTION_PREFIX = "cat_device_"
+_CONFIG_WRITE_LOCK = RLock()
+
+
+@contextmanager
+def config_transaction():
+    """Serializes a complete configuration read-modify-write transaction."""
+
+    with _CONFIG_WRITE_LOCK:
+        yield
 
 
 @dataclass(frozen=True)
@@ -66,7 +79,6 @@ class CatDeviceConfig:
     baud: int | None
     model_id: int | None
     timeout_s: float
-    satmode_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,7 +96,6 @@ class DeviceConfig:
     write_enabled: bool
     timeout_s: float
     shared_local_split_mode: bool = False
-    satmode_enabled: bool = False
     cat_debug_logging: bool = False
     min_elevation_deg: float | None = None
     home_azimuth_deg: float | None = None
@@ -94,13 +105,11 @@ class DeviceConfig:
 
 @dataclass(frozen=True)
 class SafetyConfig:
-    tx_inhibit_below_horizon: bool
-    tx_inhibit_on_cat_loss: bool
-    tx_inhibit_without_valid_pass: bool
     frequency_deadband_hz: int
     cat_rate_limit_hz: int
     tracking_update_interval_ms: int
     device_offline_failure_threshold: int
+    manual_offset_readback_active_pass_only: bool
 
 
 @dataclass(frozen=True)
@@ -183,15 +192,6 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
         tx=_load_device(parser, "tx", cat_devices),
         rotator=_load_device(parser, "rotator"),
         safety=SafetyConfig(
-            tx_inhibit_below_horizon=parser.getboolean(
-                "safety", "tx_inhibit_below_horizon"
-            ),
-            tx_inhibit_on_cat_loss=parser.getboolean(
-                "safety", "tx_inhibit_on_cat_loss"
-            ),
-            tx_inhibit_without_valid_pass=parser.getboolean(
-                "safety", "tx_inhibit_without_valid_pass"
-            ),
             frequency_deadband_hz=_get_int(parser, "safety", "frequency_deadband_hz"),
             cat_rate_limit_hz=_get_int(parser, "safety", "cat_rate_limit_hz"),
             tracking_update_interval_ms=_get_int(
@@ -205,6 +205,12 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
                 "safety",
                 "device_offline_failure_threshold",
                 fallback=3,
+            ),
+            manual_offset_readback_active_pass_only=_get_bool(
+                parser,
+                "safety",
+                "manual_offset_readback_active_pass_only",
+                fallback=False,
             ),
         ),
     )
@@ -246,7 +252,6 @@ def _load_device(
             "shared_local_split_mode",
             False,
         ),
-        satmode_enabled=base_device.satmode_enabled if base_device else False,
         cat_debug_logging=_get_bool(parser, section, "cat_debug_logging", False),
         write_enabled=True,
         timeout_s=(
@@ -346,9 +351,7 @@ CAT_DEVICE_FIELDS = [
     "capability_ptt",
     "capability_vfo",
     "capability_shared",
-    "capability_satmode",
     "capability_targets",
-    "satmode_enabled",
     "capability_last_test_utc",
     "capability_notes",
 ]
@@ -391,13 +394,11 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
     ],
     "automation": ["aos_script", "los_script"],
     "safety": [
-        "tx_inhibit_below_horizon",
-        "tx_inhibit_on_cat_loss",
-        "tx_inhibit_without_valid_pass",
         "frequency_deadband_hz",
         "cat_rate_limit_hz",
         "tracking_update_interval_ms",
         "device_offline_failure_threshold",
+        "manual_offset_readback_active_pass_only",
     ],
 }
 
@@ -456,24 +457,25 @@ def save_my_satellites(
     autotrack_norad_ids: set[int],
     path: Path | str = DEFAULT_CONFIG_PATH,
 ) -> None:
-    settings = load_settings(path)
-    settings["my_satellites"] = {
-        key: value
-        for key, value in settings["my_satellites"].items()
-        if not key.startswith("satellite_")
-    }
-    settings["my_satellites"]["min_pass_elevation_deg"] = str(min_pass_elevation_deg)
-    settings["my_satellites"]["autotrack_next_pass"] = (
-        "true" if autotrack_next_pass else "false"
-    )
-    configured_norads = {satellite.norad_id for satellite in satellites}
-    settings["my_satellites"]["autotrack_norad_ids"] = ",".join(
-        str(norad_id)
-        for norad_id in sorted(autotrack_norad_ids & configured_norads)
-    )
-    for satellite in satellites:
-        settings["my_satellites"][f"satellite_{satellite.norad_id}"] = satellite.name
-    save_settings(settings, path=path, validate_role_assignments=False)
+    with _CONFIG_WRITE_LOCK:
+        settings = load_settings(path)
+        settings["my_satellites"] = {
+            key: value
+            for key, value in settings["my_satellites"].items()
+            if not key.startswith("satellite_")
+        }
+        settings["my_satellites"]["min_pass_elevation_deg"] = str(min_pass_elevation_deg)
+        settings["my_satellites"]["autotrack_next_pass"] = (
+            "true" if autotrack_next_pass else "false"
+        )
+        configured_norads = {satellite.norad_id for satellite in satellites}
+        settings["my_satellites"]["autotrack_norad_ids"] = ",".join(
+            str(norad_id)
+            for norad_id in sorted(autotrack_norad_ids & configured_norads)
+        )
+        for satellite in satellites:
+            settings["my_satellites"][f"satellite_{satellite.norad_id}"] = satellite.name
+        save_settings(settings, path=path, validate_role_assignments=False)
 
 
 def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str, str]]:
@@ -513,40 +515,72 @@ def save_settings(
     path: Path | str = DEFAULT_CONFIG_PATH,
     validate_role_assignments: bool = True,
 ) -> None:
-    current = load_settings(path)
-    current_cat_devices = load_cat_devices(path)
-    for section, values in settings.items():
-        if section not in SETTINGS_SCHEMA:
-            continue
-        if section == "my_satellites" and any(
-            key.startswith("satellite_") for key in values
-        ):
-            current[section] = {
-                key: value
-                for key, value in current[section].items()
-                if not key.startswith("satellite_")
-            }
-        for key, value in values.items():
-            if key == "enabled" and section in {"rx", "tx", "rotator"}:
-                current[section][key] = "true" if str(value).lower() == "true" else "false"
-            elif key in SETTINGS_SCHEMA[section] or (
-                section == "my_satellites" and key.startswith("satellite_")
+    with _CONFIG_WRITE_LOCK:
+        current = load_settings(path)
+        current_cat_devices = load_cat_devices(path)
+        for section, values in settings.items():
+            if section not in SETTINGS_SCHEMA:
+                continue
+            if section == "my_satellites" and any(
+                key.startswith("satellite_") for key in values
             ):
-                if section == "tle" and key == "source_url":
-                    current[section][key] = "" if value is None else _encode_source_url(str(value))
-                else:
-                    current[section][key] = "" if value is None else str(value)
+                current[section] = {
+                    key: value
+                    for key, value in current[section].items()
+                    if not key.startswith("satellite_")
+                }
+            for key, value in values.items():
+                if key == "enabled" and section in {"rx", "tx", "rotator"}:
+                    current[section][key] = (
+                        "true" if str(value).lower() == "true" else "false"
+                    )
+                elif key in SETTINGS_SCHEMA[section] or (
+                    section == "my_satellites" and key.startswith("satellite_")
+                ):
+                    if section == "tle" and key == "source_url":
+                        current[section][key] = (
+                            "" if value is None else _encode_source_url(str(value))
+                        )
+                    else:
+                        current[section][key] = "" if value is None else str(value)
 
-    if cat_devices is not None:
-        current_cat_devices = _normalize_cat_devices(cat_devices)
+        if cat_devices is not None:
+            current_cat_devices, id_mapping = _normalize_cat_devices(cat_devices)
+            for role in ("rx", "tx"):
+                selected_id = current.get(role, {}).get("device_id", "").strip()
+                if selected_id in id_mapping:
+                    current[role]["device_id"] = id_mapping[selected_id]
 
-    _apply_station_grid_locator(current)
-    if validate_role_assignments:
-        _validate_role_device_assignments(current, current_cat_devices)
+        _apply_station_grid_locator(current)
+        if validate_role_assignments:
+            _validate_role_device_assignments(current, current_cat_devices)
 
-    rendered = _render_settings(current, current_cat_devices)
-    Path(path).write_text(rendered, encoding="utf-8")
-    load_config(path)
+        rendered = _render_settings(current, current_cat_devices)
+        _write_validated_config(Path(path), rendered)
+
+
+def _write_validated_config(path: Path, rendered: str) -> None:
+    path = path.resolve()
+    temporary_path: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write(rendered)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        load_config(temporary_path)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _validate_role_device_assignments(
@@ -555,7 +589,7 @@ def _validate_role_device_assignments(
 ) -> None:
     rx_device_id = str(settings.get("rx", {}).get("device_id", "")).strip()
     tx_device_id = str(settings.get("tx", {}).get("device_id", "")).strip()
-    if not rx_device_id or not tx_device_id or rx_device_id != tx_device_id:
+    if not rx_device_id or not tx_device_id:
         return
 
     device_by_id = {
@@ -563,14 +597,60 @@ def _validate_role_device_assignments(
         for device in cat_devices
         if str(device.get("device_id", "")).strip()
     }
+    rx_device = device_by_id.get(rx_device_id, {})
+    tx_device = device_by_id.get(tx_device_id, {})
+    same_local_endpoint = (
+        str(rx_device.get("connectivity", "")).strip().lower() == "local"
+        and str(tx_device.get("connectivity", "")).strip().lower() == "local"
+        and str(rx_device.get("serial_port", "")).strip()
+        == str(tx_device.get("serial_port", "")).strip()
+        and str(rx_device.get("model_id", "")).strip()
+        == str(tx_device.get("model_id", "")).strip()
+        and str(rx_device.get("baud", "")).strip()
+        == str(tx_device.get("baud", "")).strip()
+    )
+    if rx_device_id != tx_device_id and not same_local_endpoint:
+        return
     shared_capable = (
-        str(device_by_id.get(rx_device_id, {}).get("capability_shared", "")).strip().lower()
-        == "true"
+        str(rx_device.get("capability_shared", "")).strip().lower() == "true"
+        and str(tx_device.get("capability_shared", "")).strip().lower() == "true"
     )
     if not shared_capable:
         raise ValueError(
             "The selected CAT device cannot be assigned to both RX and TX. "
             "Save the device and use a shared-capable local radio for dual-role operation."
+        )
+    rx_target = str(settings.get("rx", {}).get("target_vfo", "")).strip().upper()
+    tx_target = str(settings.get("tx", {}).get("target_vfo", "")).strip().upper()
+    if not rx_target or rx_target == "CURRENT" or not tx_target or tx_target == "CURRENT":
+        raise ValueError(
+            "A shared CAT device requires explicit, different RX and TX targets."
+        )
+    semantic_targets = {
+        "VFOA": "MAIN",
+        "VFOB": "SUB",
+        "MAINA": "MAIN",
+        "MAINB": "MAIN",
+        "SUBA": "SUB",
+        "SUBB": "SUB",
+    }
+    if semantic_targets.get(rx_target, rx_target) == semantic_targets.get(
+        tx_target,
+        tx_target,
+    ):
+        raise ValueError("A shared CAT device cannot use the same target for RX and TX.")
+    available_targets = {
+        target.strip().upper()
+        for target in str(
+            rx_device.get("capability_targets", "")
+        ).split(",")
+        if target.strip()
+    }
+    if available_targets and (
+        rx_target not in available_targets or tx_target not in available_targets
+    ):
+        raise ValueError(
+            "The selected shared RX/TX target is not in the device's verified target list."
         )
 
 
@@ -726,14 +806,8 @@ def load_cat_devices(
             "capability_shared": _load_cat_device_metadata(
                 parser, device.device_id, "capability_shared"
             ),
-            "capability_satmode": _load_cat_device_metadata(
-                parser, device.device_id, "capability_satmode"
-            ),
             "capability_targets": _load_cat_device_metadata(
                 parser, device.device_id, "capability_targets"
-            ),
-            "satmode_enabled": _load_cat_device_metadata(
-                parser, device.device_id, "satmode_enabled"
             ),
             "capability_last_test_utc": _load_cat_device_metadata(
                 parser, device.device_id, "capability_last_test_utc"
@@ -764,7 +838,6 @@ def _load_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig]:
             baud=_get_optional_int(parser, section, "baud"),
             model_id=_get_optional_int(parser, section, "model_id"),
             timeout_s=_get_float(parser, section, "timeout_s", fallback=2.0),
-            satmode_enabled=_get_bool(parser, section, "satmode_enabled", False),
         )
     if explicit:
         return explicit
@@ -815,7 +888,6 @@ def _build_legacy_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig
                     baud=existing.baud,
                     model_id=existing.model_id,
                     timeout_s=existing.timeout_s,
-                    satmode_enabled=existing.satmode_enabled,
                 )
             continue
         device_id = f"legacy-{role}"
@@ -832,7 +904,6 @@ def _build_legacy_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig
             baud=baud,
             model_id=model_id,
             timeout_s=_get_float(parser, role, "timeout_s", fallback=2.0),
-            satmode_enabled=False,
         )
     return legacy_devices
 
@@ -864,25 +935,24 @@ def _resolve_role_device_id(
     return ""
 
 
-def _normalize_cat_devices(cat_devices: list[dict[str, Any]]) -> list[dict[str, str]]:
+def _normalize_cat_devices(
+    cat_devices: list[dict[str, Any]],
+) -> tuple[list[dict[str, str]], dict[str, str]]:
     normalized: list[dict[str, str]] = []
+    id_mapping: dict[str, str] = {}
     seen_ids: set[str] = set()
     for index, raw_device in enumerate(cat_devices, start=1):
-        device_id = str(raw_device.get("device_id", "")).strip().lower()
-        if not device_id:
-            device_id = f"cat-device-{index}"
-        device_id = "".join(
-            character if character.isalnum() or character in {"-", "_"} else "-"
-            for character in device_id
-        ).strip("-_")
-        if not device_id:
-            device_id = f"cat-device-{index}"
-        suffix = 2
-        base_id = device_id
-        while device_id in seen_ids:
-            device_id = f"{base_id}-{suffix}"
-            suffix += 1
+        raw_device_id = str(raw_device.get("device_id", "")).strip()
+        device_id = normalize_cat_device_id(raw_device_id, f"cat-device-{index}")
+        if raw_device_id in id_mapping:
+            raise ValueError(f"Duplicate CAT device ID: {raw_device_id}")
+        if device_id in seen_ids:
+            raise ValueError(
+                f"Duplicate CAT device ID after normalization: {device_id}"
+            )
         seen_ids.add(device_id)
+        if raw_device_id:
+            id_mapping[raw_device_id] = device_id
         connectivity = str(raw_device.get("connectivity", "network")).strip() or "network"
         normalized.append(
             {
@@ -899,17 +969,26 @@ def _normalize_cat_devices(cat_devices: list[dict[str, Any]]) -> list[dict[str, 
                 "capability_ptt": stringify_capability_value(raw_device.get("capability_ptt")),
                 "capability_vfo": stringify_capability_value(raw_device.get("capability_vfo")),
                 "capability_shared": stringify_capability_value(raw_device.get("capability_shared")),
-                "capability_satmode": stringify_capability_value(raw_device.get("capability_satmode")),
                 "capability_targets": str(raw_device.get("capability_targets", "")).strip(),
-                "satmode_enabled": stringify_capability_value(raw_device.get("satmode_enabled")),
                 "capability_last_test_utc": str(raw_device.get("capability_last_test_utc", "")).strip(),
                 "capability_notes": str(raw_device.get("capability_notes", "")).strip(),
             }
         )
-    return normalized
+    return normalized, id_mapping
+
+
+def normalize_cat_device_id(value: Any, fallback: str = "") -> str:
+    device_id = str(value or "").strip().lower()
+    device_id = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "-"
+        for character in device_id
+    ).strip("-_")
+    return device_id or fallback
 
 
 def parse_int_value(value: Any, fallback: int) -> int:
+    if value is None:
+        return fallback
     text = str(value).strip()
     if not text:
         return fallback
@@ -917,6 +996,8 @@ def parse_int_value(value: Any, fallback: int) -> int:
 
 
 def parse_float_value(value: Any, fallback: float) -> float:
+    if value is None:
+        return fallback
     text = str(value).strip()
     if not text:
         return fallback
@@ -924,6 +1005,8 @@ def parse_float_value(value: Any, fallback: float) -> float:
 
 
 def stringify_optional_int(value: Any) -> str:
+    if value is None:
+        return ""
     text = str(value).strip()
     if not text:
         return ""

@@ -41,7 +41,10 @@ from pi_sat_controller.backend.config import (
     save_settings,
 )
 from pi_sat_controller.backend.controller.rx_tracking import RxTrackingManager
-from pi_sat_controller.backend.controller.autotrack import AutotrackCoordinator
+from pi_sat_controller.backend.controller.autotrack import (
+    AutotrackCoordinator,
+    TimedLosCoordinator,
+)
 from pi_sat_controller.backend.device_support import (
     build_radio_client,
     build_rotator_client,
@@ -157,7 +160,7 @@ pass_cache: list[SatellitePass] = []
 pass_cache_refreshed_at_utc: str | None = None
 pass_refresh_stop = Event()
 pass_refresh_thread: Thread | None = None
-pass_refresh_in_progress = False
+pass_refresh_gate = Lock()
 autotrack_stop = Event()
 autotrack_thread: Thread | None = None
 tracking_command_lock = RLock()
@@ -172,14 +175,14 @@ hamlib_rotator_models_error: str | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _reload_runtime_config()
-    _refresh_transponder_profiles(reason="startup")
-    try:
-        _refresh_pass_cache(force_tle_download=True)
-    except Exception:
-        LOGGER.exception("Initial TLE/pass refresh failed; continuing startup without pass data")
     _start_pass_refresh_scheduler()
     _start_autotrack_scheduler()
     _start_transponder_refresh_scheduler()
+    Thread(
+        target=_run_startup_data_refresh,
+        name="startup-data-refresh",
+        daemon=True,
+    ).start()
     try:
         yield
     finally:
@@ -187,6 +190,14 @@ async def lifespan(app: FastAPI):
         _stop_autotrack_scheduler()
         _stop_transponder_refresh_scheduler()
         _shutdown_runtime()
+
+
+def _run_startup_data_refresh() -> None:
+    _refresh_transponder_profiles(reason="startup")
+    try:
+        _refresh_pass_cache(force_tle_download=True)
+    except Exception:
+        LOGGER.exception("Initial TLE/pass refresh failed; continuing with available cache")
 
 
 app = FastAPI(title="Pi-Sat Controller", lifespan=lifespan)
@@ -257,51 +268,6 @@ def _clear_split_for_single_role_radios(
             )
 
 
-def _apply_satmode_for_configured_radios(
-    config,
-    rx_manager,
-    tx_manager,
-    shared_local_radio: bool,
-    shared_local_client: LocalHamlibClient | None,
-) -> None:
-    if shared_local_radio:
-        if shared_local_client is None:
-            return
-        try:
-            shared_local_client.set_satmode(bool(config.rx.satmode_enabled or config.tx.satmode_enabled))
-        except Exception as exc:
-            LOGGER.warning("Unable to apply SAT mode for shared local radio: %s", exc)
-        return
-
-    applied_signatures: set[tuple[str, int | None, int | None]] = set()
-    candidates = [
-        (config.rx, getattr(getattr(rx_manager, "radio_manager", None), "client", None)),
-        (config.tx, getattr(tx_manager, "client", None)),
-    ]
-    for device_config, client in candidates:
-        if not device_config.enabled or device_config.connectivity != "local" or client is None:
-            continue
-        if not hasattr(client, "set_satmode"):
-            continue
-        signature = (
-            device_config.serial_port,
-            device_config.model_id,
-            device_config.baud,
-        )
-        if signature in applied_signatures:
-            continue
-        try:
-            client.set_satmode(bool(device_config.satmode_enabled))
-            applied_signatures.add(signature)
-        except Exception as exc:
-            LOGGER.warning(
-                "Unable to apply SAT mode for local radio serial_port=%s model_id=%s: %s",
-                device_config.serial_port,
-                device_config.model_id,
-                exc,
-            )
-
-
 def _get_or_create_rx_tracking_manager(
     norad_id: int | None = None,
     transponder_index: int = 0,
@@ -322,22 +288,8 @@ def _get_or_create_rx_tracking_manager(
         )
     ):
         return rx_tracking_manager
-    if rx_tracking_manager is not None:
-        rx_tracking_manager.shutdown()
-        rx_tracking_manager = None
 
     config = load_config()
-    tle_manager = TleManager(config.tle.source_url, config.tle.cache_dir)
-    tle_status = tle_manager.status()
-    if not tle_status.exists:
-        try:
-            tle_status = tle_manager.download()
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"TLE download failed: {exc}",
-            ) from exc
-
     satellites = load_satellite_profiles(config.profiles.satellites_file)
     selected_satellite = next(
         (satellite for satellite in satellites if satellite.norad_id == selected_norad),
@@ -353,6 +305,22 @@ def _get_or_create_rx_tracking_manager(
         )
     if transponder_index < 0 or transponder_index >= len(selected_satellite.transponders):
         raise HTTPException(status_code=400, detail="Selected frequency profile is invalid")
+
+    selected_transponder = selected_satellite.transponders[transponder_index]
+    if rx_tracking_manager is not None:
+        rx_tracking_manager.update_target(selected_satellite, selected_transponder)
+        return rx_tracking_manager
+
+    tle_manager = TleManager(config.tle.source_url, config.tle.cache_dir)
+    tle_status = tle_manager.status()
+    if not tle_status.exists:
+        try:
+            tle_status = tle_manager.download()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"TLE download failed: {exc}",
+            ) from exc
 
     try:
         orbital_engine = SkyfieldEngine(
@@ -371,13 +339,17 @@ def _get_or_create_rx_tracking_manager(
         orbital_engine=orbital_engine,
         sdr_manager=sdr_manager or DisabledTrackingSdrManager(),
         satellite=selected_satellite,
-        transponder=selected_satellite.transponders[transponder_index],
+        transponder=selected_transponder,
         deadband_hz=config.safety.frequency_deadband_hz,
         rotator_manager=rotator_manager,
         tx_radio_manager=tx_radio_manager,
         on_pass_start=None,
-        on_pass_end=lambda context: _trigger_automation_script_event("los", context),
+        on_pass_end=None,
         interval_s=max(0.1, config.safety.tracking_update_interval_ms / 1000.0),
+        cat_rate_limit_hz=config.safety.cat_rate_limit_hz,
+        manual_offset_readback_active_pass_only=(
+            config.safety.manual_offset_readback_active_pass_only
+        ),
     )
     return rx_tracking_manager
 
@@ -441,25 +413,53 @@ def _mutate_rx_tracking_manager(
 def _shutdown_runtime(preserve_tracking_manager: bool = False) -> None:
     global rotator_manager, rx_tracking_manager, sdr_manager, tx_radio_manager
 
+    previous_rotator = rotator_manager
+    previous_sdr = sdr_manager
+    previous_tx = tx_radio_manager
+    rotator_manager = None
+    sdr_manager = None
+    tx_radio_manager = None
     if not preserve_tracking_manager and rx_tracking_manager is not None:
         rx_tracking_manager.shutdown()
         rx_tracking_manager = None
-    if rotator_manager is not None and hasattr(rotator_manager.client, "close"):
-        rotator_manager.client.close()
-    rotator_manager = None
-    if tx_radio_manager is not None and hasattr(tx_radio_manager.client, "close"):
-        tx_radio_manager.client.close()
-    tx_radio_manager = None
-    if sdr_manager is not None:
-        sdr_manager.stop()
-        sdr_manager = None
+    elif rx_tracking_manager is not None:
+        rx_tracking_manager.update_runtime_dependencies(
+            sdr_manager=DisabledTrackingSdrManager(),
+            tx_radio_manager=None,
+            rotator_manager=None,
+        )
+    if previous_sdr is not None:
+        try:
+            previous_sdr.stop()
+        except Exception:
+            LOGGER.exception("RX shutdown failed during runtime reload")
+    if previous_rotator is not None:
+        try:
+            shutdown = getattr(previous_rotator, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+            elif hasattr(previous_rotator.client, "close"):
+                previous_rotator.client.close()
+        except Exception:
+            LOGGER.exception("Rotator shutdown failed during runtime reload")
+    if previous_tx is not None and hasattr(previous_tx.client, "close"):
+        try:
+            previous_tx.client.close()
+        except Exception:
+            LOGGER.exception("TX shutdown failed during runtime reload")
 
 
-def _reload_runtime_config() -> None:
+def _reload_runtime_config() -> list[str]:
+    with tracking_command_lock:
+        return _reload_runtime_config_locked()
+
+
+def _reload_runtime_config_locked() -> list[str]:
     global rotator_manager, sdr_manager, tx_radio_manager
     global hamlib_radio_models_cache, hamlib_radio_models_error
     global hamlib_rotator_models_cache, hamlib_rotator_models_error
 
+    startup_errors: list[str] = []
     _shutdown_runtime(preserve_tracking_manager=True)
     (
         hamlib_radio_models_cache,
@@ -476,6 +476,7 @@ def _reload_runtime_config() -> None:
     shared_local_client: LocalHamlibClient | None = None
     shared_rx_client = None
     shared_tx_client = None
+    shared_controller: SharedLocalRadioController | None = None
     shared_setup_error: str | None = None
     if shared_local_radio:
         try:
@@ -484,6 +485,7 @@ def _reload_runtime_config() -> None:
                 serial_port=config.rx.serial_port or config.tx.serial_port,
                 baud=config.rx.baud or config.tx.baud or 0,
                 timeout_s=max(config.rx.timeout_s, config.tx.timeout_s),
+                target_vfo=config.rx.target_vfo,
                 debug_logging=bool(config.rx.cat_debug_logging or config.tx.cat_debug_logging),
                 role_label="shared",
                 vfo_mode=True,
@@ -494,10 +496,13 @@ def _reload_runtime_config() -> None:
                 tx_vfo=config.tx.target_vfo,
                 split_enabled=shared_local_split_mode,
             )
+            shared_controller.initialize()
+            shared_local_split_mode = shared_controller.split_enabled
             shared_rx_client = SharedRadioRoleClient(shared_controller, "rx")
             shared_tx_client = SharedRadioRoleClient(shared_controller, "tx")
         except Exception as exc:
             shared_setup_error = str(exc)
+            startup_errors.append(f"Shared radio startup failed: {exc}")
             LOGGER.warning("Shared local radio setup failed: %s", exc)
     if config.rx.enabled:
         try:
@@ -508,9 +513,11 @@ def _reload_runtime_config() -> None:
                 shared_rx_client,
                 failure_threshold=failure_threshold,
             )
-            sdr_manager.start()
+            if hasattr(sdr_manager, "read_frequency_once"):
+                sdr_manager.read_frequency_once()
         except Exception as exc:
             error = f"RX startup failed: {exc}"
+            startup_errors.append(error)
             LOGGER.warning(error)
             sdr_manager = FailedTrackingSdrManager(error)
     if config.tx.enabled:
@@ -532,8 +539,10 @@ def _reload_runtime_config() -> None:
                 ),
                 poll_target_vfo=False,
             )
+            tx_radio_manager.get_frequency()
         except Exception as exc:
             error = f"TX startup failed: {exc}"
+            startup_errors.append(error)
             LOGGER.warning(error)
             tx_radio_manager = FailedRadioManager(error)
     if config.rotator.enabled:
@@ -550,6 +559,7 @@ def _reload_runtime_config() -> None:
             )
         except Exception as exc:
             error = f"Rotator startup failed: {exc}"
+            startup_errors.append(error)
             LOGGER.warning(error)
             rotator_manager = FailedRotatorManager(
                 error,
@@ -562,30 +572,39 @@ def _reload_runtime_config() -> None:
         tx_radio_manager,
         shared_local_radio,
     )
-    _apply_satmode_for_configured_radios(
-        config,
-        sdr_manager,
-        tx_radio_manager,
-        shared_local_radio,
-        shared_local_client,
-    )
     if rx_tracking_manager is not None:
         rx_tracking_manager.update_runtime_dependencies(
             sdr_manager=sdr_manager or DisabledTrackingSdrManager(),
             tx_radio_manager=tx_radio_manager,
             rotator_manager=rotator_manager,
+            manual_offset_readback_active_pass_only=(
+                config.safety.manual_offset_readback_active_pass_only
+            ),
         )
+    if sdr_manager is not None and not isinstance(sdr_manager, FailedTrackingSdrManager):
+        sdr_manager.start()
+    if rx_tracking_manager is not None:
         try:
             rx_tracking_manager.refresh_snapshot_only()
         except Exception:
             LOGGER.exception("Tracking snapshot refresh failed after runtime reload")
     try:
-        _ensure_pass_cache()
+        tle_manager = TleManager(config.tle.source_url, config.tle.cache_dir)
+        if tle_manager.status().exists:
+            _ensure_pass_cache()
+        else:
+            LOGGER.info("Pass cache initialization deferred until startup TLE refresh")
     except Exception:
         LOGGER.exception("TLE/pass cache unavailable during runtime reload; continuing startup")
+    return list(dict.fromkeys(startup_errors))
 
 
 def _reload_rotator_config_only() -> None:
+    with tracking_command_lock:
+        _reload_rotator_config_only_locked()
+
+
+def _reload_rotator_config_only_locked() -> None:
     global rotator_manager, rx_tracking_manager
 
     config = load_config()
@@ -593,22 +612,20 @@ def _reload_rotator_config_only() -> None:
     previous_rotator_manager = rotator_manager
     rotator_manager = None
     if rx_tracking_manager is not None:
-        rx_tracking_manager.rotator_manager = None
+        rx_tracking_manager.update_runtime_dependencies(
+            sdr_manager=sdr_manager or DisabledTrackingSdrManager(),
+            tx_radio_manager=tx_radio_manager,
+            rotator_manager=None,
+        )
     if previous_rotator_manager is not None:
-        if not config.rotator.enabled:
-            try:
-                shutdown = getattr(previous_rotator_manager, "shutdown", None)
-                if shutdown is not None:
-                    shutdown()
-                else:
-                    previous_rotator_manager.stop()
-            except Exception:
-                LOGGER.exception("Failed to shut down rotator during control disable")
-        if config.rotator.enabled and hasattr(previous_rotator_manager.client, "close"):
-            try:
-                previous_rotator_manager.client.close()
-            except Exception:
-                LOGGER.exception("Failed to close rotator client during reload")
+        try:
+            shutdown = getattr(previous_rotator_manager, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+            else:
+                previous_rotator_manager.stop()
+        except Exception:
+            LOGGER.exception("Failed to shut down rotator during control reload")
     if config.rotator.enabled:
         try:
             rotator_manager = RotatorManager(
@@ -630,7 +647,11 @@ def _reload_rotator_config_only() -> None:
                 write_enabled=True,
             )
     if rx_tracking_manager is not None:
-        rx_tracking_manager.rotator_manager = rotator_manager
+        rx_tracking_manager.update_runtime_dependencies(
+            sdr_manager=sdr_manager or DisabledTrackingSdrManager(),
+            tx_radio_manager=tx_radio_manager,
+            rotator_manager=rotator_manager,
+        )
         try:
             rx_tracking_manager.refresh_snapshot_only()
         except Exception:
@@ -793,11 +814,8 @@ def _list_serial_devices() -> list[dict[str, str]]:
 def _refresh_pass_cache(force_tle_download: bool) -> list[SatellitePass]:
     """Refreshes the shared pass cache used by the dashboard and satellite pages."""
 
-    global pass_cache_refreshed_at_utc, pass_refresh_in_progress
-    if pass_refresh_in_progress:
-        with pass_cache_lock:
-            return list(pass_cache)
-    pass_refresh_in_progress = True
+    global pass_cache_refreshed_at_utc
+    pass_refresh_gate.acquire()
     try:
         config = load_config()
         tle_manager = TleManager(config.tle.source_url, config.tle.cache_dir)
@@ -805,7 +823,16 @@ def _refresh_pass_cache(force_tle_download: bool) -> list[SatellitePass]:
             "Pass refresh started (force_tle_download=%s)",
             force_tle_download,
         )
-        if force_tle_download:
+        tle_status = tle_manager.status()
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(
+            hours=max(1, config.tle.stale_after_hours)
+        )
+        cache_is_stale = (
+            not tle_status.exists
+            or tle_status.downloaded_at_utc is None
+            or tle_status.downloaded_at_utc < stale_cutoff
+        )
+        if force_tle_download or cache_is_stale:
             try:
                 tle_manager.download()
             except Exception:
@@ -845,7 +872,7 @@ def _refresh_pass_cache(force_tle_download: bool) -> list[SatellitePass]:
         LOGGER.info("Pass refresh complete: %s pass(es) cached", len(refreshed))
         return refreshed
     finally:
-        pass_refresh_in_progress = False
+        pass_refresh_gate.release()
 
 
 def _ensure_pass_cache() -> None:
@@ -933,19 +960,50 @@ def _start_autotrack_pass(satellite_pass: SatellitePass) -> bool:
 
 
 def _run_pre_aos_automation(satellite_pass: SatellitePass) -> None:
-    snapshot = rx_tracking_manager.snapshot() if rx_tracking_manager is not None else None
     _trigger_automation_script_event(
         "aos",
-        {
-            "event": "AOS",
-            "norad_id": satellite_pass.norad_id,
-            "satellite_name": satellite_pass.satellite_name,
-            "aos_utc": satellite_pass.aos_utc.isoformat(),
-            "los_utc": satellite_pass.los_utc.isoformat(),
-            "target_rx_hz": getattr(snapshot, "target_rx_hz", None),
-            "target_tx_hz": getattr(snapshot, "calculated_tx_hz", None),
-        },
+        _automation_context_for_pass(satellite_pass, "AOS"),
     )
+
+
+def _run_timed_los_automation(satellite_pass: SatellitePass) -> None:
+    _trigger_automation_script_event(
+        "los",
+        _automation_context_for_pass(satellite_pass, "LOS"),
+    )
+
+
+def _automation_context_for_pass(
+    satellite_pass: SatellitePass,
+    event_name: str,
+) -> dict[str, object]:
+    manager = rx_tracking_manager
+    snapshot = manager.snapshot() if manager is not None else None
+    if manager is not None and manager.satellite.norad_id != satellite_pass.norad_id:
+        snapshot = None
+    return {
+        "event": event_name,
+        "norad_id": satellite_pass.norad_id,
+        "satellite_name": satellite_pass.satellite_name,
+        "aos_utc": satellite_pass.aos_utc.isoformat(),
+        "los_utc": satellite_pass.los_utc.isoformat(),
+        "transponder_name": getattr(snapshot, "transponder_name", None),
+        "azimuth_deg": getattr(snapshot, "azimuth_deg", None),
+        "elevation_deg": getattr(snapshot, "elevation_deg", None),
+        "latitude_deg": getattr(snapshot, "latitude_deg", None),
+        "longitude_deg": getattr(snapshot, "longitude_deg", None),
+        "range_km": getattr(snapshot, "range_km", None),
+        "range_rate_m_s": getattr(snapshot, "range_rate_m_s", None),
+        "target_rx_hz": getattr(snapshot, "target_rx_hz", None),
+        "target_tx_hz": getattr(snapshot, "calculated_tx_hz", None),
+    }
+
+
+def _get_active_tracking_norad() -> int | None:
+    manager = rx_tracking_manager
+    if manager is None or not manager.snapshot().active:
+        return None
+    return manager.satellite.norad_id
 
 
 autotrack_coordinator = AutotrackCoordinator(
@@ -956,11 +1014,22 @@ autotrack_coordinator = AutotrackCoordinator(
     logger=LOGGER,
 )
 
+timed_los_coordinator = TimedLosCoordinator(
+    get_active_norad=_get_active_tracking_norad,
+    get_passes=_get_cached_passes,
+    run_los=_run_timed_los_automation,
+    logger=LOGGER,
+)
+
 
 def _run_autotrack_scheduler() -> None:
-    """Runs the single authoritative upcoming-pass selection loop."""
+    """Runs timed LOS before the authoritative upcoming-pass selection loop."""
 
     while not autotrack_stop.is_set():
+        try:
+            timed_los_coordinator.tick()
+        except Exception:
+            LOGGER.exception("Timed LOS evaluation failed")
         try:
             autotrack_coordinator.tick()
         except Exception:

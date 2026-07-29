@@ -52,6 +52,8 @@ class LocalHamlibClient:
     def get_frequency(self) -> int:
         with self._lock:
             client = self._ensure_client()
+            if self.vfo_mode and self.target_vfo:
+                return client.get_frequency_on_vfo(self.target_vfo)
             return client.get_frequency()
 
     def get_ptt(self) -> bool:
@@ -83,6 +85,9 @@ class LocalHamlibClient:
     def set_frequency(self, frequency_hz: int) -> None:
         with self._lock:
             client = self._ensure_client()
+            if self.vfo_mode and self.target_vfo:
+                client.set_frequency_on_vfo(self.target_vfo, frequency_hz)
+                return
             try:
                 client.set_frequency(frequency_hz)
                 return
@@ -216,6 +221,30 @@ class LocalHamlibClient:
                 client.select_vfo(vfo)
             client.set_mode(mode, passband_hz)
 
+    def set_ctcss_tone_on_vfo(
+        self,
+        vfo: str | None,
+        tone_tenths_hz: int,
+    ) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            if vfo and self.vfo_mode:
+                client.set_ctcss_tone_on_vfo(vfo, tone_tenths_hz)
+                return
+            if vfo:
+                client.select_vfo(vfo)
+            client.set_ctcss_tone(tone_tenths_hz)
+
+    def set_tone_enabled_on_vfo(self, vfo: str | None, enabled: bool) -> None:
+        with self._lock:
+            client = self._ensure_client()
+            if vfo and self.vfo_mode:
+                client.set_tone_enabled_on_vfo(vfo, enabled)
+                return
+            if vfo:
+                client.select_vfo(vfo)
+            client.set_tone_enabled(enabled)
+
     def set_mode_on_vfo_and_restore(
         self,
         vfo: str | None,
@@ -238,11 +267,6 @@ class LocalHamlibClient:
             client = self._ensure_client()
             client.select_vfo(vfo)
 
-    def set_satmode(self, enabled: bool) -> None:
-        with self._lock:
-            client = self._ensure_client()
-            client.set_satmode(enabled)
-
     def close(self) -> None:
         with self._lock:
             if self._client is not None:
@@ -259,12 +283,27 @@ class LocalHamlibClient:
             self._daemon_port = None
 
     def _ensure_client(self) -> PersistentRigctldClient:
-        if self._client is not None and self._daemon is not None and self._daemon.poll() is None:
+        if (
+            self._client is not None
+            and not self._client.is_broken
+            and self._daemon is not None
+            and self._daemon.poll() is None
+        ):
             return self._client
+        if self._client is not None and self._client.is_broken:
+            LOGGER.warning(
+                "local_hamlib role=%s restarting_rigctld_after_transport_failure "
+                "model_id=%s serial_port=%s",
+                self.role_label,
+                self.model_id,
+                self.serial_port,
+            )
         self.close()
         port = _find_free_port()
         command = [
             "rigctld",
+            "-T",
+            "127.0.0.1",
             "-m",
             str(self.model_id),
             "-r",
@@ -294,6 +333,8 @@ class LocalHamlibClient:
             stdout=subprocess.PIPE if self.debug_logging else subprocess.DEVNULL,
             stderr=subprocess.STDOUT if self.debug_logging else subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="backslashreplace",
             bufsize=1,
         )
         if self.debug_logging and self._daemon.stdout is not None:
@@ -316,12 +357,23 @@ class LocalHamlibClient:
                 self.timeout_s,
                 self.debug_logging,
                 role_label=self.role_label,
+                target_vfo=self.target_vfo,
+                vfo_mode=self.vfo_mode,
             )
             try:
                 client.connect()
                 if self.vfo_mode and not client.check_vfo_mode():
                     client.close()
                     raise RuntimeError("rigctld did not enable VFO-addressed command mode")
+                try:
+                    client.set_cache_timeout_ms(0)
+                except RuntimeError as exc:
+                    LOGGER.warning(
+                        "local_hamlib role=%s unable_to_disable_rigctld_cache "
+                        "error=%s",
+                        self.role_label,
+                        exc,
+                    )
             except Exception as exc:
                 last_error = exc
                 sleep(0.1)

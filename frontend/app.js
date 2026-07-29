@@ -1,4 +1,4 @@
-﻿let currentRxFrequencyHz = null;
+﻿
 let latestTracking = null;
 let selectedSatelliteNorad = null;
 let selectedFrequencyProfileIndex = 0;
@@ -21,7 +21,12 @@ let catDevicesCache = [];
 let currentSettingsState = {};
 let qthTimezone = 'UTC';
 let rotatorControlEnabled = false;
-let deviceControlUpdatePending = false;
+let deviceControlUpdatesPending = 0;
+const pendingDeviceControlValues = {};
+let deviceControlFlushTimer = null;
+let deviceControlFlushActive = false;
+const pendingTrackingStepsHz = { rx: 0, tx: 0 };
+let trackingStepFlushActive = false;
 let mapRefreshPending = false;
 let mapRefreshRequestedAtMs = 0;
 let syncToggleUpdatePending = false;
@@ -58,13 +63,11 @@ const lastLoggedErrors = {
 const worldMapImage = new Image();
 worldMapImage.src = '/assets/world-map-equirectangular.png';
 const ADVANCED_SETTING_DESCRIPTIONS = {
-  tx_inhibit_below_horizon: 'Prevents transmit control when the tracked satellite is below the horizon.',
-  tx_inhibit_on_cat_loss: 'Stops TX-side control when CAT communication with the transmit device is lost.',
-  tx_inhibit_without_valid_pass: 'Blocks TX-side control unless the current tracking state is tied to a valid computed pass.',
   frequency_deadband_hz: 'Minimum frequency change required before a new CAT tuning command is sent.',
   cat_rate_limit_hz: 'Maximum number of CAT control updates per second sent to the live device path while tracking.',
   tracking_update_interval_ms: 'How often the tracking loop recalculates satellite position, Doppler, and control targets.',
   device_offline_failure_threshold: 'How many consecutive device failures must happen before RX, TX, SDR, or rotator is marked offline.',
+  manual_offset_readback_active_pass_only: 'When enabled, physical radio tuning is adopted as an offset only during a live pass. When disabled, it is adopted whenever tracking is active.',
 };
 const STANDARD_PAGE_NAV = PAGE_NAMES.map((page) => {
   const labelByPage = {
@@ -274,7 +277,7 @@ async function loadStatus() {
     stationLatitudeDeg = Number(status.station.latitude_deg);
     stationLongitudeDeg = Number(status.station.longitude_deg);
     qthTimezone = status.station.timezone || 'UTC';
-    if (!deviceControlUpdatePending) {
+    if (deviceControlUpdatesPending === 0) {
       const rxToggle = document.getElementById('rx-control-toggle');
       const txToggle = document.getElementById('tx-control-toggle');
       const rotatorToggle = document.getElementById('rotator-control-toggle');
@@ -426,7 +429,6 @@ async function loadSdrFrequency() {
 
     frequencyElement.textContent =
       `${Number(result.frequency_hz).toLocaleString()} Hz`;
-    currentRxFrequencyHz = Number(result.frequency_hz);
   } catch (error) {
     frequencyElement.textContent = 'Read failed';
   }
@@ -434,34 +436,52 @@ async function loadSdrFrequency() {
 
 async function stepSdrFrequency(event) {
   const stepHz = Number(event.currentTarget.dataset.rxStepHz);
-  await stepTrackingOffset('rx', stepHz);
+  queueTrackingOffsetStep('rx', stepHz);
 }
 
 async function stepTxFrequency(event) {
   const stepHz = Number(event.currentTarget.dataset.txStepHz);
-  await stepTrackingOffset('tx', stepHz);
+  queueTrackingOffsetStep('tx', stepHz);
 }
 
-async function stepTrackingOffset(role, stepHz) {
+function queueTrackingOffsetStep(role, stepHz) {
+  pendingTrackingStepsHz[role] += stepHz;
+  if (!trackingStepFlushActive) {
+    void flushTrackingOffsetSteps();
+  }
+}
+
+async function flushTrackingOffsetSteps() {
+  trackingStepFlushActive = true;
   try {
-    const response = await fetch(`/api/tracking/${role}/step`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        step_hz: stepHz,
-        norad_id: selectedSatelliteNorad,
-        frequency_profile_index: selectedFrequencyProfileIndex,
-        sync_offsets: syncRxTx,
-      }),
-    });
-    const result = await response.json();
-    if (!response.ok) {
-      addLog(result.detail || 'Offset step failed.');
-      return;
+    while (pendingTrackingStepsHz.rx || pendingTrackingStepsHz.tx) {
+      const role = pendingTrackingStepsHz.rx ? 'rx' : 'tx';
+      const stepHz = pendingTrackingStepsHz[role];
+      pendingTrackingStepsHz[role] = 0;
+      const response = await fetch(`/api/tracking/${role}/step`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          step_hz: stepHz,
+          norad_id: selectedSatelliteNorad,
+          frequency_profile_index: selectedFrequencyProfileIndex,
+          sync_offsets: syncRxTx,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        addLog(result.detail || 'Offset step failed.');
+        continue;
+      }
+      renderTracking(result);
     }
-    renderTracking(result);
   } catch (error) {
     addLog('Offset step failed.');
+  } finally {
+    trackingStepFlushActive = false;
+    if (pendingTrackingStepsHz.rx || pendingTrackingStepsHz.tx) {
+      void flushTrackingOffsetSteps();
+    }
   }
 }
 
@@ -603,7 +623,14 @@ async function selectPass(satellitePass, options = {}) {
   }
   beginMapRefresh(satellitePass.norad_id, satellitePass.satellite_name);
   drawMap();
-  await selectSatelliteByNorad(satellitePass.norad_id, { suppressRender: true });
+  const trackingResult = await selectSatelliteByNorad(
+    satellitePass.norad_id,
+    { suppressRender: true }
+  );
+  if (!trackingResult) {
+    addLog(`Unable to load ${satellitePass.satellite_name} pass.`);
+    return;
+  }
   addLog(`${satellitePass.satellite_name} pass loaded.`);
   await loadTracking(true);
   drawMap();
@@ -640,7 +667,7 @@ function renderTrackFilter() {
         ? selectedSatelliteNorad
         : null;
       try {
-        await persistTrackFilter();
+        await persistTrackFilter(noradId, checkbox.checked);
       } catch (error) {
         if (checkbox.checked) {
           trackedSatelliteNorads.delete(noradId);
@@ -673,7 +700,7 @@ async function selectSatelliteByNorad(noradId, options = {}) {
     return Number(item.norad_id) === Number(noradId);
   });
   if (!satellite) {
-    return;
+    return null;
   }
   beginMapRefresh(satellite.norad_id, satellite.name);
   selectedSatelliteNorad = satellite.norad_id;
@@ -692,6 +719,7 @@ async function selectSatelliteByNorad(noradId, options = {}) {
   ) {
     renderTracking(result);
   }
+  return result;
 }
 
 function restoreSelectionFromTracking() {
@@ -814,7 +842,7 @@ function updateTxProfileState(profile) {
     txBadge.className = rxOnly ? 'badge text-bg-secondary' : 'badge text-bg-success';
     txBadge.textContent = rxOnly ? 'Disabled (RX-only)' : 'Active';
   }
-  document.querySelectorAll('[data-tx-step-khz]').forEach((button) => {
+  document.querySelectorAll('[data-tx-step-hz]').forEach((button) => {
     button.disabled = rxOnly;
   });
   if (syncToggle) {
@@ -844,12 +872,13 @@ async function persistAutotrackSetting(enabled) {
   }
 }
 
-async function persistTrackFilter() {
+async function persistTrackFilter(noradId, enabled) {
   const response = await fetch('/api/my-satellites/options', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      autotrack_norad_ids: Array.from(trackedSatelliteNorads),
+      autotrack_norad_id: Number(noradId),
+      autotrack_enabled: Boolean(enabled),
     }),
   });
   const result = await response.json();
@@ -1597,7 +1626,6 @@ function buildCatDeviceCard(device) {
     buildCatDeviceField('Model ID', 'model_id', device.model_id || '', { type: 'hamlib_model' }),
   );
   config.appendChild(detailGrid);
-  config.appendChild(buildCatDeviceSatModeRow(device));
   body.appendChild(config);
 
   const capabilityChart = document.createElement('div');
@@ -1691,41 +1719,6 @@ function buildCatDeviceField(label, key, value, options = {}) {
   return row;
 }
 
-function buildCatDeviceSatModeRow(device) {
-  const row = document.createElement('label');
-  row.className = 'settings-row settings-row-toggle cat-device-satmode-row';
-  row.dataset.catDeviceSatmodeRow = 'true';
-  row.hidden = true;
-
-  const labelText = document.createElement('span');
-  labelText.className = 'form-label mb-0';
-  labelText.textContent = 'SAT Mode';
-
-  const hidden = document.createElement('input');
-  hidden.type = 'hidden';
-  hidden.dataset.catDeviceField = 'satmode_enabled';
-  hidden.value = String(device.satmode_enabled || '').trim().toLowerCase() === 'true'
-    ? 'true'
-    : 'false';
-
-  const checkbox = document.createElement('input');
-  checkbox.type = 'checkbox';
-  checkbox.className = 'form-check-input';
-  checkbox.setAttribute('role', 'switch');
-  checkbox.dataset.catDeviceSatmodeToggle = 'true';
-  checkbox.checked = hidden.value === 'true';
-  checkbox.addEventListener('change', () => {
-    hidden.value = checkbox.checked ? 'true' : 'false';
-  });
-
-  const switchWrap = document.createElement('span');
-  switchWrap.className = 'form-check form-switch mb-0';
-  switchWrap.appendChild(checkbox);
-
-  row.append(labelText, hidden, switchWrap);
-  return row;
-}
-
 function attachCatDeviceFieldHandlers(card) {
   const nameInput = card.querySelector('[data-cat-device-field="name"]');
   const idInput = card.querySelector('[data-cat-device-field="device_id"]');
@@ -1740,11 +1733,6 @@ function attachCatDeviceFieldHandlers(card) {
         markCatDeviceDirty(card);
       });
     }
-  });
-  card.querySelectorAll('[data-cat-device-satmode-toggle]').forEach((element) => {
-    element.addEventListener('change', () => {
-      markCatDeviceDirty(card);
-    });
   });
   nameInput?.addEventListener('input', () => {
     title.textContent = nameInput.value.trim() || 'New Device';
@@ -2057,7 +2045,11 @@ async function trackManagedSatelliteNow(noradId) {
     return;
   }
   addLog(`Tracking ${satellite.name} now...`);
-  await selectSatelliteByNorad(satellite.norad_id);
+  const trackingResult = await selectSatelliteByNorad(satellite.norad_id);
+  if (!trackingResult) {
+    addLog(`Unable to start tracking ${satellite.name}.`);
+    return;
+  }
   await loadTracking(true);
   if (pageFromHash() !== 'home') {
     window.location.hash = 'home';
@@ -2423,7 +2415,7 @@ function refreshRoleTargetSelectors() {
     const deviceId = document.querySelector(`select[name="${section}.device_id"]`)?.value
       || currentSettingsState?.[section]?.device_id
       || '';
-    const replacement = buildVfoSelect(currentValue, deviceId);
+    const replacement = buildVfoSelect(currentValue, deviceId, section);
     replacement.name = select.name;
     replacement.addEventListener('change', () => {
       if (!currentSettingsState[section]) {
@@ -2576,7 +2568,6 @@ function collectCatDeviceFromCard(card) {
     baud: String(values.baud || '').trim(),
     model_id: String(values.model_id || '').trim(),
     timeout_s: String(values.timeout_s || '').trim() || '2.0',
-    satmode_enabled: String(values.satmode_enabled || '').trim(),
   };
 }
 
@@ -2629,7 +2620,22 @@ async function saveCatDevice(card) {
     }
     catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : catDevicesCache;
     addLog(result.message || 'Device saved.');
-    await loadSettings();
+    const savedDevice = result.device || device;
+    card.dataset.savedDeviceId = String(savedDevice.device_id || device.device_id);
+    card.dataset.deviceId = card.dataset.savedDeviceId;
+    card.querySelectorAll('[data-cat-device-field]').forEach((element) => {
+      const key = element.dataset.catDeviceField;
+      if (Object.hasOwn(savedDevice, key)) {
+        element.value = String(savedDevice[key] ?? '');
+      }
+    });
+    applyCatDeviceCapabilitiesToCard(card, savedDevice);
+    renderCatDeviceCapabilityChart(card);
+    refreshRoleDeviceSelectors();
+    if (status) {
+      status.textContent = result.message || 'Device saved.';
+      status.classList.remove('is-error');
+    }
   } catch (error) {
     if (status) {
       status.textContent = 'Device save failed.';
@@ -2665,7 +2671,8 @@ async function removeCatDevice(card) {
     }
     catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : catDevicesCache;
     addLog(result.message || 'Device removed.');
-    await loadSettings();
+    card.remove();
+    refreshRoleDeviceSelectors();
   } catch (error) {
     if (status) {
       status.textContent = 'Device removal failed.';
@@ -2680,9 +2687,7 @@ function applyCatDeviceCapabilitiesToCard(card, device) {
   card.dataset.capabilityPtt = normalizeCapabilityValue(device.capability_ptt);
   card.dataset.capabilityVfo = normalizeCapabilityValue(device.capability_vfo);
   card.dataset.capabilityShared = normalizeCapabilityValue(device.capability_shared);
-  card.dataset.capabilitySatmode = normalizeCapabilityValue(device.capability_satmode);
   card.dataset.capabilityTargets = String(device.capability_targets || '').trim();
-  card.dataset.satmodeEnabled = normalizeCapabilityValue(device.satmode_enabled);
   card.dataset.capabilityLastTestUtc = String(device.capability_last_test_utc || '').trim();
   card.dataset.capabilityNotes = String(device.capability_notes || '').trim();
 }
@@ -2706,7 +2711,6 @@ function renderCatDeviceCapabilityChart(card) {
     ['PTT', card.dataset.capabilityPtt],
     ['VFO', card.dataset.capabilityVfo],
     ['Shared RX/TX', card.dataset.capabilityShared],
-    ['SAT Mode', card.dataset.capabilitySatmode],
   ];
   items.forEach(([label, value]) => {
     const item = document.createElement('div');
@@ -2724,26 +2728,6 @@ function renderCatDeviceCapabilityChart(card) {
   notes.className = 'device-capability-notes';
   notes.textContent = card.dataset.capabilityNotes || 'Save device to populate device support when reachable.';
   container.appendChild(notes);
-  updateCatDeviceSatModeControl(card);
-}
-
-function updateCatDeviceSatModeControl(card) {
-  const row = card.querySelector('[data-cat-device-satmode-row="true"]');
-  const checkbox = card.querySelector('[data-cat-device-satmode-toggle="true"]');
-  const hidden = card.querySelector('[data-cat-device-field="satmode_enabled"]');
-  if (!row || !checkbox || !hidden) {
-    return;
-  }
-  const supported = card.dataset.capabilitySatmode === 'true';
-  row.hidden = !supported;
-  if (!supported) {
-    hidden.value = '';
-    checkbox.checked = false;
-    return;
-  }
-  const enabled = String(card.dataset.satmodeEnabled || hidden.value || '').toLowerCase() === 'true';
-  hidden.value = enabled ? 'true' : 'false';
-  checkbox.checked = enabled;
 }
 
 function buildSatellitePassList(passes) {
@@ -2960,7 +2944,7 @@ function buildSettingControl(section, key, value) {
     control = buildHamlibRotatorModelSelect(value);
   } else if (key === 'target_vfo' && (section === 'rx' || section === 'tx')) {
     const deviceId = currentSettingsState?.[section]?.device_id || '';
-    control = buildVfoSelect(value, deviceId);
+    control = buildVfoSelect(value, deviceId, section);
     control.addEventListener('change', () => {
       if (!currentSettingsState[section]) {
         currentSettingsState[section] = {};
@@ -3195,33 +3179,40 @@ function getCatDeviceById(deviceId) {
   return catDevicesCache.find((device) => String(device.device_id || '') === String(deviceId || ''));
 }
 
-function getDeviceTargetOptions(deviceId) {
+function getDeviceTargetOptions(deviceId, requireExplicit = false) {
   const device = getCatDeviceById(deviceId);
-  const options = [['current', 'Current VFO']];
+  const options = requireExplicit
+    ? [['', 'Select explicit target']]
+    : [['current', 'Current VFO']];
   const rawTargets = String(device?.capability_targets || '')
     .split(',')
-    .map((target) => target.trim().toUpperCase())
+    .map((target) => canonicalizeDeviceTargetValue(target))
     .filter(Boolean);
-  const uniqueTargets = [...new Set(rawTargets)];
-  const hasMain = uniqueTargets.includes('MAIN');
-  const hasSub = uniqueTargets.includes('SUB');
+  const uniqueTargets = rawTargets.filter(
+    (target, index) => rawTargets.findIndex(
+      (candidate) => candidate.toUpperCase() === target.toUpperCase(),
+    ) === index,
+  );
   uniqueTargets.forEach((target) => {
-    if (hasMain && (target === 'MAINA' || target === 'MAINB')) {
-      return;
-    }
-    if (hasSub && (target === 'SUBA' || target === 'SUBB')) {
-      return;
-    }
     options.push([target, formatHamlibTargetLabel(target)]);
   });
   return options;
 }
 
-function buildVfoSelect(value, deviceId = '') {
+function buildVfoSelect(value, deviceId = '', section = '') {
   const control = document.createElement('select');
   control.className = 'form-select';
   const selectedValue = canonicalizeDeviceTargetValue(value);
-  const options = getDeviceTargetOptions(deviceId);
+  const otherSection = section === 'rx' ? 'tx' : section === 'tx' ? 'rx' : '';
+  const otherDeviceId = otherSection
+    ? (
+      document.querySelector(`select[name="${otherSection}.device_id"]`)?.value
+      || currentSettingsState?.[otherSection]?.device_id
+      || ''
+    )
+    : '';
+  const requireExplicit = Boolean(deviceId && otherDeviceId === deviceId);
+  const options = getDeviceTargetOptions(deviceId, requireExplicit);
   options.forEach(([optionValue, optionLabel]) => {
     const option = document.createElement('option');
     option.value = optionValue;
@@ -3250,6 +3241,17 @@ function canonicalizeDeviceTargetValue(value) {
   if (normalized === 'B') {
     return 'VFOB';
   }
+  const compoundTargets = {
+    MAINA: 'MainA',
+    MAINB: 'MainB',
+    MAINC: 'MainC',
+    SUBA: 'SubA',
+    SUBB: 'SubB',
+    SUBC: 'SubC',
+  };
+  if (compoundTargets[normalized]) {
+    return compoundTargets[normalized];
+  }
   return normalized;
 }
 
@@ -3272,6 +3274,24 @@ function formatHamlibTargetLabel(target) {
   }
   if (normalized === 'SUB') {
     return 'Sub';
+  }
+  if (normalized === 'MAINA') {
+    return 'Main A';
+  }
+  if (normalized === 'MAINB') {
+    return 'Main B';
+  }
+  if (normalized === 'MAINC') {
+    return 'Main C';
+  }
+  if (normalized === 'SUBA') {
+    return 'Sub A';
+  }
+  if (normalized === 'SUBB') {
+    return 'Sub B';
+  }
+  if (normalized === 'SUBC') {
+    return 'Sub C';
   }
   return normalized;
 }
@@ -3309,7 +3329,12 @@ async function saveSettings(event) {
       return;
     }
     catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : catDevicesCache;
-    status.textContent = 'Settings saved and connections reloaded.';
+    const runtimeWarnings = Array.isArray(result.runtime_warnings)
+      ? result.runtime_warnings.filter(Boolean)
+      : [];
+    status.textContent = runtimeWarnings.length
+      ? `Settings saved, with connection warnings: ${runtimeWarnings.join(' ')}`
+      : 'Settings saved and connections reloaded.';
     loadStatus();
     await loadSettings();
     loadRotator();
@@ -3319,11 +3344,9 @@ async function saveSettings(event) {
 }
 
 async function updateDeviceControl(event) {
-  addLog('Updating device control...');
   const toggle = event.currentTarget;
   const requestedEnabled = toggle.checked;
   toggle.blur();
-  toggle.disabled = true;
   const payloadKeyByToggleId = {
     'rx-control-toggle': 'rx_enabled',
     'tx-control-toggle': 'tx_enabled',
@@ -3331,32 +3354,57 @@ async function updateDeviceControl(event) {
   };
   const payloadKey = payloadKeyByToggleId[toggle.id];
   if (!payloadKey) {
-    toggle.disabled = false;
     return;
   }
-  deviceControlUpdatePending = true;
+  pendingDeviceControlValues[payloadKey] = requestedEnabled;
+  deviceControlUpdatesPending = 1;
+  if (deviceControlFlushTimer !== null) {
+    window.clearTimeout(deviceControlFlushTimer);
+  }
+  deviceControlFlushTimer = window.setTimeout(() => {
+    deviceControlFlushTimer = null;
+    if (!deviceControlFlushActive) {
+      void flushDeviceControlUpdates();
+    }
+  }, 150);
+}
+
+async function flushDeviceControlUpdates() {
+  const payload = { ...pendingDeviceControlValues };
+  Object.keys(payload).forEach((key) => {
+    delete pendingDeviceControlValues[key];
+  });
+  if (!Object.keys(payload).length) {
+    deviceControlUpdatesPending = 0;
+    return;
+  }
+
+  deviceControlFlushActive = true;
+  addLog('Updating device controls...');
   try {
     const response = await fetch('/api/device-controls', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [payloadKey]: requestedEnabled }),
+      body: JSON.stringify(payload),
     });
     const result = await response.json();
     if (!response.ok) {
       addLog(result.detail || 'Device control update failed.');
-      toggle.checked = !requestedEnabled;
       return;
     }
-    addLog('Device control updated.');
-    loadStatus();
+    addLog('Device controls updated.');
     rotatorControlEnabled = document.getElementById('rotator-control-toggle').checked;
     loadRotator();
   } catch (error) {
     addLog('Device control update failed.');
-    toggle.checked = !requestedEnabled;
   } finally {
-    toggle.disabled = false;
-    deviceControlUpdatePending = false;
+    deviceControlFlushActive = false;
+    if (Object.keys(pendingDeviceControlValues).length) {
+      void flushDeviceControlUpdates();
+    } else {
+      deviceControlUpdatesPending = 0;
+      loadStatus();
+    }
   }
 }
 
@@ -3385,6 +3433,7 @@ function isBooleanSetting(key) {
   return key === 'enabled'
     || key === 'cat_debug_logging'
     || key === 'return_home_after_pass'
+    || key === 'manual_offset_readback_active_pass_only'
     || key.startsWith('tx_inhibit');
 }
 
@@ -3445,11 +3494,9 @@ function formatSettingLabel(key) {
     target_vfo: 'Target VFO',
     tracking_update_interval_ms: 'Tracking Update Interval (ms)',
     device_offline_failure_threshold: 'Number of Failures Before Device Is Marked Offline',
-    tx_inhibit_below_horizon: 'TX Inhibit Below Horizon',
-    tx_inhibit_on_cat_loss: 'TX Inhibit On CAT Loss',
-    tx_inhibit_without_valid_pass: 'TX Inhibit Without Valid Pass',
     frequency_deadband_hz: 'Frequency Deadband (Hz)',
     cat_rate_limit_hz: 'CAT Rate Limit (Hz)',
+    manual_offset_readback_active_pass_only: 'Monitor Manual Offset Only During Live Pass',
     gui_resources_caching: 'GUI Resources Caching',
     name: 'Name',
     connectivity: 'Connectivity',

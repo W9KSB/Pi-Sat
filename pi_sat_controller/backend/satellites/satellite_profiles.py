@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import RLock
 
 from pi_sat_controller.backend.models import SatelliteProfile, TransponderProfile
 
+_PROFILE_LOCK = RLock()
+
 
 def load_satellite_profiles(path: Path | str) -> list[SatelliteProfile]:
-    with Path(path).open("r", encoding="utf-8") as profile_file:
-        raw_profiles = json.load(profile_file)
+    with _PROFILE_LOCK:
+        with Path(path).open("r", encoding="utf-8") as profile_file:
+            raw_profiles = json.load(profile_file)
 
     return [
         SatelliteProfile(
@@ -68,23 +74,45 @@ def save_satellite_profiles(
         }
         for profile in profiles
     ]
-    Path(path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    target = Path(path).resolve()
+    temporary_path: Path | None = None
+    with _PROFILE_LOCK:
+        try:
+            with NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                json.dump(payload, temporary, indent=2)
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_path = Path(temporary.name)
+            os.replace(temporary_path, target)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
 
 def upsert_satellite_transponders(
     path: Path | str,
     satellite: SatelliteProfile,
 ) -> SatelliteProfile:
-    profiles = load_satellite_profiles(path)
-    updated_profiles: list[SatelliteProfile] = []
-    replaced = False
-    for existing in profiles:
-        if existing.norad_id == satellite.norad_id:
+    with _PROFILE_LOCK:
+        profiles = load_satellite_profiles(path)
+        updated_profiles: list[SatelliteProfile] = []
+        replaced = False
+        for existing in profiles:
+            if existing.norad_id == satellite.norad_id:
+                updated_profiles.append(satellite)
+                replaced = True
+            else:
+                updated_profiles.append(existing)
+        if not replaced:
             updated_profiles.append(satellite)
-            replaced = True
-        else:
-            updated_profiles.append(existing)
-    if not replaced:
-        updated_profiles.append(satellite)
-    save_satellite_profiles(path, updated_profiles)
+        save_satellite_profiles(path, updated_profiles)
     return satellite

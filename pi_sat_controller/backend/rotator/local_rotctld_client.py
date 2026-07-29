@@ -74,6 +74,8 @@ class LocalRotctldClient:
         port = _find_free_port()
         command = [
             "rotctld",
+            "-T",
+            "127.0.0.1",
             "-m",
             str(self.model_id),
             "-r",

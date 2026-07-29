@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query
 
-from pi_sat_controller.backend.config import load_config
+from pi_sat_controller.backend.config import config_transaction, load_config
 from pi_sat_controller.backend.models import MySatellite, SatelliteProfile
 from pi_sat_controller.backend.satellites.satellite_profiles import (
     load_satellite_profiles,
@@ -17,6 +17,17 @@ from pi_sat_controller.backend.satellites.tle_manager import TleManager
 from pi_sat_controller.backend.satellites.transponder_source_client import (
     TransponderSourceClient,
 )
+
+
+def _parse_boolean(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise HTTPException(status_code=400, detail=f"{field_name} must be a boolean")
 
 
 def register_satellites_api(
@@ -176,56 +187,99 @@ def register_satellites_api(
                 detail=f"NORAD {norad_id} was not found in the current TLE cache",
             )
 
-        satellites, min_elevation, autotrack, autotrack_norads = load_my_satellites()
-        name = str(payload.get("name") or engine.satellites[norad_id].name or norad_id)
-        updated = [satellite for satellite in satellites if satellite.norad_id != norad_id]
-        updated.append(MySatellite(norad_id=norad_id, name=name))
-        save_my_satellites(updated, min_elevation, autotrack, autotrack_norads)
+        with config_transaction():
+            satellites, min_elevation, autotrack, autotrack_norads = load_my_satellites()
+            name = str(payload.get("name") or engine.satellites[norad_id].name or norad_id)
+            updated = [satellite for satellite in satellites if satellite.norad_id != norad_id]
+            updated.append(MySatellite(norad_id=norad_id, name=name))
+            save_my_satellites(updated, min_elevation, autotrack, autotrack_norads)
+        refresh_pass_cache(False)
         return get_my_satellites()
 
     @app.delete("/api/my-satellites/{norad_id}")
     def delete_my_satellite(norad_id: int) -> dict[str, object]:
-        satellites, min_elevation, autotrack, autotrack_norads = load_my_satellites()
-        save_my_satellites(
-            [satellite for satellite in satellites if satellite.norad_id != norad_id],
-            min_elevation,
-            autotrack,
-            autotrack_norads,
-        )
+        with config_transaction():
+            satellites, min_elevation, autotrack, autotrack_norads = load_my_satellites()
+            save_my_satellites(
+                [satellite for satellite in satellites if satellite.norad_id != norad_id],
+                min_elevation,
+                autotrack,
+                autotrack_norads,
+            )
+        refresh_pass_cache(False)
         return get_my_satellites()
 
     @app.post("/api/my-satellites/options")
     def update_my_satellite_options(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
-        satellites, min_elevation, autotrack, autotrack_norads = load_my_satellites()
-        if "min_pass_elevation_deg" in payload:
-            min_elevation = float(payload["min_pass_elevation_deg"])
-        if "autotrack_next_pass" in payload:
-            autotrack = bool(payload["autotrack_next_pass"])
-        if "autotrack_norad_ids" in payload:
-            try:
-                requested_norads = {
-                    int(norad_id) for norad_id in payload["autotrack_norad_ids"]
-                }
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Autotrack NORAD IDs must be a list of integers",
-                ) from exc
-            configured_norads = {satellite.norad_id for satellite in satellites}
-            unknown_norads = requested_norads - configured_norads
-            if unknown_norads:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unknown tracked NORAD IDs: {sorted(unknown_norads)}",
+        with config_transaction():
+            satellites, min_elevation, autotrack, autotrack_norads = load_my_satellites()
+            if "min_pass_elevation_deg" in payload:
+                try:
+                    min_elevation = float(payload["min_pass_elevation_deg"])
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Minimum elevation must be a valid number",
+                    ) from exc
+                if not 0.0 <= min_elevation <= 90.0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Minimum elevation must be between 0 and 90 degrees",
+                    )
+            if "autotrack_next_pass" in payload:
+                autotrack = _parse_boolean(
+                    payload["autotrack_next_pass"],
+                    "autotrack_next_pass",
                 )
-            autotrack_norads = requested_norads
-        save_my_satellites(
-            satellites,
-            min_elevation,
-            autotrack,
-            autotrack_norads,
-        )
-        if "autotrack_next_pass" in payload or "autotrack_norad_ids" in payload:
+            if "autotrack_norad_id" in payload:
+                try:
+                    changed_norad = int(payload["autotrack_norad_id"])
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="autotrack_norad_id must be an integer",
+                    ) from exc
+                configured_norads = {satellite.norad_id for satellite in satellites}
+                if changed_norad not in configured_norads:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unknown tracked NORAD ID: {changed_norad}",
+                    )
+                if _parse_boolean(payload.get("autotrack_enabled"), "autotrack_enabled"):
+                    autotrack_norads.add(changed_norad)
+                else:
+                    autotrack_norads.discard(changed_norad)
+            if "autotrack_norad_ids" in payload:
+                try:
+                    requested_norads = {
+                        int(norad_id) for norad_id in payload["autotrack_norad_ids"]
+                    }
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Autotrack NORAD IDs must be a list of integers",
+                    ) from exc
+                configured_norads = {satellite.norad_id for satellite in satellites}
+                unknown_norads = requested_norads - configured_norads
+                if unknown_norads:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unknown tracked NORAD IDs: {sorted(unknown_norads)}",
+                    )
+                autotrack_norads = requested_norads
+            save_my_satellites(
+                satellites,
+                min_elevation,
+                autotrack,
+                autotrack_norads,
+            )
+        if "min_pass_elevation_deg" in payload:
+            refresh_pass_cache(False)
+        if (
+            "autotrack_next_pass" in payload
+            or "autotrack_norad_ids" in payload
+            or "autotrack_norad_id" in payload
+        ):
             on_autotrack_changed(autotrack)
         return get_my_satellites()
 

@@ -21,6 +21,17 @@ def _parse_vfo_response(response: str) -> str:
     raise RuntimeError(f"rigctld rejected VFO read: {response or 'empty response'}")
 
 
+def _parse_vfo_mode_response(response: str) -> bool:
+    value = response.strip().upper()
+    if value in {"1", "CHKVFO 1"}:
+        return True
+    if value in {"0", "CHKVFO 0"}:
+        return False
+    raise RuntimeError(
+        f"rigctld returned an invalid VFO mode response: {response or 'empty response'}"
+    )
+
+
 class RigctldClient:
     def __init__(
         self,
@@ -71,7 +82,12 @@ class RigctldClient:
         return _parse_vfo_response(self._request("v"))
 
     def check_vfo_mode(self) -> bool:
-        return self._request(r"\chk_vfo").strip().upper() == "CHKVFO 1"
+        return _parse_vfo_mode_response(self._request(r"\chk_vfo"))
+
+    def set_cache_timeout_ms(self, timeout_ms: int) -> None:
+        response = self._request(fr"\set_cache {max(0, int(timeout_ms))}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected cache timeout set: {response}")
 
     def set_frequency(self, frequency_hz: int) -> None:
         response = self._request(f"F {frequency_hz}")
@@ -82,6 +98,16 @@ class RigctldClient:
         response = self._request(f"M {mode} {passband_hz}")
         if response and response != "RPRT 0":
             raise RuntimeError(f"rigctld rejected mode set: {response}")
+
+    def set_ctcss_tone(self, tone_tenths_hz: int) -> None:
+        response = self._request(f"C {tone_tenths_hz}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected CTCSS tone set: {response}")
+
+    def set_tone_enabled(self, enabled: bool) -> None:
+        response = self._request(f"U TONE {1 if enabled else 0}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected CTCSS encoder state: {response}")
 
     def set_split(self, enabled: bool, tx_vfo: str | None = None) -> None:
         command = f"S {1 if enabled else 0}"
@@ -106,12 +132,6 @@ class RigctldClient:
         if response and response != "RPRT 0":
             raise RuntimeError(f"rigctld rejected VFO select: {response}")
 
-    def set_satmode(self, enabled: bool) -> None:
-        response = self._request(f"U SATMODE {1 if enabled else 0}")
-        if response and response != "RPRT 0":
-            raise RuntimeError(f"rigctld rejected SATMODE set: {response}")
-
-
 class PersistentRigctldClient:
     def __init__(
         self,
@@ -120,22 +140,35 @@ class PersistentRigctldClient:
         timeout_s: float = 2.0,
         debug_logging: bool = False,
         role_label: str = "rx",
+        target_vfo: str | None = None,
+        vfo_mode: bool = False,
     ) -> None:
         self.host = host
         self.port = port
         self.timeout_s = timeout_s
         self.debug_logging = debug_logging
         self.role_label = role_label
+        self.target_vfo = target_vfo
+        self.vfo_mode = vfo_mode
         self._socket: socket.socket | None = None
         self._reader = None
+        self._broken = False
+
+    @property
+    def is_broken(self) -> bool:
+        return self._broken
 
     def connect(self) -> None:
         if self._socket is not None:
             return
 
+        self._open_socket()
+
+    def _open_socket(self) -> None:
         self._socket = socket.create_connection((self.host, self.port), self.timeout_s)
         self._socket.settimeout(self.timeout_s)
         self._reader = self._socket.makefile("r", encoding="ascii", newline="\n")
+        self._broken = False
 
     def close(self) -> None:
         if self._reader is not None:
@@ -144,6 +177,12 @@ class PersistentRigctldClient:
         if self._socket is not None:
             self._socket.close()
             self._socket = None
+
+    def _mark_broken(self) -> None:
+        try:
+            self.close()
+        finally:
+            self._broken = True
 
     def _request(self, command: str) -> str:
         self.connect()
@@ -162,11 +201,11 @@ class PersistentRigctldClient:
             self._socket.sendall(command.encode("ascii") + b"\n")
             response = self._reader.readline()
         except Exception:
-            self.close()
+            self._mark_broken()
             raise
 
         if response == "":
-            self.close()
+            self._mark_broken()
             raise ConnectionError("rigctld closed the connection")
         normalized = response.strip()
         if self.debug_logging:
@@ -196,7 +235,12 @@ class PersistentRigctldClient:
         return _parse_vfo_response(self._request("v"))
 
     def check_vfo_mode(self) -> bool:
-        return self._request(r"\chk_vfo").strip().upper() == "CHKVFO 1"
+        return _parse_vfo_mode_response(self._request(r"\chk_vfo"))
+
+    def set_cache_timeout_ms(self, timeout_ms: int) -> None:
+        response = self._request(fr"\set_cache {max(0, int(timeout_ms))}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected cache timeout set: {response}")
 
     def set_frequency(self, frequency_hz: int) -> None:
         response = self._request(f"F {frequency_hz}")
@@ -217,6 +261,26 @@ class PersistentRigctldClient:
         response = self._request(f"M {vfo} {mode} {passband_hz}")
         if response and response != "RPRT 0":
             raise RuntimeError(f"rigctld rejected VFO mode set: {response}")
+
+    def set_ctcss_tone(self, tone_tenths_hz: int) -> None:
+        response = self._request(f"C {tone_tenths_hz}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected CTCSS tone set: {response}")
+
+    def set_ctcss_tone_on_vfo(self, vfo: str, tone_tenths_hz: int) -> None:
+        response = self._request(f"C {vfo} {tone_tenths_hz}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected VFO CTCSS tone set: {response}")
+
+    def set_tone_enabled(self, enabled: bool) -> None:
+        response = self._request(f"U TONE {1 if enabled else 0}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected CTCSS encoder state: {response}")
+
+    def set_tone_enabled_on_vfo(self, vfo: str, enabled: bool) -> None:
+        response = self._request(f"U {vfo} TONE {1 if enabled else 0}")
+        if response and response != "RPRT 0":
+            raise RuntimeError(f"rigctld rejected VFO CTCSS encoder state: {response}")
 
     def set_split(self, enabled: bool, tx_vfo: str | None = None) -> None:
         command = f"S {1 if enabled else 0}"
@@ -253,11 +317,6 @@ class PersistentRigctldClient:
         response = self._request(f"V {vfo}")
         if response and response != "RPRT 0":
             raise RuntimeError(f"rigctld rejected VFO select: {response}")
-
-    def set_satmode(self, enabled: bool) -> None:
-        response = self._request(f"U SATMODE {1 if enabled else 0}")
-        if response and response != "RPRT 0":
-            raise RuntimeError(f"rigctld rejected SATMODE set: {response}")
 
     def __enter__(self) -> "PersistentRigctldClient":
         self.connect()

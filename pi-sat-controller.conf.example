@@ -29,7 +29,7 @@ satellite_44909 = RS-44
 enabled = false
 # Assign a configured CAT device from the My CAT Devices inventory.
 device_id = 
-# Select which VFO Hamlib should control for RX: current, A, or B.
+# Select a Hamlib-reported RX target, such as current, VFOA, VFOB, MAIN, or SUB.
 target_vfo = current
 # Enable verbose CAT/Hamlib command logging for this role.
 cat_debug_logging = false
@@ -38,7 +38,7 @@ cat_debug_logging = false
 enabled = false
 # Assign a configured CAT device from the My CAT Devices inventory.
 device_id = 
-# Select which VFO Hamlib should control for TX: current, A, or B.
+# Select a Hamlib-reported TX target, such as current, VFOA, VFOB, MAIN, or SUB.
 target_vfo = current
 # For one local radio serving both RX and TX, enable Hamlib split operation.
 # This remains a config-file-only compatibility option.
@@ -70,10 +70,8 @@ aos_script =
 los_script =
 
 [safety]
-tx_inhibit_below_horizon = true
-tx_inhibit_on_cat_loss = true
-tx_inhibit_without_valid_pass = true
 frequency_deadband_hz = 10
 cat_rate_limit_hz = 4
 tracking_update_interval_ms = 1000
 device_offline_failure_threshold = 3
+manual_offset_readback_active_pass_only = false

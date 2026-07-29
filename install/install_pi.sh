@@ -141,8 +141,10 @@ fi
 log_step "Enabling and starting Pi-Sat"
 log_info "Reloading systemd"
 sudo systemctl daemon-reload
-log_info "Enabling and starting ${SERVICE_NAME}"
-sudo systemctl enable --now "${SERVICE_NAME}"
+log_info "Enabling ${SERVICE_NAME}"
+sudo systemctl enable "${SERVICE_NAME}"
+log_info "Starting or restarting ${SERVICE_NAME} with the installed code"
+sudo systemctl restart "${SERVICE_NAME}"
 
 echo ""
 echo "Install complete."

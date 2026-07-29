@@ -7,6 +7,17 @@ from typing import Any
 from fastapi import Body, FastAPI, HTTPException, Query
 
 
+def _parse_boolean(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise HTTPException(status_code=400, detail=f"{field_name} must be a boolean")
+
+
 def register_tracking_api(
     app: FastAPI,
     *,
@@ -95,12 +106,18 @@ def register_tracking_api(
         norad_id = None
         frequency_profile_index = 0
         if payload:
-            raw_norad = payload.get("norad_id")
-            norad_id = int(raw_norad) if raw_norad else None
-            raw_profile_index = payload.get("frequency_profile_index")
-            frequency_profile_index = int(raw_profile_index) if raw_profile_index else 0
+            try:
+                raw_norad = payload.get("norad_id")
+                norad_id = int(raw_norad) if raw_norad else None
+                raw_profile_index = payload.get("frequency_profile_index")
+                frequency_profile_index = int(raw_profile_index) if raw_profile_index else 0
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="NORAD ID and frequency profile index must be integers",
+                ) from exc
         requested_sync = (
-            bool(payload["sync_offsets"])
+            _parse_boolean(payload["sync_offsets"], "sync_offsets")
             if payload and "sync_offsets" in payload
             else None
         )
@@ -125,7 +142,9 @@ def register_tracking_api(
         payload = payload or {}
         def reset(manager):
             if "sync_offsets" in payload:
-                manager.set_offset_sync(bool(payload["sync_offsets"]))
+                manager.set_offset_sync(
+                    _parse_boolean(payload["sync_offsets"], "sync_offsets")
+                )
             return manager.reset_offset()
 
         return mutate_rx_tracking_manager(
@@ -139,7 +158,9 @@ def register_tracking_api(
         return mutate_rx_tracking_manager(
             payload_norad_id(payload),
             payload_frequency_profile_index(payload),
-            lambda manager: manager.set_offset_sync(bool(payload.get("enabled", True))),
+            lambda manager: manager.set_offset_sync(
+                _parse_boolean(payload.get("enabled", True), "enabled")
+            ),
         ).to_dict()
 
     @app.post("/api/tracking/rx/step")
@@ -150,7 +171,9 @@ def register_tracking_api(
             raise HTTPException(status_code=400, detail="Request body must include integer step_hz") from exc
         def step(manager):
             if "sync_offsets" in payload:
-                manager.set_offset_sync(bool(payload["sync_offsets"]))
+                manager.set_offset_sync(
+                    _parse_boolean(payload["sync_offsets"], "sync_offsets")
+                )
             return manager.adjust_downlink_offset(step_hz)
 
         return mutate_rx_tracking_manager(
@@ -167,7 +190,9 @@ def register_tracking_api(
             raise HTTPException(status_code=400, detail="Request body must include integer step_hz") from exc
         def step(manager):
             if "sync_offsets" in payload:
-                manager.set_offset_sync(bool(payload["sync_offsets"]))
+                manager.set_offset_sync(
+                    _parse_boolean(payload["sync_offsets"], "sync_offsets")
+                )
             return manager.adjust_uplink_offset(step_hz)
 
         return mutate_rx_tracking_manager(

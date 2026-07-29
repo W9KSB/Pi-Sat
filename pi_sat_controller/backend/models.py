@@ -2,14 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
-
-
-class MasterMode(str, Enum):
-    SDR_MASTER = "SDR_MASTER"
-    RADIO_MASTER = "RADIO_MASTER"
-    CONTROLLER_MASTER = "CONTROLLER_MASTER"
-    MANUAL = "MANUAL"
 
 
 @dataclass(frozen=True)

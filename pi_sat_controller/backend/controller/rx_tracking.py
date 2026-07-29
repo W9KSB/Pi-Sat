@@ -7,6 +7,7 @@ control, optional TX radio control, and optional rotator coordination. Manual
 offsets remain stable user intent while Doppler is recalculated each cycle.
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
@@ -27,13 +28,17 @@ from pi_sat_controller.backend.models import (
 from pi_sat_controller.backend.orbital.doppler import doppler_shift_hz
 from pi_sat_controller.backend.orbital.orbital_engine import SatellitePosition
 from pi_sat_controller.backend.rotator.rotator_manager import RotatorManager
-from pi_sat_controller.backend.radio.radio_manager import RadioManager
+from pi_sat_controller.backend.radio.radio_manager import (
+    RadioManager,
+    normalize_hamlib_mode,
+)
 from pi_sat_controller.backend.sdr.polling_sdr import PollingSdrManager
 
 if TYPE_CHECKING:
     from pi_sat_controller.backend.orbital.skyfield_engine import SkyfieldEngine
 
 MAX_MANUAL_READBACK_DELTA_HZ = 2_000_000
+FM_SETUP_PASSBAND_HZ = 15_000
 
 
 def is_rx_only_profile(transponder: TransponderProfile) -> bool:
@@ -93,6 +98,8 @@ class RxTrackingManager:
         on_pass_start: Callable[[dict[str, Any]], None] | None = None,
         on_pass_end: Callable[[dict[str, Any]], None] | None = None,
         interval_s: float = 1.0,
+        cat_rate_limit_hz: int = 5,
+        manual_offset_readback_active_pass_only: bool = False,
     ) -> None:
         self.orbital_engine = orbital_engine
         self.sdr_manager = sdr_manager
@@ -104,20 +111,33 @@ class RxTrackingManager:
         self.on_pass_start = on_pass_start
         self.on_pass_end = on_pass_end
         self.interval_s = interval_s
+        self.cat_rate_limit_hz = max(1, int(cat_rate_limit_hz))
+        self.manual_offset_readback_active_pass_only = bool(
+            manual_offset_readback_active_pass_only
+        )
         self._stop = Event()
+        self._wake = Event()
         self._lock = Lock()
+        self._update_lock = Lock()
         self._thread: Thread | None = None
         self._active = False
         self._user_downlink_offset_hz = 0
         self._user_uplink_offset_hz = 0
         self._sync_offsets = True
+        self._sync_enable_pending = False
         self._rx_only = is_rx_only_profile(transponder)
         self._rx_session_ready = False
         self._tx_session_ready = False
+        self._rx_session_generation: int | None = None
+        self._tx_session_generation: int | None = None
         self._last_pass_active = False
         self._last_commanded_rx_hz: int | None = None
         self._last_commanded_tx_hz: int | None = None
+        self._last_observed_rx_hz: int | None = None
+        self._last_observed_tx_hz: int | None = None
         self._last_commanded_at = 0.0
+        self._last_rx_write_at = 0.0
+        self._last_tx_write_at = 0.0
         self._last_snapshot = RxTrackingSnapshot(
             active=False,
             pass_active=False,
@@ -146,19 +166,32 @@ class RxTrackingManager:
 
     def start(self) -> None:
         with self._lock:
+            was_active = self._active
             self._active = True
+            if not was_active:
+                self._rx_session_ready = False
+                self._tx_session_ready = False
+        self._set_background_polling_enabled(False)
         self.refresh_snapshot_only()
         if self._thread is None:
             self._thread = Thread(target=self._run, name="rx-tracker", daemon=True)
             self._thread.start()
+        else:
+            self._wake.set()
 
     def stop(self) -> None:
         with self._lock:
             self._active = False
             self._last_snapshot = replace(self._last_snapshot, active=False)
+        self._set_background_polling_enabled(True)
+        self._wake.set()
 
     def shutdown(self) -> None:
+        with self._lock:
+            self._active = False
+        self._set_background_polling_enabled(True)
         self._stop.set()
+        self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
@@ -169,15 +202,53 @@ class RxTrackingManager:
         sdr_manager: PollingSdrManager,
         tx_radio_manager: RadioManager | None,
         rotator_manager: RotatorManager | None,
+        manual_offset_readback_active_pass_only: bool | None = None,
     ) -> None:
         """Swaps runtime device managers without resetting tracking state."""
 
-        with self._lock:
-            self.sdr_manager = sdr_manager
-            self.tx_radio_manager = tx_radio_manager
-            self.rotator_manager = rotator_manager
-            self._rx_session_ready = False
-            self._tx_session_ready = False
+        with self._update_lock:
+            with self._lock:
+                self.sdr_manager = sdr_manager
+                self.tx_radio_manager = tx_radio_manager
+                self.rotator_manager = rotator_manager
+                self._rx_session_ready = False
+                self._tx_session_ready = False
+                self._rx_session_generation = None
+                self._tx_session_generation = None
+                if manual_offset_readback_active_pass_only is not None:
+                    self.manual_offset_readback_active_pass_only = bool(
+                        manual_offset_readback_active_pass_only
+                    )
+                active = self._active
+            self._set_background_polling_enabled(not active)
+
+    def update_target(
+        self,
+        satellite: SatelliteProfile,
+        transponder: TransponderProfile,
+    ) -> None:
+        """Retargets the live worker without destroying its thread or CAT runtime."""
+
+        with self._update_lock:
+            with self._lock:
+                self.satellite = satellite
+                self.transponder = transponder
+                self._rx_only = is_rx_only_profile(transponder)
+                self._user_downlink_offset_hz = 0
+                self._user_uplink_offset_hz = 0
+                self._sync_offsets = not self._rx_only
+                self._sync_enable_pending = False
+                self._rx_session_ready = False
+                self._tx_session_ready = False
+                self._last_pass_active = False
+                self._last_commanded_rx_hz = None
+                self._last_commanded_tx_hz = None
+                self._last_observed_rx_hz = None
+                self._last_observed_tx_hz = None
+                self._last_rx_write_at = 0.0
+                self._last_tx_write_at = 0.0
+        self.refresh_snapshot_only()
+        self._wake.set()
 
     def snapshot(self) -> RxTrackingSnapshot:
         with self._lock:
@@ -187,24 +258,24 @@ class RxTrackingManager:
         with self._lock:
             self._user_downlink_offset_hz = 0
             self._user_uplink_offset_hz = 0
-        return self._apply_current_plan(write_rx=False)
+            self._sync_enable_pending = False
+        snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
+        self._wake.set()
+        return snapshot
 
     def set_offset_sync(self, enabled: bool) -> RxTrackingSnapshot:
         with self._lock:
             sync_already_enabled = bool(self._sync_offsets)
-        if enabled and not self._rx_only and not sync_already_enabled:
-            baseline_error = self._capture_offset_sync_baseline()
-            if baseline_error is not None:
-                with self._lock:
-                    self._sync_offsets = False
-                return self._apply_current_plan(
-                    write_rx=False,
-                    write_tx=False,
-                    initial_errors=[baseline_error],
-                )
-        with self._lock:
+            sync_already_pending = bool(self._sync_enable_pending)
             self._sync_offsets = False if self._rx_only else enabled
-        return self._apply_current_plan(write_rx=False)
+            self._sync_enable_pending = bool(
+                enabled
+                and not self._rx_only
+                and (sync_already_pending or not sync_already_enabled)
+            )
+        snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
+        self._wake.set()
+        return snapshot
 
     def adjust_downlink_offset(self, delta_hz: int) -> RxTrackingSnapshot:
         with self._lock:
@@ -214,11 +285,15 @@ class RxTrackingManager:
                     delta_hz,
                     self.transponder,
                 )
-        return self._apply_current_plan(write_rx=False)
+        snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
+        self._wake.set()
+        return snapshot
 
     def adjust_uplink_offset(self, delta_hz: int) -> RxTrackingSnapshot:
         if self._rx_only:
-            return self._apply_current_plan(write_rx=False)
+            snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
+            self._wake.set()
+            return snapshot
         with self._lock:
             self._user_uplink_offset_hz += delta_hz
             sync_offsets = self._sync_offsets
@@ -227,13 +302,15 @@ class RxTrackingManager:
                     delta_hz,
                     self.transponder,
                 )
-        return self._apply_current_plan(write_rx=False)
+        snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
+        self._wake.set()
+        return snapshot
 
     def _apply_current_plan(
         self,
         write_rx: bool,
         *,
-        write_tx: bool = True,
+        write_tx: bool = False,
         initial_errors: list[str] | None = None,
     ) -> RxTrackingSnapshot:
         """Builds the current RX/TX plan and optionally writes it to hardware."""
@@ -254,8 +331,9 @@ class RxTrackingManager:
         commanded_rx_hz = self._last_commanded_rx_hz
         commanded_tx_hz = self._last_commanded_tx_hz
         errors: list[str] = list(initial_errors or [])
+        rx_frequency_written = False
+        tx_frequency_written = False
         if write_rx:
-            self._ensure_rx_session_state(errors)
             sdr_state = self.sdr_manager.try_set_frequency(plan.downlink_hz)
             if sdr_state.error:
                 errors.append(sdr_state.error)
@@ -264,18 +342,26 @@ class RxTrackingManager:
                 with self._lock:
                     self._last_commanded_rx_hz = plan.downlink_hz
                     self._last_commanded_at = monotonic()
+                rx_frequency_written = True
+
+        uses_split_mode = bool(
+            self.tx_radio_manager is not None
+            and getattr(self.tx_radio_manager, "split_mode_vfo", None)
+        )
+        if not self._rx_only and write_tx and uses_split_mode:
+            self._ensure_tx_session_state(errors)
 
         if (
             not self._rx_only
             and write_tx
             and plan.uplink_hz is not None
             and self.tx_radio_manager
+            and self._cat_write_due(self._last_tx_write_at)
             and (
                 commanded_tx_hz is None
                 or abs(commanded_tx_hz - plan.uplink_hz) > self.deadband_hz
             )
         ):
-            self._ensure_tx_session_state(errors)
             tx_state = self.tx_radio_manager.try_set_frequency(
                 plan.uplink_hz,
                 source="rx_tracking.apply_current_plan",
@@ -286,6 +372,13 @@ class RxTrackingManager:
                 commanded_tx_hz = plan.uplink_hz
                 with self._lock:
                     self._last_commanded_tx_hz = plan.uplink_hz
+                    self._last_tx_write_at = monotonic()
+                tx_frequency_written = True
+
+        if rx_frequency_written:
+            self._ensure_rx_session_state(errors)
+        if tx_frequency_written and not uses_split_mode:
+            self._ensure_tx_session_state(errors)
 
         with self._lock:
             self._last_snapshot = RxTrackingSnapshot(
@@ -319,88 +412,44 @@ class RxTrackingManager:
             )
             return self._last_snapshot
 
-    def _capture_offset_sync_baseline(self) -> str | None:
-        """Stores the current RX/TX hardware relationship as the sync baseline."""
-
-        with self._lock:
-            current = self._last_snapshot
-            tracking_active = self._active
-            pass_active = current.pass_active
-            user_downlink_offset = self._user_downlink_offset_hz
-            user_uplink_offset = self._user_uplink_offset_hz
-
-        if not tracking_active or not pass_active:
-            return None
-        if self.tx_radio_manager is None:
-            return "Cannot enable RX/TX offset sync: TX radio is unavailable."
-
-        rx_snapshot = self._fresh_rx_snapshot()
-        current_rx_hz = getattr(rx_snapshot, "frequency_hz", None)
-        rx_error = getattr(rx_snapshot, "error", None)
-        if rx_error:
-            return f"Cannot enable RX/TX offset sync: RX readback failed: {rx_error}"
-        if current_rx_hz is None:
-            return "Cannot enable RX/TX offset sync: RX frequency unavailable."
-
-        try:
-            current_tx_hz = self.tx_radio_manager.get_frequency()
-        except Exception as exc:
-            return f"Cannot enable RX/TX offset sync: TX readback failed: {exc}"
-        if current_tx_hz is None:
-            return "Cannot enable RX/TX offset sync: TX frequency unavailable."
-
-        downlink_doppler = current.downlink_doppler_hz or 0
-        uplink_doppler = current.uplink_doppler_hz or 0
-        next_user_downlink_offset = (
-            current_rx_hz - self.transponder.preferred_downlink - downlink_doppler
-        )
-        next_user_uplink_offset = (
-            current_tx_hz - self.transponder.preferred_uplink - uplink_doppler
-        )
-
-        downlink_delta = next_user_downlink_offset - user_downlink_offset
-        uplink_delta = next_user_uplink_offset - user_uplink_offset
-        if abs(downlink_delta) > MAX_MANUAL_READBACK_DELTA_HZ:
-            return (
-                "Cannot enable RX/TX offset sync: "
-                f"RX readback delta {downlink_delta:+,} Hz is out-of-band."
-            )
-        if abs(uplink_delta) > MAX_MANUAL_READBACK_DELTA_HZ:
-            return (
-                "Cannot enable RX/TX offset sync: "
-                f"TX readback delta {uplink_delta:+,} Hz is out-of-band."
-            )
-
-        with self._lock:
-            self._user_downlink_offset_hz = next_user_downlink_offset
-            self._user_uplink_offset_hz = next_user_uplink_offset
-            self._last_commanded_rx_hz = current_rx_hz
-            self._last_commanded_tx_hz = current_tx_hz
-            self._last_commanded_at = monotonic()
-        return None
-
     def _run(self) -> None:
+        next_update_at = 0.0
         while not self._stop.is_set():
             with self._lock:
                 active = self._active
-            if active:
-                self.update_once()
-            if self._stop.wait(self.interval_s):
-                break
+
+            if not active:
+                next_update_at = 0.0
+                self._wake.wait()
+                self._wake.clear()
+                continue
+
+            now = monotonic()
+            if now < next_update_at:
+                self._wake.wait(next_update_at - now)
+                self._wake.clear()
+                continue
+
+            self.update_once()
+            next_update_at = monotonic() + self.interval_s
+            self._wake.clear()
 
     def update_once(self) -> None:
-        try:
-            position = self.orbital_engine.get_position(self.satellite.norad_id)
-            self._apply_update(position, write_devices=True)
-        except Exception as exc:
-            self._record_error(str(exc))
+        with self._update_lock:
+            try:
+                with self._radio_operation_batch():
+                    position = self.orbital_engine.get_position(self.satellite.norad_id)
+                    self._apply_update(position, write_devices=True)
+            except Exception as exc:
+                self._record_error(str(exc))
 
     def refresh_snapshot_only(self) -> None:
-        try:
-            position = self.orbital_engine.get_position(self.satellite.norad_id)
-            self._apply_update(position, write_devices=False)
-        except Exception as exc:
-            self._record_error(str(exc))
+        with self._update_lock:
+            try:
+                position = self.orbital_engine.get_position(self.satellite.norad_id)
+                self._apply_update(position, write_devices=False)
+            except Exception as exc:
+                self._record_error(str(exc))
 
     def _apply_update(self, position: SatellitePosition, write_devices: bool) -> None:
         """Applies one orbital position update to SDR, TX, and rotator state."""
@@ -421,6 +470,7 @@ class RxTrackingManager:
             user_uplink_offset = self._user_uplink_offset_hz
             sync_offsets = False if self._rx_only else self._sync_offsets
             tracking_active = self._active
+            sync_enable_pending = self._sync_enable_pending
             last_commanded = self._last_commanded_rx_hz
             last_commanded_tx_hz = self._last_commanded_tx_hz
 
@@ -450,6 +500,9 @@ class RxTrackingManager:
             if rx_readback.ignored_error:
                 readback_errors.append(rx_readback.ignored_error)
             skip_rx_write = rx_readback.read_failed
+            if not rx_readback.read_failed and current_rx_hz is not None:
+                with self._lock:
+                    self._last_observed_rx_hz = current_rx_hz
 
             tx_readback = _ReadbackDelta(frequency_hz=None, delta_hz=None)
             if not self._rx_only and self.tx_radio_manager and plan.uplink_hz is not None:
@@ -462,10 +515,75 @@ class RxTrackingManager:
                 if tx_readback.ignored_error:
                     readback_errors.append(tx_readback.ignored_error)
                 skip_tx_write = tx_readback.read_failed
+                if not tx_readback.read_failed and current_tx_hz is not None:
+                    with self._lock:
+                        self._last_observed_tx_hz = current_tx_hz
 
             rx_delta = rx_readback.delta_hz
             tx_delta = tx_readback.delta_hz
-            if rx_delta is not None or tx_delta is not None:
+            if sync_enable_pending:
+                baseline_error: str | None = None
+                if rx_readback.read_failed or current_rx_hz is None:
+                    baseline_error = "Waiting for RX readback to enable offset sync."
+                elif self.tx_radio_manager is None:
+                    baseline_error = (
+                        "Cannot enable RX/TX offset sync: TX radio is unavailable."
+                    )
+                elif tx_readback.read_failed or current_tx_hz is None:
+                    baseline_error = "Waiting for TX readback to enable offset sync."
+                else:
+                    next_user_downlink_offset = (
+                        current_rx_hz
+                        - self.transponder.preferred_downlink
+                        - downlink_doppler
+                    )
+                    next_user_uplink_offset = (
+                        current_tx_hz
+                        - self.transponder.preferred_uplink
+                        - (uplink_doppler or 0)
+                    )
+                    downlink_delta = next_user_downlink_offset - user_offset
+                    uplink_delta = next_user_uplink_offset - user_uplink_offset
+                    if abs(downlink_delta) > MAX_MANUAL_READBACK_DELTA_HZ:
+                        baseline_error = (
+                            "Cannot enable RX/TX offset sync: "
+                            f"RX readback delta {downlink_delta:+,} Hz is out-of-band."
+                        )
+                    elif abs(uplink_delta) > MAX_MANUAL_READBACK_DELTA_HZ:
+                        baseline_error = (
+                            "Cannot enable RX/TX offset sync: "
+                            f"TX readback delta {uplink_delta:+,} Hz is out-of-band."
+                        )
+                    else:
+                        user_offset = next_user_downlink_offset
+                        user_uplink_offset = next_user_uplink_offset
+                        commanded_rx_hz = current_rx_hz
+                        commanded_tx_hz = current_tx_hz
+                        last_commanded = current_rx_hz
+                        last_commanded_tx_hz = current_tx_hz
+                        with self._lock:
+                            self._user_downlink_offset_hz = user_offset
+                            self._user_uplink_offset_hz = user_uplink_offset
+                            self._last_commanded_rx_hz = current_rx_hz
+                            self._last_commanded_tx_hz = current_tx_hz
+                            self._last_commanded_at = monotonic()
+                            self._sync_enable_pending = False
+                        plan = self._build_plan(
+                            user_offset,
+                            user_uplink_offset,
+                            downlink_doppler,
+                            uplink_doppler or 0,
+                        )
+                if baseline_error is not None:
+                    readback_errors.append(baseline_error)
+                    skip_rx_write = True
+                    skip_tx_write = True
+                    if baseline_error.startswith("Cannot enable"):
+                        sync_offsets = False
+                        with self._lock:
+                            self._sync_offsets = False
+                            self._sync_enable_pending = False
+            elif rx_delta is not None or tx_delta is not None:
                 if rx_delta is not None and tx_delta is not None and sync_offsets:
                     sync_offsets = False
                     readback_errors.append(
@@ -510,10 +628,20 @@ class RxTrackingManager:
                 )
 
         errors.extend(readback_errors)
-        if write_devices and not skip_rx_write and (
-            current_rx_hz is None or abs(current_rx_hz - plan.downlink_hz) > self.deadband_hz
+        rx_frequency_ready = bool(
+            current_rx_hz is not None
+            and abs(current_rx_hz - plan.downlink_hz) <= self.deadband_hz
+        )
+
+        if (
+            write_devices
+            and not skip_rx_write
+            and self._cat_write_due(self._last_rx_write_at)
+            and (
+                current_rx_hz is None
+                or abs(current_rx_hz - plan.downlink_hz) > self.deadband_hz
+            )
         ):
-            self._ensure_rx_session_state(errors)
             sdr_state = self.sdr_manager.try_set_frequency(plan.downlink_hz)
             if sdr_state.error:
                 errors.append(sdr_state.error)
@@ -522,6 +650,8 @@ class RxTrackingManager:
                 with self._lock:
                     self._last_commanded_rx_hz = plan.downlink_hz
                     self._last_commanded_at = monotonic()
+                    self._last_rx_write_at = self._last_commanded_at
+                rx_frequency_ready = True
 
         if self.rotator_manager is not None:
             self.rotator_manager.set_pass_active(
@@ -538,18 +668,35 @@ class RxTrackingManager:
                 except Exception as exc:
                     errors.append(str(exc))
 
+        tx_frequency_ready = bool(
+            plan.uplink_hz is not None
+            and current_tx_hz is not None
+            and abs(current_tx_hz - plan.uplink_hz) <= self.deadband_hz
+        )
+        tx_uses_split_mode = bool(
+            self.tx_radio_manager is not None
+            and getattr(self.tx_radio_manager, "split_mode_vfo", None)
+        )
         if (
             write_devices
-            and not skip_tx_write
             and not self._rx_only
+            and self.tx_radio_manager is not None
+            and tx_uses_split_mode
+        ):
+            self._ensure_tx_session_state(errors)
+
+        if (
+            write_devices
+            and not self._rx_only
+            and not skip_tx_write
             and plan.uplink_hz is not None
             and self.tx_radio_manager
             and (
                 current_tx_hz is None
                 or abs(current_tx_hz - plan.uplink_hz) > self.deadband_hz
             )
+            and self._cat_write_due(self._last_tx_write_at)
         ):
-            self._ensure_tx_session_state(errors)
             tx_state = self.tx_radio_manager.try_set_frequency(
                 plan.uplink_hz,
                 source="rx_tracking.update_once",
@@ -560,6 +707,20 @@ class RxTrackingManager:
                 commanded_tx_hz = plan.uplink_hz
                 with self._lock:
                     self._last_commanded_tx_hz = plan.uplink_hz
+                    self._last_tx_write_at = monotonic()
+                tx_frequency_ready = True
+
+        if write_devices and rx_frequency_ready:
+            self._ensure_rx_session_state(errors)
+
+        if (
+            write_devices
+            and not self._rx_only
+            and self.tx_radio_manager is not None
+            and tx_frequency_ready
+            and not tx_uses_split_mode
+        ):
+            self._ensure_tx_session_state(errors)
 
         with self._lock:
             if write_devices:
@@ -621,7 +782,10 @@ class RxTrackingManager:
         if (
             current_hz is None
             or not tracking_active
-            or not pass_active
+            or (
+                self.manual_offset_readback_active_pass_only
+                and not pass_active
+            )
             or last_commanded_hz is None
             or abs(current_hz - last_commanded_hz) <= self.deadband_hz
         ):
@@ -635,6 +799,7 @@ class RxTrackingManager:
                 ignored_error=(
                     f"Ignored RX readback delta {delta_hz:+,} Hz as out-of-band."
                 ),
+                read_failed=True,
             )
         return _ReadbackDelta(frequency_hz=current_hz, delta_hz=delta_hz)
 
@@ -658,7 +823,10 @@ class RxTrackingManager:
         if (
             current_hz is None
             or not tracking_active
-            or not pass_active
+            or (
+                self.manual_offset_readback_active_pass_only
+                and not pass_active
+            )
             or last_commanded_hz is None
             or abs(current_hz - last_commanded_hz) <= self.deadband_hz
         ):
@@ -672,6 +840,7 @@ class RxTrackingManager:
                 ignored_error=(
                     f"Ignored TX readback delta {delta_hz:+,} Hz as out-of-band."
                 ),
+                read_failed=True,
             )
         return _ReadbackDelta(frequency_hz=current_hz, delta_hz=delta_hz)
 
@@ -689,9 +858,31 @@ class RxTrackingManager:
                 return snapshot
         return self.sdr_manager.snapshot()
 
+    def _set_background_polling_enabled(self, enabled: bool) -> None:
+        setter = getattr(self.sdr_manager, "set_background_polling_enabled", None)
+        if setter is not None:
+            setter(enabled)
+
+    def _radio_operation_batch(self):
+        radio_manager = getattr(self.sdr_manager, "radio_manager", None)
+        client = getattr(radio_manager, "client", None)
+        operation_batch = getattr(client, "operation_batch", None)
+        if operation_batch is None:
+            return nullcontext()
+        return operation_batch()
+
     def _ensure_rx_session_state(self, errors: list[str] | None = None) -> None:
+        radio_manager = getattr(self.sdr_manager, "radio_manager", None)
+        if radio_manager is not None and hasattr(radio_manager, "connection_generation"):
+            generation = radio_manager.connection_generation()
+            if self._rx_session_generation != generation:
+                self._rx_session_ready = False
+                self._rx_session_generation = generation
         if self._rx_session_ready:
             return
+        # A transponder/start/reconnect setup is attempted once. A CAT error is
+        # reported, but it must not turn the tracking loop into a mode writer.
+        self._rx_session_ready = True
         session_errors: list[str] = []
         rx_target_vfo = getattr(
             getattr(self.sdr_manager, "radio_manager", None),
@@ -717,6 +908,10 @@ class RxTrackingManager:
             mode_state = self.sdr_manager.try_set_mode(
                 self.transponder.downlink_mode,
                 source="rx_tracking.session_setup",
+                force=True,
+                passband_hz=_session_setup_passband_hz(
+                    self.transponder.downlink_mode
+                ),
             )
             if mode_state.error:
                 session_errors.append(mode_state.error)
@@ -725,19 +920,32 @@ class RxTrackingManager:
                 self.sdr_manager.set_mode(
                     self.transponder.downlink_mode,
                     source="rx_tracking.session_setup",
+                    force=True,
+                    passband_hz=_session_setup_passband_hz(
+                        self.transponder.downlink_mode
+                    ),
                 )
             except Exception as exc:
                 session_errors.append(str(exc))
         if errors is not None and session_errors:
             errors.extend(session_errors)
-        if session_errors:
-            return
-        self._rx_session_ready = True
 
     def _ensure_tx_session_state(self, errors: list[str] | None = None) -> None:
+        if self.tx_radio_manager is not None and hasattr(
+            self.tx_radio_manager,
+            "connection_generation",
+        ):
+            generation = self.tx_radio_manager.connection_generation()
+            if self._tx_session_generation != generation:
+                self._tx_session_ready = False
+                self._tx_session_generation = generation
         if self._tx_session_ready or self.tx_radio_manager is None:
             return
+        # See RX setup above: setup errors are surfaced once, not retried on
+        # every Doppler update where they could overwrite operator changes.
+        self._tx_session_ready = True
         session_errors: list[str] = []
+        tone_errors: list[str] = []
         try:
             if getattr(self.tx_radio_manager, "split_mode_vfo", None):
                 self.tx_radio_manager.set_split_mode_enabled(
@@ -752,14 +960,29 @@ class RxTrackingManager:
             self.tx_radio_manager.set_mode(
                 self.transponder.uplink_mode,
                 source="rx_tracking.session_setup",
+                force=True,
+                passband_hz=_session_setup_passband_hz(
+                    self.transponder.uplink_mode
+                ),
             )
         except Exception as exc:
             session_errors.append(str(exc))
-        if errors is not None and session_errors:
+        if hasattr(
+            self.tx_radio_manager,
+            "try_set_ctcss_tone",
+        ):
+            tone_state = self.tx_radio_manager.try_set_ctcss_tone(
+                self.transponder.tone,
+                source="rx_tracking.session_setup",
+            )
+            if tone_state.error:
+                tone_errors.append(tone_state.error)
+        if errors is not None:
             errors.extend(session_errors)
-        if session_errors:
-            return
-        self._tx_session_ready = True
+            errors.extend(tone_errors)
+
+    def _cat_write_due(self, last_write_at: float) -> bool:
+        return monotonic() - last_write_at >= (1.0 / self.cat_rate_limit_hz)
 
     def _record_error(self, error: str) -> None:
         with self._lock:
@@ -853,6 +1076,13 @@ def _utc_now() -> str:
 
 def _python_float(value: Any) -> float:
     return float(value)
+
+
+def _session_setup_passband_hz(mode: str | None) -> int:
+    normalized_mode = normalize_hamlib_mode(mode)
+    if normalized_mode in {"FM", "PKTFM"}:
+        return FM_SETUP_PASSBAND_HZ
+    return 0
 
 
 def _python_int(value: Any) -> int:

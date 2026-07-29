@@ -24,6 +24,12 @@ class RadioClient(Protocol):
     def set_mode(self, mode: str, passband_hz: int = 0) -> None:
         ...
 
+    def set_ctcss_tone(self, tone_tenths_hz: int) -> None:
+        ...
+
+    def set_tone_enabled(self, enabled: bool) -> None:
+        ...
+
     def select_vfo(self, vfo: str) -> None:
         ...
 
@@ -76,7 +82,9 @@ class RadioManager:
         self._connected = False
         self._frequency_hz: int | None = None
         self._mode: str | None = None
+        self._ctcss_tone_tenths_hz: int | None = None
         self._vfo: str | None = None
+        self._client_generation: int | None = None
         self._last_read_at_utc: str | None = None
         self._last_write_at_utc: str | None = None
         self._error: str | None = None
@@ -106,6 +114,11 @@ class RadioManager:
                 last_write_at_utc=self._last_write_at_utc,
                 error=self._error,
             )
+
+    def connection_generation(self) -> int:
+        with self._lock:
+            self._refresh_client_generation_locked()
+            return self._client_generation or 0
 
     def get_frequency(self) -> int:
         with self._lock:
@@ -209,12 +222,21 @@ class RadioManager:
         mode: str,
         passband_hz: int = 0,
         source: str = "",
+        force: bool = False,
     ) -> RadioDeviceSnapshot:
         normalized_mode = normalize_hamlib_mode(mode)
-        if not self.write_enabled or normalized_mode is None:
+        if not self.write_enabled:
+            return self.snapshot()
+        if normalized_mode is None:
+            LOGGER.info(
+                "cat_command source=%s op=set_mode skipped=unsupported_profile_mode profile_mode=%s",
+                source or "unknown",
+                mode,
+            )
             return self.snapshot()
         with self._lock:
-            if self._mode == normalized_mode:
+            self._refresh_client_generation_locked()
+            if self._mode == normalized_mode and not force:
                 return self.snapshot()
 
             try:
@@ -266,14 +288,82 @@ class RadioManager:
             LOGGER.info("Radio mode connection restored")
         return self.snapshot()
 
+    def set_ctcss_tone(
+        self,
+        tone_hz: float | None,
+        source: str = "",
+    ) -> RadioDeviceSnapshot:
+        if not self.write_enabled:
+            return self.snapshot()
+        tone_tenths_hz = 0 if tone_hz is None else int(round(float(tone_hz) * 10.0))
+        if tone_tenths_hz < 0:
+            raise ValueError("CTCSS tone cannot be negative")
+        with self._lock:
+            self._refresh_client_generation_locked()
+            if self._ctcss_tone_tenths_hz == tone_tenths_hz:
+                return self.snapshot()
+            normalized_vfo = normalize_hamlib_vfo(self.target_vfo)
+            try:
+                LOGGER.info(
+                    "cat_command source=%s op=set_ctcss_tone tone_tenths_hz=%s",
+                    source or "unknown",
+                    tone_tenths_hz,
+                )
+                if hasattr(self.client, "set_ctcss_tone_on_vfo"):
+                    self.client.set_ctcss_tone_on_vfo(
+                        normalized_vfo,
+                        tone_tenths_hz,
+                    )
+                else:
+                    self._select_vfo_locked(
+                        normalized_vfo,
+                        source=source or "radio_manager.set_ctcss_tone",
+                    )
+                    self.client.set_ctcss_tone(tone_tenths_hz)
+                enabled = tone_tenths_hz > 0
+                if hasattr(self.client, "set_tone_enabled_on_vfo"):
+                    self.client.set_tone_enabled_on_vfo(normalized_vfo, enabled)
+                else:
+                    self.client.set_tone_enabled(enabled)
+            except RadioOperationDeferred:
+                raise
+            except Exception as exc:
+                self._record_error(exc)
+                raise
+            self._ctcss_tone_tenths_hz = tone_tenths_hz
+            self._last_write_at_utc = _utc_now()
+            self._error = None
+            self._consecutive_failures = 0
+        return self.snapshot()
+
+    def try_set_ctcss_tone(
+        self,
+        tone_hz: float | None,
+        source: str = "",
+    ) -> RadioDeviceSnapshot:
+        try:
+            return self.set_ctcss_tone(tone_hz, source=source)
+        except ValueError:
+            raise
+        except RadioOperationDeferred as exc:
+            return self._snapshot_with_error(str(exc))
+        except Exception as exc:
+            return self._snapshot_with_error(str(exc))
+
     def try_set_mode(
         self,
         mode: str,
         passband_hz: int = 0,
         source: str = "",
+        force: bool = False,
     ) -> RadioDeviceSnapshot:
         try:
-            return self.set_mode(mode, passband_hz=passband_hz, source=source)
+            return self.set_mode(
+                mode,
+                passband_hz=passband_hz,
+                source=source,
+                force=force,
+            )
         except RadioOperationDeferred as exc:
             return self._snapshot_with_error(str(exc))
         except Exception as exc:
@@ -400,6 +490,17 @@ class RadioManager:
             pass
         return self.snapshot()
 
+    def _refresh_client_generation_locked(self) -> None:
+        ensure_connected = getattr(self.client, "ensure_connected", None)
+        if ensure_connected is None:
+            return
+        generation = int(ensure_connected())
+        if self._client_generation is not None and generation != self._client_generation:
+            self._mode = None
+            self._ctcss_tone_tenths_hz = None
+            self._vfo = None
+        self._client_generation = generation
+
     def _snapshot_with_error(self, error: str) -> RadioDeviceSnapshot:
         state = self.snapshot()
         return RadioDeviceSnapshot(
@@ -450,11 +551,39 @@ def normalize_hamlib_mode(mode: str | None) -> str | None:
         "NFM": "FM",
         "FM-N": "FM",
         "FM-W": "WFM",
+        "FM-D": "PKTFM",
         "WIDEFM": "WFM",
         "PKT": "PKTFM",
         "PACKET": "PKTFM",
+        "AFSK": "PKTFM",
+        "SSTV": "FM",
     }
-    return mapping.get(first, first)
+    normalized = mapping.get(first, first)
+    supported_modes = {
+        "AM",
+        "AMS",
+        "CW",
+        "CWR",
+        "DD",
+        "DSB",
+        "DV",
+        "ECSSLSB",
+        "ECSSUSB",
+        "FAX",
+        "FM",
+        "LSB",
+        "PKTFM",
+        "PKTLSB",
+        "PKTUSB",
+        "RTTY",
+        "RTTYR",
+        "SAH",
+        "SAL",
+        "SAM",
+        "USB",
+        "WFM",
+    }
+    return normalized if normalized in supported_modes else None
 
 
 def normalize_hamlib_vfo(vfo: str | None) -> str | None:
@@ -466,5 +595,11 @@ def normalize_hamlib_vfo(vfo: str | None) -> str | None:
         "B": "VFOB",
         "VFOA": "VFOA",
         "VFOB": "VFOB",
+        "MAINA": "MainA",
+        "MAINB": "MainB",
+        "MAINC": "MainC",
+        "SUBA": "SubA",
+        "SUBB": "SubB",
+        "SUBC": "SubC",
     }
     return mapping.get(value, value)

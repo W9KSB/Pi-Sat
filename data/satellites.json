@@ -579,7 +579,7 @@
         "ratio": 1.0,
         "preferred_uplink": 145990000,
         "preferred_downlink": 437800000,
-        "tone": null
+        "tone": 67.0
       },
       {
         "name": "Mode V Imaging",
@@ -646,7 +646,7 @@
         "ratio": 1.0,
         "preferred_uplink": 145850000,
         "preferred_downlink": 436795000,
-        "tone": null
+        "tone": 67.0
       }
     ]
   },
