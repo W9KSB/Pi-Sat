@@ -25,7 +25,10 @@ from pi_sat_controller.backend.models import (
     SatelliteProfile,
     TransponderProfile,
 )
-from pi_sat_controller.backend.orbital.doppler import doppler_shift_hz
+from pi_sat_controller.backend.orbital.doppler import (
+    doppler_shift_hz,
+    uplink_doppler_correction_hz,
+)
 from pi_sat_controller.backend.orbital.orbital_engine import SatellitePosition
 from pi_sat_controller.backend.rotator.rotator_manager import RotatorManager
 from pi_sat_controller.backend.radio.radio_manager import (
@@ -460,7 +463,7 @@ class RxTrackingManager:
             self.transponder.preferred_downlink,
             position.range_rate_m_s,
         )
-        uplink_doppler = None if self._rx_only else doppler_shift_hz(
+        uplink_doppler = None if self._rx_only else uplink_doppler_correction_hz(
             self.transponder.preferred_uplink,
             position.range_rate_m_s,
         )

@@ -9,3 +9,15 @@ def doppler_shift_hz(frequency_hz: int, range_rate_m_s: float) -> int:
     """
     return round(-frequency_hz * range_rate_m_s / SPEED_OF_LIGHT_M_S)
 
+
+def uplink_doppler_correction_hz(
+    frequency_hz: int,
+    range_rate_m_s: float,
+) -> int:
+    """Return the ground-transmit correction needed for an uplink.
+
+    The transmitted uplink experiences the same physical shift on arrival at
+    the satellite, so the ground station must pre-correct in the opposite
+    direction from a received downlink.
+    """
+    return -doppler_shift_hz(frequency_hz, range_rate_m_s)
