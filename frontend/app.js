@@ -10,6 +10,7 @@ let managedSatelliteProfilesByNorad = new Map();
 let managedSatellitePassesByNorad = new Map();
 let trackedSatelliteNorads = new Set();
 let trackFilterLoaded = false;
+let manualOffsetsEnabled = true;
 let syncRxTx = true;
 let frontendLogMessages = [];
 let backendLogMessages = [];
@@ -25,10 +26,11 @@ let deviceControlUpdatesPending = 0;
 const pendingDeviceControlValues = {};
 let deviceControlFlushTimer = null;
 let deviceControlFlushActive = false;
-const pendingTrackingStepsHz = { rx: 0, tx: 0 };
+const pendingTrackingStepsHz = { rx: 0, tx: 0, virtualRit: 0 };
 let trackingStepFlushActive = false;
 let mapRefreshPending = false;
 let mapRefreshRequestedAtMs = 0;
+let manualOffsetsToggleUpdatePending = false;
 let syncToggleUpdatePending = false;
 let trackedSatelliteLocations = [];
 let stationLatitudeDeg = null;
@@ -444,6 +446,11 @@ async function stepTxFrequency(event) {
   queueTrackingOffsetStep('tx', stepHz);
 }
 
+async function stepVirtualRit(event) {
+  const stepHz = Number(event.currentTarget.dataset.virtualRitStepHz);
+  queueTrackingOffsetStep('virtualRit', stepHz);
+}
+
 function queueTrackingOffsetStep(role, stepHz) {
   pendingTrackingStepsHz[role] += stepHz;
   if (!trackingStepFlushActive) {
@@ -454,19 +461,31 @@ function queueTrackingOffsetStep(role, stepHz) {
 async function flushTrackingOffsetSteps() {
   trackingStepFlushActive = true;
   try {
-    while (pendingTrackingStepsHz.rx || pendingTrackingStepsHz.tx) {
-      const role = pendingTrackingStepsHz.rx ? 'rx' : 'tx';
+    while (
+      pendingTrackingStepsHz.rx
+      || pendingTrackingStepsHz.tx
+      || pendingTrackingStepsHz.virtualRit
+    ) {
+      const role = pendingTrackingStepsHz.rx
+        ? 'rx'
+        : (pendingTrackingStepsHz.tx ? 'tx' : 'virtualRit');
       const stepHz = pendingTrackingStepsHz[role];
       pendingTrackingStepsHz[role] = 0;
-      const response = await fetch(`/api/tracking/${role}/step`, {
+      const path = role === 'virtualRit'
+        ? '/api/tracking/rx/virtual-rit/step'
+        : `/api/tracking/${role}/step`;
+      const payload = {
+        step_hz: stepHz,
+        norad_id: selectedSatelliteNorad,
+        frequency_profile_index: selectedFrequencyProfileIndex,
+      };
+      if (role !== 'virtualRit') {
+        payload.sync_offsets = syncRxTx;
+      }
+      const response = await fetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          step_hz: stepHz,
-          norad_id: selectedSatelliteNorad,
-          frequency_profile_index: selectedFrequencyProfileIndex,
-          sync_offsets: syncRxTx,
-        }),
+        body: JSON.stringify(payload),
       });
       const result = await response.json();
       if (!response.ok) {
@@ -479,7 +498,11 @@ async function flushTrackingOffsetSteps() {
     addLog('Offset step failed.');
   } finally {
     trackingStepFlushActive = false;
-    if (pendingTrackingStepsHz.rx || pendingTrackingStepsHz.tx) {
+    if (
+      pendingTrackingStepsHz.rx
+      || pendingTrackingStepsHz.tx
+      || pendingTrackingStepsHz.virtualRit
+    ) {
       void flushTrackingOffsetSteps();
     }
   }
@@ -488,6 +511,37 @@ async function flushTrackingOffsetSteps() {
 function getSelectedFrequencyProfile() {
   const satellite = getSelectedSatellite();
   return satellite?.frequency_profiles?.[selectedFrequencyProfileIndex] || null;
+}
+
+async function updateManualOffsetsMode(event) {
+  const requestedValue = event.currentTarget.checked;
+  manualOffsetsEnabled = requestedValue;
+  manualOffsetsToggleUpdatePending = true;
+  updateManualOffsetControlState();
+  addLog(requestedValue ? 'Manual offsets enabled.' : 'Manual offsets disabled and reset.');
+  try {
+    const response = await fetch('/api/tracking/manual-offsets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: requestedValue,
+        norad_id: selectedSatelliteNorad,
+        frequency_profile_index: selectedFrequencyProfileIndex,
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.detail || 'Manual offset mode update failed.');
+    }
+    manualOffsetsToggleUpdatePending = false;
+    renderTracking(result);
+  } catch (error) {
+    manualOffsetsToggleUpdatePending = false;
+    manualOffsetsEnabled = !requestedValue;
+    event.currentTarget.checked = manualOffsetsEnabled;
+    updateManualOffsetControlState();
+    addLog('Manual offset mode update failed.');
+  }
 }
 
 async function updateSyncMode(event) {
@@ -523,13 +577,20 @@ async function postTrackingAction(path, statusText, options = {}) {
   addLog(statusText);
 
   try {
+    const includeTrackingSelection = Boolean(
+      options.includeTrackingSelection
+      || path.endsWith('/start')
+      || path.endsWith('/reset-offset')
+    );
     const response = await fetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: path.endsWith('/start') || path.endsWith('/reset-offset')
+      body: includeTrackingSelection
         ? JSON.stringify({
           norad_id: selectedSatelliteNorad,
           frequency_profile_index: selectedFrequencyProfileIndex,
+          // RX-only profiles leave the remembered RX/TX sync preference
+          // untouched, so this is false only after RX/TX sync was disabled.
           sync_offsets: syncRxTx,
         })
         : '{}',
@@ -843,10 +904,10 @@ function updateTxProfileState(profile) {
     txBadge.textContent = rxOnly ? 'Disabled (RX-only)' : 'Active';
   }
   document.querySelectorAll('[data-tx-step-hz]').forEach((button) => {
-    button.disabled = rxOnly;
+    button.disabled = rxOnly || !manualOffsetsEnabled;
   });
   if (syncToggle) {
-    syncToggle.disabled = rxOnly;
+    syncToggle.disabled = rxOnly || !manualOffsetsEnabled;
     if (rxOnly) {
       syncToggle.checked = false;
     } else {
@@ -854,8 +915,30 @@ function updateTxProfileState(profile) {
     }
   }
   if (syncLabel) {
-    syncLabel.classList.toggle('control-disabled', rxOnly);
+    syncLabel.classList.toggle('control-disabled', rxOnly || !manualOffsetsEnabled);
   }
+}
+
+function updateManualOffsetControlState() {
+  const toggle = document.getElementById('manual-offsets-toggle');
+  const resetButton = document.getElementById('reset-rx-offset');
+  const resetVirtualRitButton = document.getElementById('reset-virtual-rit');
+  if (toggle) {
+    toggle.checked = manualOffsetsEnabled;
+  }
+  document.querySelectorAll('[data-rx-step-hz]').forEach((button) => {
+    button.disabled = !manualOffsetsEnabled;
+  });
+  document.querySelectorAll('[data-virtual-rit-step-hz]').forEach((button) => {
+    button.disabled = !manualOffsetsEnabled;
+  });
+  if (resetButton) {
+    resetButton.disabled = !manualOffsetsEnabled;
+  }
+  if (resetVirtualRitButton) {
+    resetVirtualRitButton.disabled = !manualOffsetsEnabled;
+  }
+  updateTxProfileState(getSelectedFrequencyProfile());
 }
 
 async function persistAutotrackSetting(enabled) {
@@ -1613,6 +1696,7 @@ function buildCatDeviceCard(device) {
     buildCatDeviceField('Device ID', 'device_id', device.device_id || '', { inputClass: 'compact-input' }),
     buildCatDeviceField('Connectivity', 'connectivity', device.connectivity || '', { type: 'connectivity' }),
     buildCatDeviceField('Timeout (s)', 'timeout_s', device.timeout_s || '2.0', { inputMode: 'decimal', compactClass: 'settings-row-compact-sm' }),
+    buildCatDeviceField('Radio State Updates', 'state_updates', device.state_updates || 'automatic', { type: 'state_updates' }),
   );
   config.appendChild(topGrid);
 
@@ -1645,13 +1729,19 @@ function buildCatDeviceCard(device) {
   saveButton.textContent = 'Save';
   saveButton.addEventListener('click', () => saveCatDevice(card));
 
+  const testButton = document.createElement('button');
+  testButton.type = 'button';
+  testButton.className = 'btn btn-outline-primary btn-sm';
+  testButton.textContent = 'Test Radio';
+  testButton.addEventListener('click', () => testCatDevice(card));
+
   const removeButton = document.createElement('button');
   removeButton.type = 'button';
   removeButton.className = 'btn btn-outline-danger btn-sm';
   removeButton.textContent = 'Remove';
   removeButton.addEventListener('click', () => removeCatDevice(card));
 
-  buttons.append(saveButton, removeButton);
+  buttons.append(saveButton, testButton, removeButton);
   actions.appendChild(buttons);
 
   const status = document.createElement('div');
@@ -1695,6 +1785,19 @@ function buildCatDeviceField(label, key, value, options = {}) {
       control.appendChild(option);
     });
     control.value = value || '';
+  } else if (options.type === 'state_updates') {
+    control = document.createElement('select');
+    control.className = 'form-select';
+    [
+      ['automatic', 'Automatic (recommended)'],
+      ['polling', 'Polling only'],
+    ].forEach(([optionValue, optionLabel]) => {
+      const option = document.createElement('option');
+      option.value = optionValue;
+      option.textContent = optionLabel;
+      control.appendChild(option);
+    });
+    control.value = value === 'polling' ? 'polling' : 'automatic';
   } else if (options.type === 'serial_port') {
     control = buildSerialPortSelect(value);
   } else if (options.type === 'hamlib_model') {
@@ -2374,6 +2477,7 @@ function createEmptyCatDevice() {
     baud: '',
     model_id: '',
     timeout_s: '2.0',
+    state_updates: 'automatic',
   };
 }
 
@@ -2568,7 +2672,50 @@ function collectCatDeviceFromCard(card) {
     baud: String(values.baud || '').trim(),
     model_id: String(values.model_id || '').trim(),
     timeout_s: String(values.timeout_s || '').trim() || '2.0',
+    state_updates: values.state_updates === 'polling' ? 'polling' : 'automatic',
   };
+}
+
+async function testCatDevice(card) {
+  const status = card.querySelector('[data-cat-device-status]');
+  const device = collectCatDeviceFromCard(card);
+  if (status) {
+    status.textContent = 'Testing radio and state updates...';
+    status.classList.remove('is-error');
+  }
+  try {
+    const response = await fetch('/api/cat-devices/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      const message = result.detail || result.message || 'Radio test failed.';
+      if (status) {
+        status.textContent = message;
+        status.classList.add('is-error');
+      }
+      addLog(message);
+      return;
+    }
+    const testedDevice = { ...device, ...(result.details || {}) };
+    applyCatDeviceCapabilitiesToCard(card, testedDevice);
+    renderCatDeviceCapabilityChart(card);
+    const asyncMessage = String(result.details?.capability_async_notes || '').trim();
+    const message = `${result.message || 'Radio connected successfully.'}${asyncMessage ? ` ${asyncMessage}` : ''}`;
+    if (status) {
+      status.textContent = message;
+      status.classList.remove('is-error');
+    }
+    addLog(message);
+  } catch (error) {
+    if (status) {
+      status.textContent = 'Radio test failed.';
+      status.classList.add('is-error');
+    }
+    addLog('Radio test failed.');
+  }
 }
 
 async function saveCatDevice(card) {
@@ -2690,6 +2837,10 @@ function applyCatDeviceCapabilitiesToCard(card, device) {
   card.dataset.capabilityTargets = String(device.capability_targets || '').trim();
   card.dataset.capabilityLastTestUtc = String(device.capability_last_test_utc || '').trim();
   card.dataset.capabilityNotes = String(device.capability_notes || '').trim();
+  card.dataset.capabilityAsync = String(device.capability_async || '').trim().toLowerCase();
+  card.dataset.capabilityAsyncVersion = String(device.capability_async_version || '').trim();
+  card.dataset.capabilityAsyncProperties = String(device.capability_async_properties || '').trim();
+  card.dataset.capabilityAsyncNotes = String(device.capability_async_notes || '').trim();
 }
 
 function normalizeCapabilityValue(value) {
@@ -2724,9 +2875,28 @@ function renderCatDeviceCapabilityChart(card) {
     item.append(icon, text);
     container.appendChild(item);
   });
+  const asyncState = card.dataset.capabilityAsync || '';
+  const asyncItem = document.createElement('div');
+  asyncItem.className = 'device-capability-item';
+  const asyncIcon = document.createElement('span');
+  asyncIcon.className = `device-capability-icon capability-${asyncState || 'unknown'}`;
+  asyncIcon.textContent = asyncState === 'verified' ? '✓' : asyncState === 'available' ? '◐' : asyncState === 'unsupported' ? '✕' : '?';
+  const asyncLabel = document.createElement('span');
+  asyncLabel.className = 'device-capability-label';
+  asyncLabel.textContent = asyncState === 'verified'
+    ? 'Real-time updates active'
+    : asyncState === 'available'
+      ? 'Async available; awaiting verification'
+      : asyncState === 'unsupported'
+        ? 'Polling state updates'
+        : 'State updates not tested';
+  asyncItem.append(asyncIcon, asyncLabel);
+  container.appendChild(asyncItem);
   const notes = document.createElement('div');
   notes.className = 'device-capability-notes';
-  notes.textContent = card.dataset.capabilityNotes || 'Save device to populate device support when reachable.';
+  notes.textContent = [card.dataset.capabilityNotes, card.dataset.capabilityAsyncNotes]
+    .filter(Boolean)
+    .join(' ') || 'Save or test the device to populate device support when reachable.';
   container.appendChild(notes);
 }
 
@@ -3534,12 +3704,22 @@ function renderTracking(result) {
   }
   const syncToggle = document.getElementById('sync-rx-tx-toggle');
   if (
+    typeof result.manual_offsets_enabled === 'boolean'
+    && !manualOffsetsToggleUpdatePending
+  ) {
+    manualOffsetsEnabled = result.manual_offsets_enabled;
+    updateManualOffsetControlState();
+  }
+  if (
     syncToggle
     && typeof result.sync_offsets === 'boolean'
     && !syncToggleUpdatePending
   ) {
-    syncRxTx = result.sync_offsets;
-    syncToggle.checked = result.sync_offsets;
+    const profileSupportsSync = !isRxOnlyProfile(getSelectedFrequencyProfile());
+    if (profileSupportsSync) {
+      syncRxTx = result.sync_offsets;
+    }
+    syncToggle.checked = profileSupportsSync ? syncRxTx : false;
   }
   const autotrackToggle = document.getElementById('auto-track-toggle');
   if (autotrackToggle && typeof result.autotrack_next_pass === 'boolean') {
@@ -3557,6 +3737,8 @@ function renderTracking(result) {
     formatSignedHz(result.downlink_doppler_hz);
   document.getElementById('tracking-rx-offset').textContent =
     formatSignedHz(result.user_downlink_offset_hz);
+  document.getElementById('tracking-virtual-rit').textContent =
+    formatSignedHz(result.virtual_rit_hz);
   document.getElementById('tracking-target-rx').textContent =
     formatHz(result.target_rx_hz);
   document.getElementById('tracking-tx-center').textContent =
@@ -4365,6 +4547,7 @@ function escapeHtml(value) {
 
 updateDashboardMode();
 loadStatus();
+document.getElementById('manual-offsets-toggle').checked = manualOffsetsEnabled;
 document.getElementById('sync-rx-tx-toggle').checked = syncRxTx;
 loadSdrFrequency();
 loadRotator();
@@ -4403,6 +4586,9 @@ document
   .getElementById('rotator-control-toggle')
   .addEventListener('input', updateDeviceControl);
 document
+  .getElementById('manual-offsets-toggle')
+  .addEventListener('change', updateManualOffsetsMode);
+document
   .getElementById('sync-rx-tx-toggle')
   .addEventListener('change', updateSyncMode);
 document
@@ -4412,9 +4598,21 @@ document
   .querySelectorAll('[data-tx-step-hz]')
   .forEach((button) => button.addEventListener('click', stepTxFrequency));
 document
+  .querySelectorAll('[data-virtual-rit-step-hz]')
+  .forEach((button) => button.addEventListener('click', stepVirtualRit));
+document
   .getElementById('reset-rx-offset')
   .addEventListener('click', () =>
     postTrackingAction('/api/tracking/rx/reset-offset', 'Resetting RX offset...')
+  );
+document
+  .getElementById('reset-virtual-rit')
+  .addEventListener('click', () =>
+    postTrackingAction(
+      '/api/tracking/rx/virtual-rit/reset',
+      'Resetting Virtual RIT...',
+      { includeTrackingSelection: true }
+    )
   );
 document
   .getElementById('settings-form')

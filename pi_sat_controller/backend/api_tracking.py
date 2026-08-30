@@ -90,7 +90,9 @@ def register_tracking_api(
         if rx_tracking_manager is None:
             return {
                 "active": False,
+                "manual_offsets_enabled": True,
                 "sync_offsets": True,
+                "virtual_rit_hz": 0,
                 "frequency_profile_index": None,
                 "autotrack_next_pass": get_autotrack_enabled(),
                 "error": "RX tracking has not been started",
@@ -163,6 +165,16 @@ def register_tracking_api(
             ),
         ).to_dict()
 
+    @app.post("/api/tracking/manual-offsets")
+    def set_tracking_manual_offsets(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        return mutate_rx_tracking_manager(
+            payload_norad_id(payload),
+            payload_frequency_profile_index(payload),
+            lambda manager: manager.set_manual_offsets_enabled(
+                _parse_boolean(payload.get("enabled", True), "enabled")
+            ),
+        ).to_dict()
+
     @app.post("/api/tracking/rx/step")
     def step_rx_tracking_offset(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
         try:
@@ -180,6 +192,29 @@ def register_tracking_api(
             payload_norad_id(payload),
             payload_frequency_profile_index(payload),
             step,
+        ).to_dict()
+
+    @app.post("/api/tracking/rx/virtual-rit/step")
+    def step_rx_virtual_rit(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        try:
+            step_hz = int(payload["step_hz"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Request body must include integer step_hz",
+            ) from exc
+        return mutate_rx_tracking_manager(
+            payload_norad_id(payload),
+            payload_frequency_profile_index(payload),
+            lambda manager: manager.adjust_virtual_rit(step_hz),
+        ).to_dict()
+
+    @app.post("/api/tracking/rx/virtual-rit/reset")
+    def reset_rx_virtual_rit(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        return mutate_rx_tracking_manager(
+            payload_norad_id(payload),
+            payload_frequency_profile_index(payload),
+            lambda manager: manager.reset_virtual_rit(),
         ).to_dict()
 
     @app.post("/api/tracking/tx/step")

@@ -8,6 +8,7 @@ from typing import Any
 
 from pi_sat_controller.backend.radio.rigctld_client import PersistentRigctldClient
 from pi_sat_controller.backend.radio.radio_manager import RadioManager
+from pi_sat_controller.backend.radio.radio_state import RadioFrequencyObservation
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_FAILURE_THRESHOLD = 3
@@ -213,6 +214,12 @@ class PollingRadioFrequencyManager:
             last_write_at_utc=state.last_write_at_utc,
             error=state.error,
         )
+
+    def read_frequency_for_reconciliation(self) -> RadioFrequencyObservation:
+        return self.radio_manager.get_frequency_for_reconciliation()
+
+    def async_status(self) -> dict[str, object]:
+        return self.radio_manager.async_status()
 
     def set_frequency(self, frequency_hz: int) -> SdrDeviceSnapshot:
         state = self.radio_manager.set_frequency(

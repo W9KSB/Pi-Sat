@@ -202,6 +202,10 @@ def register_settings_api(
                         "capability_targets",
                         "capability_last_test_utc",
                         "capability_notes",
+                        "capability_async",
+                        "capability_async_version",
+                        "capability_async_properties",
+                        "capability_async_notes",
                     ):
                         if key not in merged_device:
                             merged_device[key] = existing_device.get(key, "")
@@ -274,6 +278,8 @@ def register_settings_api(
                             "capability_shared",
                             "capability_targets",
                             "capability_last_test_utc",
+                            "capability_async",
+                            "capability_async_version",
                         )
                     ) if existing_device else False
                     if cached_capability_exists:

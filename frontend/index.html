@@ -120,6 +120,10 @@
                     <div class="summary-box-label">Offset Controls</div>
                     <div class="summary-controls-row">
                       <label class="form-check form-switch sync-toggle mb-0">
+                        <span class="form-check-label">Enable Manual Offsets</span>
+                        <input class="form-check-input" type="checkbox" role="switch" id="manual-offsets-toggle" checked>
+                      </label>
+                      <label class="form-check form-switch sync-toggle mb-0">
                         <span class="form-check-label">Sync RX / TX Offsets</span>
                         <input class="form-check-input" type="checkbox" role="switch" id="sync-rx-tx-toggle" checked>
                       </label>
@@ -150,6 +154,25 @@
                           <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="100">+100 Hz</button>
                           <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="1000">+1000 Hz</button>
                         </div>
+                        <section class="virtual-rit-section" aria-labelledby="virtual-rit-heading">
+                          <div class="virtual-rit-header">
+                            <h4 class="virtual-rit-title mb-0" id="virtual-rit-heading">
+                              Virtual RIT <span class="text-body-secondary">(RX only)</span>
+                            </h4>
+                            <div class="virtual-rit-status">
+                              <output id="tracking-virtual-rit" aria-live="polite">0 Hz</output>
+                              <button type="button" class="btn btn-sm btn-outline-warning" id="reset-virtual-rit">Reset RIT</button>
+                            </div>
+                          </div>
+                          <div class="step-controls" aria-label="Virtual RIT step controls">
+                            <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="-250">-250 Hz</button>
+                            <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="-100">-100 Hz</button>
+                            <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="-10">-10 Hz</button>
+                            <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="10">+10 Hz</button>
+                            <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="100">+100 Hz</button>
+                            <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="250">+250 Hz</button>
+                          </div>
+                        </section>
                       </div>
                     </div>
                   </section>
@@ -174,6 +197,7 @@
                           <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="100">+100 Hz</button>
                           <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="1000">+1000 Hz</button>
                         </div>
+                        <div class="virtual-rit-placeholder" aria-hidden="true"></div>
                       </div>
                     </div>
                   </section>

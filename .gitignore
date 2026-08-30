@@ -1,5 +1,7 @@
 __pycache__/
 *.py[cod]
+.codex/
+.agents/
 .venv/
 venv/
 .pytest_cache/

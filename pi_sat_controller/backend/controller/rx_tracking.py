@@ -35,6 +35,7 @@ from pi_sat_controller.backend.radio.radio_manager import (
     RadioManager,
     normalize_hamlib_mode,
 )
+from pi_sat_controller.backend.radio.radio_state import RadioStateClassification
 from pi_sat_controller.backend.sdr.polling_sdr import PollingSdrManager
 
 if TYPE_CHECKING:
@@ -67,6 +68,8 @@ class RxTrackingSnapshot:
     uplink_doppler_hz: int | None
     user_downlink_offset_hz: int
     mapped_user_uplink_offset_hz: int | None
+    virtual_rit_hz: int
+    manual_offsets_enabled: bool
     sync_offsets: bool
     target_rx_hz: int | None
     calculated_tx_hz: int | None
@@ -84,6 +87,7 @@ class _ReadbackDelta:
     delta_hz: int | None
     ignored_error: str | None = None
     read_failed: bool = False
+    observed_frequency_hz: int | None = None
 
 
 class RxTrackingManager:
@@ -126,6 +130,8 @@ class RxTrackingManager:
         self._active = False
         self._user_downlink_offset_hz = 0
         self._user_uplink_offset_hz = 0
+        self._virtual_rit_hz = 0
+        self._manual_offsets_enabled = True
         self._sync_offsets = True
         self._sync_enable_pending = False
         self._rx_only = is_rx_only_profile(transponder)
@@ -159,6 +165,8 @@ class RxTrackingManager:
             uplink_doppler_hz=None,
             user_downlink_offset_hz=0,
             mapped_user_uplink_offset_hz=None,
+            virtual_rit_hz=0,
+            manual_offsets_enabled=True,
             sync_offsets=True,
             target_rx_hz=None,
             calculated_tx_hz=None,
@@ -239,6 +247,7 @@ class RxTrackingManager:
                 self._rx_only = is_rx_only_profile(transponder)
                 self._user_downlink_offset_hz = 0
                 self._user_uplink_offset_hz = 0
+                self._virtual_rit_hz = 0
                 self._sync_offsets = not self._rx_only
                 self._sync_enable_pending = False
                 self._rx_session_ready = False
@@ -261,7 +270,27 @@ class RxTrackingManager:
         with self._lock:
             self._user_downlink_offset_hz = 0
             self._user_uplink_offset_hz = 0
+            self._virtual_rit_hz = 0
             self._sync_enable_pending = False
+        snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
+        self._wake.set()
+        return snapshot
+
+    def reset_virtual_rit(self) -> RxTrackingSnapshot:
+        with self._lock:
+            self._virtual_rit_hz = 0
+        snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
+        self._wake.set()
+        return snapshot
+
+    def set_manual_offsets_enabled(self, enabled: bool) -> RxTrackingSnapshot:
+        with self._lock:
+            self._manual_offsets_enabled = bool(enabled)
+            if not enabled:
+                self._user_downlink_offset_hz = 0
+                self._user_uplink_offset_hz = 0
+                self._virtual_rit_hz = 0
+                self._sync_enable_pending = False
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
         self._wake.set()
         return snapshot
@@ -274,6 +303,7 @@ class RxTrackingManager:
             self._sync_enable_pending = bool(
                 enabled
                 and not self._rx_only
+                and self._manual_offsets_enabled
                 and (sync_already_pending or not sync_already_enabled)
             )
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
@@ -282,12 +312,22 @@ class RxTrackingManager:
 
     def adjust_downlink_offset(self, delta_hz: int) -> RxTrackingSnapshot:
         with self._lock:
-            self._user_downlink_offset_hz += delta_hz
-            if self._sync_offsets and not self._rx_only:
-                self._user_uplink_offset_hz += map_downlink_offset_to_uplink(
-                    delta_hz,
-                    self.transponder,
-                )
+            manual_offsets_enabled = self._manual_offsets_enabled
+            if manual_offsets_enabled:
+                self._user_downlink_offset_hz += delta_hz
+                if self._sync_offsets and not self._rx_only:
+                    self._user_uplink_offset_hz += map_downlink_offset_to_uplink(
+                        delta_hz,
+                        self.transponder,
+                    )
+        snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
+        self._wake.set()
+        return snapshot
+
+    def adjust_virtual_rit(self, delta_hz: int) -> RxTrackingSnapshot:
+        with self._lock:
+            if self._manual_offsets_enabled:
+                self._virtual_rit_hz += delta_hz
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
         self._wake.set()
         return snapshot
@@ -298,13 +338,15 @@ class RxTrackingManager:
             self._wake.set()
             return snapshot
         with self._lock:
-            self._user_uplink_offset_hz += delta_hz
-            sync_offsets = self._sync_offsets
-            if sync_offsets:
-                self._user_downlink_offset_hz += map_uplink_offset_to_downlink(
-                    delta_hz,
-                    self.transponder,
-                )
+            manual_offsets_enabled = self._manual_offsets_enabled
+            if manual_offsets_enabled:
+                self._user_uplink_offset_hz += delta_hz
+                sync_offsets = self._sync_offsets
+                if sync_offsets:
+                    self._user_downlink_offset_hz += map_uplink_offset_to_downlink(
+                        delta_hz,
+                        self.transponder,
+                    )
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
         self._wake.set()
         return snapshot
@@ -322,11 +364,14 @@ class RxTrackingManager:
             current = self._last_snapshot
             user_downlink_offset = self._user_downlink_offset_hz
             user_uplink_offset = self._user_uplink_offset_hz
+            virtual_rit_hz = self._virtual_rit_hz
+            manual_offsets_enabled = self._manual_offsets_enabled
             sync_offsets = False if self._rx_only else self._sync_offsets
 
         plan = self._build_plan(
             user_downlink_offset,
             user_uplink_offset,
+            virtual_rit_hz,
             current.downlink_doppler_hz or 0,
             current.uplink_doppler_hz or 0,
         )
@@ -406,6 +451,8 @@ class RxTrackingManager:
                 mapped_user_uplink_offset_hz=(
                     None if self._rx_only else _python_int(plan.mapped_user_uplink_offset_hz)
                 ),
+                virtual_rit_hz=_python_int(virtual_rit_hz),
+                manual_offsets_enabled=bool(manual_offsets_enabled),
                 sync_offsets=bool(sync_offsets),
                 target_rx_hz=_python_int(plan.downlink_hz),
                 calculated_tx_hz=None if self._rx_only else _python_int(plan.uplink_hz),
@@ -471,6 +518,8 @@ class RxTrackingManager:
         with self._lock:
             user_offset = self._user_downlink_offset_hz
             user_uplink_offset = self._user_uplink_offset_hz
+            virtual_rit_hz = self._virtual_rit_hz
+            manual_offsets_enabled = self._manual_offsets_enabled
             sync_offsets = False if self._rx_only else self._sync_offsets
             tracking_active = self._active
             sync_enable_pending = self._sync_enable_pending
@@ -484,6 +533,7 @@ class RxTrackingManager:
         plan = self._build_plan(
             user_offset,
             user_uplink_offset,
+            virtual_rit_hz,
             downlink_doppler,
             uplink_doppler or 0,
         )
@@ -505,7 +555,11 @@ class RxTrackingManager:
             skip_rx_write = rx_readback.read_failed
             if not rx_readback.read_failed and current_rx_hz is not None:
                 with self._lock:
-                    self._last_observed_rx_hz = current_rx_hz
+                    self._last_observed_rx_hz = (
+                        rx_readback.observed_frequency_hz
+                        if rx_readback.observed_frequency_hz is not None
+                        else current_rx_hz
+                    )
 
             tx_readback = _ReadbackDelta(frequency_hz=None, delta_hz=None)
             if not self._rx_only and self.tx_radio_manager and plan.uplink_hz is not None:
@@ -520,11 +574,15 @@ class RxTrackingManager:
                 skip_tx_write = tx_readback.read_failed
                 if not tx_readback.read_failed and current_tx_hz is not None:
                     with self._lock:
-                        self._last_observed_tx_hz = current_tx_hz
+                        self._last_observed_tx_hz = (
+                            tx_readback.observed_frequency_hz
+                            if tx_readback.observed_frequency_hz is not None
+                            else current_tx_hz
+                        )
 
             rx_delta = rx_readback.delta_hz
             tx_delta = tx_readback.delta_hz
-            if sync_enable_pending:
+            if sync_enable_pending and manual_offsets_enabled:
                 baseline_error: str | None = None
                 if rx_readback.read_failed or current_rx_hz is None:
                     baseline_error = "Waiting for RX readback to enable offset sync."
@@ -539,6 +597,7 @@ class RxTrackingManager:
                         current_rx_hz
                         - self.transponder.preferred_downlink
                         - downlink_doppler
+                        - virtual_rit_hz
                     )
                     next_user_uplink_offset = (
                         current_tx_hz
@@ -574,6 +633,7 @@ class RxTrackingManager:
                         plan = self._build_plan(
                             user_offset,
                             user_uplink_offset,
+                            virtual_rit_hz,
                             downlink_doppler,
                             uplink_doppler or 0,
                         )
@@ -586,7 +646,7 @@ class RxTrackingManager:
                         with self._lock:
                             self._sync_offsets = False
                             self._sync_enable_pending = False
-            elif rx_delta is not None or tx_delta is not None:
+            elif manual_offsets_enabled and (rx_delta is not None or tx_delta is not None):
                 if rx_delta is not None and tx_delta is not None and sync_offsets:
                     sync_offsets = False
                     readback_errors.append(
@@ -626,6 +686,7 @@ class RxTrackingManager:
                 plan = self._build_plan(
                     user_offset,
                     user_uplink_offset,
+                    virtual_rit_hz,
                     downlink_doppler,
                     uplink_doppler or 0,
                 )
@@ -754,6 +815,8 @@ class RxTrackingManager:
                 mapped_user_uplink_offset_hz=(
                     None if self._rx_only else _python_int(plan.mapped_user_uplink_offset_hz)
                 ),
+                virtual_rit_hz=_python_int(virtual_rit_hz),
+                manual_offsets_enabled=bool(manual_offsets_enabled),
                 sync_offsets=bool(sync_offsets),
                 target_rx_hz=_python_int(plan.downlink_hz),
                 calculated_tx_hz=None if self._rx_only else _python_int(plan.uplink_hz),
@@ -772,16 +835,44 @@ class RxTrackingManager:
         pass_active: bool,
         last_commanded_hz: int | None,
     ) -> _ReadbackDelta:
-        snapshot = self._fresh_rx_snapshot()
-        current_hz = getattr(snapshot, "frequency_hz", None)
-        error = getattr(snapshot, "error", None)
-        if error:
-            return _ReadbackDelta(
-                frequency_hz=current_hz,
-                delta_hz=None,
-                ignored_error=f"Skipped RX manual readback check: {error}",
-                read_failed=True,
-            )
+        observation_reader = getattr(
+            self.sdr_manager,
+            "read_frequency_for_reconciliation",
+            None,
+        )
+        if observation_reader is not None:
+            observation = observation_reader()
+            if observation.error:
+                return _ReadbackDelta(
+                    frequency_hz=observation.frequency_hz,
+                    delta_hz=None,
+                    ignored_error=f"Skipped RX manual readback check: {observation.error}",
+                    read_failed=True,
+                    observed_frequency_hz=observation.frequency_hz,
+                )
+            if not observation.from_poll and observation.classification != RadioStateClassification.EXTERNAL_CHANGE:
+                return _ReadbackDelta(
+                    frequency_hz=(
+                        last_commanded_hz
+                        if last_commanded_hz is not None
+                        else observation.frequency_hz
+                    ),
+                    delta_hz=None,
+                    observed_frequency_hz=observation.frequency_hz,
+                )
+            current_hz = observation.frequency_hz
+        else:
+            snapshot = self._fresh_rx_snapshot()
+            current_hz = getattr(snapshot, "frequency_hz", None)
+            error = getattr(snapshot, "error", None)
+            if error:
+                return _ReadbackDelta(
+                    frequency_hz=current_hz,
+                    delta_hz=None,
+                    ignored_error=f"Skipped RX manual readback check: {error}",
+                    read_failed=True,
+                    observed_frequency_hz=current_hz,
+                )
         if (
             current_hz is None
             or not tracking_active
@@ -792,7 +883,11 @@ class RxTrackingManager:
             or last_commanded_hz is None
             or abs(current_hz - last_commanded_hz) <= self.deadband_hz
         ):
-            return _ReadbackDelta(frequency_hz=current_hz, delta_hz=None)
+            return _ReadbackDelta(
+                frequency_hz=current_hz,
+                delta_hz=None,
+                observed_frequency_hz=current_hz,
+            )
 
         delta_hz = current_hz - last_commanded_hz
         if abs(delta_hz) > MAX_MANUAL_READBACK_DELTA_HZ:
@@ -803,8 +898,13 @@ class RxTrackingManager:
                     f"Ignored RX readback delta {delta_hz:+,} Hz as out-of-band."
                 ),
                 read_failed=True,
+                observed_frequency_hz=current_hz,
             )
-        return _ReadbackDelta(frequency_hz=current_hz, delta_hz=delta_hz)
+        return _ReadbackDelta(
+            frequency_hz=current_hz,
+            delta_hz=delta_hz,
+            observed_frequency_hz=current_hz,
+        )
 
     def _read_tx_frequency_for_reconciliation(
         self,
@@ -814,8 +914,29 @@ class RxTrackingManager:
     ) -> _ReadbackDelta:
         if self.tx_radio_manager is None:
             return _ReadbackDelta(frequency_hz=None, delta_hz=None)
+        observation_reader = getattr(
+            self.tx_radio_manager,
+            "get_frequency_for_reconciliation",
+            None,
+        )
         try:
-            current_hz = self.tx_radio_manager.get_frequency()
+            if observation_reader is not None:
+                observation = observation_reader()
+                if observation.error:
+                    raise RuntimeError(observation.error)
+                if not observation.from_poll and observation.classification != RadioStateClassification.EXTERNAL_CHANGE:
+                    return _ReadbackDelta(
+                        frequency_hz=(
+                            last_commanded_hz
+                            if last_commanded_hz is not None
+                            else observation.frequency_hz
+                        ),
+                        delta_hz=None,
+                        observed_frequency_hz=observation.frequency_hz,
+                    )
+                current_hz = observation.frequency_hz
+            else:
+                current_hz = self.tx_radio_manager.get_frequency()
         except Exception as exc:
             return _ReadbackDelta(
                 frequency_hz=None,
@@ -833,7 +954,11 @@ class RxTrackingManager:
             or last_commanded_hz is None
             or abs(current_hz - last_commanded_hz) <= self.deadband_hz
         ):
-            return _ReadbackDelta(frequency_hz=current_hz, delta_hz=None)
+            return _ReadbackDelta(
+                frequency_hz=current_hz,
+                delta_hz=None,
+                observed_frequency_hz=current_hz,
+            )
 
         delta_hz = current_hz - last_commanded_hz
         if abs(delta_hz) > MAX_MANUAL_READBACK_DELTA_HZ:
@@ -844,8 +969,13 @@ class RxTrackingManager:
                     f"Ignored TX readback delta {delta_hz:+,} Hz as out-of-band."
                 ),
                 read_failed=True,
+                observed_frequency_hz=current_hz,
             )
-        return _ReadbackDelta(frequency_hz=current_hz, delta_hz=delta_hz)
+        return _ReadbackDelta(
+            frequency_hz=current_hz,
+            delta_hz=delta_hz,
+            observed_frequency_hz=current_hz,
+        )
 
     def _fresh_rx_snapshot(self) -> Any:
         if hasattr(self.sdr_manager, "read_frequency_once"):
@@ -1010,6 +1140,8 @@ class RxTrackingManager:
                 mapped_user_uplink_offset_hz=(
                     None if self._rx_only else current.mapped_user_uplink_offset_hz
                 ),
+                virtual_rit_hz=_python_int(self._virtual_rit_hz),
+                manual_offsets_enabled=bool(self._manual_offsets_enabled),
                 sync_offsets=bool(False if self._rx_only else self._sync_offsets),
                 target_rx_hz=current.target_rx_hz,
                 calculated_tx_hz=None if self._rx_only else current.calculated_tx_hz,
@@ -1048,6 +1180,7 @@ class RxTrackingManager:
         self,
         user_downlink_offset_hz: int,
         user_uplink_offset_hz: int,
+        virtual_rit_hz: int,
         downlink_doppler_hz: int,
         uplink_doppler_hz: int,
     ):
@@ -1057,6 +1190,7 @@ class RxTrackingManager:
                     self.transponder.preferred_downlink
                     + downlink_doppler_hz
                     + user_downlink_offset_hz
+                    + virtual_rit_hz
                 ),
                 uplink_hz=None,
                 user_downlink_offset_hz=user_downlink_offset_hz,
@@ -1064,13 +1198,14 @@ class RxTrackingManager:
                 downlink_doppler_hz=downlink_doppler_hz,
                 uplink_doppler_hz=None,
             )
-        return plan_from_offsets(
+        plan = plan_from_offsets(
             transponder=self.transponder,
             user_downlink_offset_hz=user_downlink_offset_hz,
             user_uplink_offset_hz=user_uplink_offset_hz,
             downlink_doppler_hz=downlink_doppler_hz,
             uplink_doppler_hz=uplink_doppler_hz,
         )
+        return replace(plan, downlink_hz=plan.downlink_hz + virtual_rit_hz)
 
 
 def _utc_now() -> str:

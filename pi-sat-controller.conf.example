@@ -25,6 +25,10 @@ satellite_25544 = ISS
 satellite_27607 = SO-50
 satellite_44909 = RS-44
 
+# CAT device sections are created from Settings > My Devices. Local radio
+# sections default to: state_updates = automatic
+# Select state_updates = polling to disable pushed updates for that radio.
+
 [rx]
 enabled = false
 # Assign a configured CAT device from the My CAT Devices inventory.

@@ -227,6 +227,70 @@ def _build_status_payload() -> dict[str, object]:
     }
 
 
+def _load_cat_devices_with_runtime_state() -> list[dict[str, str]]:
+    devices = [dict(device) for device in load_cat_devices()]
+    try:
+        current_config = load_config()
+    except Exception:
+        return devices
+
+    runtime_sources = (
+        (current_config.rx.device_id, sdr_manager),
+        (current_config.tx.device_id, tx_radio_manager),
+    )
+    status_by_device: dict[str, dict[str, object]] = {}
+    for device_id, manager in runtime_sources:
+        status_reader = getattr(manager, "async_status", None)
+        if not device_id or status_reader is None:
+            continue
+        try:
+            status = dict(status_reader())
+        except Exception:
+            continue
+        existing = status_by_device.get(device_id)
+        if existing is None:
+            status_by_device[device_id] = status
+            continue
+        combined_properties = sorted(
+            {
+                str(value)
+                for value in (
+                    list(existing.get("verified_properties", []))
+                    + list(status.get("verified_properties", []))
+                )
+            }
+        )
+        states = {str(existing.get("state", "")), str(status.get("state", ""))}
+        existing["state"] = (
+            "verified" if "verified" in states else "available" if "available" in states else "unsupported"
+        )
+        existing["verified_properties"] = combined_properties
+
+    for device in devices:
+        device_id = str(device.get("device_id", ""))
+        status = status_by_device.get(device_id)
+        if status is None:
+            continue
+        state = str(status.get("state", "unsupported"))
+        properties = [str(value) for value in status.get("verified_properties", [])]
+        device["capability_async"] = state
+        device["capability_async_version"] = str(status.get("hamlib_version") or "")
+        device["capability_async_properties"] = ",".join(properties)
+        if str(status.get("preference", "automatic")) == "polling":
+            note = "Polling Only is selected; real-time pushed updates are disabled."
+        elif state == "verified":
+            note = (
+                f"Real-time updates active for {', '.join(properties) or 'radio state'}; "
+                "slow reconciliation polling remains enabled."
+            )
+        elif state == "available":
+            note = "Async available, waiting for verification; normal polling remains active."
+        else:
+            note = "Polling - async updates are unavailable or the listener is not healthy."
+        device["capability_async_notes"] = note
+    return devices
+
+
 def _build_hamlib_radio_models_payload() -> dict[str, object]:
     return {
         "available": not hamlib_radio_models_error,
@@ -489,6 +553,7 @@ def _reload_runtime_config_locked() -> list[str]:
                 debug_logging=bool(config.rx.cat_debug_logging or config.tx.cat_debug_logging),
                 role_label="shared",
                 vfo_mode=True,
+                state_updates=config.rx.state_updates,
             )
             shared_controller = SharedLocalRadioController(
                 client=shared_local_client,
@@ -960,6 +1025,14 @@ def _start_autotrack_pass(satellite_pass: SatellitePass) -> bool:
 
 
 def _run_pre_aos_automation(satellite_pass: SatellitePass) -> None:
+    if not _rx_or_tx_control_enabled():
+        LOGGER.info(
+            "Skipping AOS automation because RX and TX control are disabled "
+            "satellite=%s norad=%s",
+            satellite_pass.satellite_name,
+            satellite_pass.norad_id,
+        )
+        return
     _trigger_automation_script_event(
         "aos",
         _automation_context_for_pass(satellite_pass, "AOS"),
@@ -967,10 +1040,23 @@ def _run_pre_aos_automation(satellite_pass: SatellitePass) -> None:
 
 
 def _run_timed_los_automation(satellite_pass: SatellitePass) -> None:
+    if not _rx_or_tx_control_enabled():
+        LOGGER.info(
+            "Skipping LOS automation because RX and TX control are disabled "
+            "satellite=%s norad=%s",
+            satellite_pass.satellite_name,
+            satellite_pass.norad_id,
+        )
+        return
     _trigger_automation_script_event(
         "los",
         _automation_context_for_pass(satellite_pass, "LOS"),
     )
+
+
+def _rx_or_tx_control_enabled() -> bool:
+    config = load_config()
+    return bool(config.rx.enabled or config.tx.enabled)
 
 
 def _automation_context_for_pass(
@@ -1289,7 +1375,7 @@ register_settings_api(
     logger=LOGGER,
     settings_schema=SETTINGS_SCHEMA,
     load_settings=load_settings,
-    load_cat_devices=load_cat_devices,
+    load_cat_devices=_load_cat_devices_with_runtime_state,
     save_settings=save_settings,
     reload_runtime_config=_reload_runtime_config,
     reload_rotator_config_only=_reload_rotator_config_only,

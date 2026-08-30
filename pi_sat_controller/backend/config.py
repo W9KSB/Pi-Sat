@@ -79,6 +79,7 @@ class CatDeviceConfig:
     baud: int | None
     model_id: int | None
     timeout_s: float
+    state_updates: str = "automatic"
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class DeviceConfig:
     # Device writes are now controlled solely by the runtime enabled toggle.
     write_enabled: bool
     timeout_s: float
+    state_updates: str = "automatic"
     shared_local_split_mode: bool = False
     cat_debug_logging: bool = False
     min_elevation_deg: float | None = None
@@ -259,6 +261,11 @@ def _load_device(
             if base_device
             else _get_float(parser, section, "timeout_s", fallback=2.0)
         ),
+        state_updates=(
+            base_device.state_updates
+            if base_device
+            else parser.get(section, "state_updates", fallback="automatic")
+        ),
         min_elevation_deg=_get_optional_float(parser, section, "min_elevation_deg"),
         home_azimuth_deg=_get_optional_float(parser, section, "home_azimuth_deg"),
         home_elevation_deg=_get_optional_float(parser, section, "home_elevation_deg"),
@@ -347,6 +354,7 @@ CAT_DEVICE_FIELDS = [
     "baud",
     "model_id",
     "timeout_s",
+    "state_updates",
     "capability_comm",
     "capability_ptt",
     "capability_vfo",
@@ -354,6 +362,10 @@ CAT_DEVICE_FIELDS = [
     "capability_targets",
     "capability_last_test_utc",
     "capability_notes",
+    "capability_async",
+    "capability_async_version",
+    "capability_async_properties",
+    "capability_async_notes",
 ]
 
 
@@ -794,6 +806,7 @@ def load_cat_devices(
             "baud": "" if device.baud is None else str(device.baud),
             "model_id": "" if device.model_id is None else str(device.model_id),
             "timeout_s": str(device.timeout_s),
+            "state_updates": device.state_updates,
             "capability_comm": _load_cat_device_metadata(
                 parser, device.device_id, "capability_comm"
             ),
@@ -814,6 +827,18 @@ def load_cat_devices(
             ),
             "capability_notes": _load_cat_device_metadata(
                 parser, device.device_id, "capability_notes"
+            ),
+            "capability_async": _load_cat_device_metadata(
+                parser, device.device_id, "capability_async"
+            ),
+            "capability_async_version": _load_cat_device_metadata(
+                parser, device.device_id, "capability_async_version"
+            ),
+            "capability_async_properties": _load_cat_device_metadata(
+                parser, device.device_id, "capability_async_properties"
+            ),
+            "capability_async_notes": _load_cat_device_metadata(
+                parser, device.device_id, "capability_async_notes"
             ),
         }
         for device in _load_cat_devices(parser).values()
@@ -838,6 +863,9 @@ def _load_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig]:
             baud=_get_optional_int(parser, section, "baud"),
             model_id=_get_optional_int(parser, section, "model_id"),
             timeout_s=_get_float(parser, section, "timeout_s", fallback=2.0),
+            state_updates=_normalize_state_updates(
+                parser.get(section, "state_updates", fallback="automatic")
+            ),
         )
     if explicit:
         return explicit
@@ -888,6 +916,7 @@ def _build_legacy_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig
                     baud=existing.baud,
                     model_id=existing.model_id,
                     timeout_s=existing.timeout_s,
+                    state_updates=existing.state_updates,
                 )
             continue
         device_id = f"legacy-{role}"
@@ -904,6 +933,9 @@ def _build_legacy_cat_devices(parser: ConfigParser) -> dict[str, CatDeviceConfig
             baud=baud,
             model_id=model_id,
             timeout_s=_get_float(parser, role, "timeout_s", fallback=2.0),
+            state_updates=_normalize_state_updates(
+                parser.get(role, "state_updates", fallback="automatic")
+            ),
         )
     return legacy_devices
 
@@ -965,6 +997,9 @@ def _normalize_cat_devices(
                 "baud": stringify_optional_int(raw_device.get("baud")),
                 "model_id": stringify_optional_int(raw_device.get("model_id")),
                 "timeout_s": str(parse_float_value(raw_device.get("timeout_s"), 2.0)),
+                "state_updates": _normalize_state_updates(
+                    raw_device.get("state_updates", "automatic")
+                ),
                 "capability_comm": stringify_capability_value(raw_device.get("capability_comm")),
                 "capability_ptt": stringify_capability_value(raw_device.get("capability_ptt")),
                 "capability_vfo": stringify_capability_value(raw_device.get("capability_vfo")),
@@ -972,6 +1007,10 @@ def _normalize_cat_devices(
                 "capability_targets": str(raw_device.get("capability_targets", "")).strip(),
                 "capability_last_test_utc": str(raw_device.get("capability_last_test_utc", "")).strip(),
                 "capability_notes": str(raw_device.get("capability_notes", "")).strip(),
+                "capability_async": str(raw_device.get("capability_async", "")).strip(),
+                "capability_async_version": str(raw_device.get("capability_async_version", "")).strip(),
+                "capability_async_properties": str(raw_device.get("capability_async_properties", "")).strip(),
+                "capability_async_notes": str(raw_device.get("capability_async_notes", "")).strip(),
             }
         )
     return normalized, id_mapping
@@ -984,6 +1023,10 @@ def normalize_cat_device_id(value: Any, fallback: str = "") -> str:
         for character in device_id
     ).strip("-_")
     return device_id or fallback
+
+
+def _normalize_state_updates(value: Any) -> str:
+    return "polling" if str(value or "").strip().lower() == "polling" else "automatic"
 
 
 def parse_int_value(value: Any, fallback: int) -> int:

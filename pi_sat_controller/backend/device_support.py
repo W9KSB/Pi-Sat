@@ -56,6 +56,8 @@ def _device_config_from_cat_device_entry(device_settings: dict[str, Any]) -> Dev
         shared_local_split_mode=False,
         write_enabled=True,
         timeout_s=parse_float_setting(device_settings.get("timeout_s"), 2.0) or 2.0,
+        state_updates=str(device_settings.get("state_updates", "automatic")).strip()
+        or "automatic",
         cat_debug_logging=False,
     )
 
@@ -123,6 +125,12 @@ def device_config_from_settings(
             if base_device_config is not None
             else parse_float_setting(section_settings.get("timeout_s"), 2.0) or 2.0
         ),
+        state_updates=(
+            base_device_config.state_updates
+            if base_device_config is not None
+            else str(section_settings.get("state_updates", "automatic")).strip()
+            or "automatic"
+        ),
         cat_debug_logging=parse_bool_setting(
             section_settings.get("cat_debug_logging"),
             False,
@@ -141,6 +149,7 @@ def device_endpoint_details(role: str, device_config: DeviceConfig) -> dict[str,
     details: dict[str, object] = {
         "connectivity": device_config.connectivity,
         "timeout_s": device_config.timeout_s,
+        "state_updates": device_config.state_updates,
     }
     if device_config.connectivity == "network":
         details["host"] = device_config.host
@@ -185,6 +194,7 @@ def build_radio_client(device_config, role: str, shared_local_client=None):
             debug_logging=device_config.cat_debug_logging,
             role_label=role.lower(),
             vfo_mode=target_vfo is not None,
+            state_updates=device_config.state_updates,
         )
     raise ValueError(f"Unsupported TX connectivity: {device_config.connectivity}")
 
@@ -331,6 +341,7 @@ def run_cat_device_test(
                 debug_logging=device_config.cat_debug_logging,
                 role_label="cat-device-test",
                 vfo_mode=True,
+                state_updates=device_config.state_updates,
             )
             client.ensure_connected()
         else:
@@ -401,9 +412,32 @@ def run_cat_device_test(
             capability_shared,
             device_config.connectivity,
         )
+        if isinstance(client, LocalHamlibClient):
+            async_status = client.async_status()
+            details["capability_async"] = async_status["state"]
+            details["capability_async_version"] = async_status.get("hamlib_version") or ""
+            details["capability_async_properties"] = ",".join(
+                str(value) for value in async_status.get("verified_properties", [])
+            )
+            details["capability_async_notes"] = _build_async_capability_notes(async_status)
+            logger.info(
+                "CAT device test Hamlib version=%s async_state=%s backend_supported=%s listener_running=%s verified_properties=%s",
+                async_status.get("hamlib_version"),
+                async_status.get("state"),
+                async_status.get("backend_supported"),
+                async_status.get("listener_running"),
+                async_status.get("verified_properties"),
+            )
+        else:
+            details["capability_async"] = "unsupported"
+            details["capability_async_version"] = ""
+            details["capability_async_properties"] = ""
+            details["capability_async_notes"] = (
+                "Polling is used for external rigctld endpoints because Pi-Sat does not own their async configuration."
+            )
         return {
             "ok": True,
-            "message": "Capability test complete.",
+            "message": "Radio connected successfully.",
             "details": details,
         }
     except Exception as exc:
@@ -416,6 +450,10 @@ def run_cat_device_test(
         details["capability_targets"] = ""
         details["capability_last_test_utc"] = datetime.now(timezone.utc).isoformat()
         details["capability_notes"] = "Communication failed."
+        details["capability_async"] = "unsupported"
+        details["capability_async_version"] = ""
+        details["capability_async_properties"] = ""
+        details["capability_async_notes"] = "Async capability could not be tested because radio communication failed."
         return {
             "ok": False,
             "message": "Capability test failed.",
@@ -469,6 +507,29 @@ def _build_capability_notes(
     if not missing:
         return "Basic CAT communication succeeded."
     return f"Missing {' and '.join(missing)}. Single role capable only."
+
+
+def _build_async_capability_notes(status: dict[str, object]) -> str:
+    preference = str(status.get("preference", "automatic"))
+    state = str(status.get("state", "unsupported"))
+    if preference == "polling":
+        return "Polling Only is selected; real-time pushed updates are disabled."
+    if state == "verified":
+        properties = ", ".join(str(value) for value in status.get("verified_properties", []))
+        return (
+            f"Real-time pushed updates verified for {properties or 'radio state'}. "
+            "Pi-Sat will keep slow reconciliation polling."
+        )
+    if state == "available":
+        return (
+            "Real-time pushed updates are available and the listener started. "
+            "Pi-Sat will continue normal polling until a valid async state change is received."
+        )
+    reason = str(status.get("reason", "")).strip()
+    return (
+        "Real-time pushed updates are not available for this radio/Hamlib backend. "
+        f"Pi-Sat will use polling.{f' {reason}' if reason else ''}"
+    )
 
 
 def _load_hamlib_caps_output(device_config: DeviceConfig) -> str:

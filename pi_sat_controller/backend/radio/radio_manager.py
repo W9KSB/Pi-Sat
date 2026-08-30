@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 from threading import RLock
+from time import monotonic
 from typing import Any, Protocol
+
+from pi_sat_controller.backend.radio.radio_state import (
+    ASYNC_RECONCILIATION_MISS_THRESHOLD,
+    ASYNC_RECONCILIATION_POLL_S,
+    PENDING_EXTERNAL_EVENT_WINDOW_S,
+    RadioFrequencyObservation,
+    RadioStateClassification,
+    RadioStateEvent,
+    RadioStateProperty,
+)
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_FAILURE_THRESHOLD = 3
@@ -90,6 +102,9 @@ class RadioManager:
         self._error: str | None = None
         self._consecutive_failures = 0
         self._failure_threshold = max(1, int(failure_threshold))
+        self._pending_state_events: deque[RadioStateEvent] = deque(maxlen=64)
+        self._last_reconciliation_poll_at = 0.0
+        self._async_reconciliation_misses = 0
 
     def _select_vfo_locked(self, vfo: str | None, source: str = "") -> None:
         normalized_vfo = normalize_hamlib_vfo(vfo)
@@ -104,6 +119,7 @@ class RadioManager:
         self._vfo = normalized_vfo
 
     def snapshot(self) -> RadioDeviceSnapshot:
+        self.refresh_async_state()
         with self._lock:
             return RadioDeviceSnapshot(
                 enabled=self.enabled,
@@ -114,6 +130,161 @@ class RadioManager:
                 last_write_at_utc=self._last_write_at_utc,
                 error=self._error,
             )
+
+    def refresh_async_state(self) -> list[RadioStateEvent]:
+        drain = getattr(self.client, "drain_radio_state_events", None)
+        if drain is None:
+            return []
+        try:
+            events = list(drain())
+        except Exception as exc:
+            LOGGER.warning("Unable to consume async radio state: %s", exc)
+            return []
+        if not events:
+            return []
+        with self._lock:
+            for event in events:
+                if event.property == RadioStateProperty.FREQUENCY:
+                    if not event.requires_reconciliation:
+                        try:
+                            self._frequency_hz = int(event.value)
+                        except (TypeError, ValueError):
+                            continue
+                        self._last_read_at_utc = _utc_now()
+                        self._async_reconciliation_misses = 0
+                elif event.property == RadioStateProperty.MODE:
+                    if not event.requires_reconciliation:
+                        self._mode = str(event.value)
+                elif event.property == RadioStateProperty.VFO:
+                    if not event.requires_reconciliation:
+                        self._vfo = str(event.value)
+                self._connected = True
+                self._error = None
+                self._consecutive_failures = 0
+                self._pending_state_events.append(event)
+        return events
+
+    def is_async_property_verified(self, property: RadioStateProperty | str) -> bool:
+        checker = getattr(self.client, "is_async_property_verified", None)
+        return bool(checker and checker(property))
+
+    def async_status(self) -> dict[str, object]:
+        status = getattr(self.client, "async_status", None)
+        if status is None:
+            return {
+                "preference": "polling",
+                "state": "unsupported",
+                "available": False,
+                "healthy": False,
+                "verified_properties": [],
+            }
+        return dict(status())
+
+    def get_frequency_for_reconciliation(self) -> RadioFrequencyObservation:
+        self.refresh_async_state()
+        now = monotonic()
+        external_event: RadioStateEvent | None = None
+        self_echo_seen = False
+        requires_reconciliation = False
+        with self._lock:
+            while (
+                self._pending_state_events
+                and now - self._pending_state_events[0].timestamp
+                > PENDING_EXTERNAL_EVENT_WINDOW_S
+            ):
+                self._pending_state_events.popleft()
+            retained: deque[RadioStateEvent] = deque(maxlen=64)
+            while self._pending_state_events:
+                event = self._pending_state_events.popleft()
+                if event.property != RadioStateProperty.FREQUENCY:
+                    retained.append(event)
+                    continue
+                if event.requires_reconciliation:
+                    requires_reconciliation = True
+                elif event.classification == RadioStateClassification.EXTERNAL_CHANGE:
+                    external_event = event
+                elif event.classification == RadioStateClassification.SELF_ECHO:
+                    self_echo_seen = True
+            self._pending_state_events = retained
+            cached_frequency = self._frequency_hz
+            reconciliation_due = (
+                now - self._last_reconciliation_poll_at >= ASYNC_RECONCILIATION_POLL_S
+            )
+
+        if external_event is not None:
+            return RadioFrequencyObservation(
+                frequency_hz=int(external_event.value),
+                classification=RadioStateClassification.EXTERNAL_CHANGE,
+                timestamp=external_event.timestamp,
+            )
+
+        async_verified = self.is_async_property_verified(RadioStateProperty.FREQUENCY)
+        if async_verified and not requires_reconciliation and not reconciliation_due:
+            return RadioFrequencyObservation(
+                frequency_hz=cached_frequency,
+                classification=(
+                    RadioStateClassification.SELF_ECHO
+                    if self_echo_seen
+                    else RadioStateClassification.STATE_REFRESH
+                ),
+                timestamp=now,
+            )
+
+        try:
+            frequency_hz = self.get_frequency()
+        except Exception as exc:
+            return RadioFrequencyObservation(
+                frequency_hz=cached_frequency,
+                classification=RadioStateClassification.STATE_REFRESH,
+                timestamp=now,
+                from_poll=True,
+                error=str(exc),
+            )
+        classification = RadioStateClassification.STATE_REFRESH
+        if async_verified and cached_frequency is not None:
+            if frequency_hz != cached_frequency:
+                classification = RadioStateClassification.EXTERNAL_CHANGE
+                with self._lock:
+                    self._async_reconciliation_misses += 1
+                    mismatch_count = self._async_reconciliation_misses
+                LOGGER.info(
+                    "async_reconciliation_miss vfo=%s cached=%s polled=%s "
+                    "count=%s/%s recovered_by_poll",
+                    self.target_vfo or "current",
+                    cached_frequency,
+                    frequency_hz,
+                    mismatch_count,
+                    ASYNC_RECONCILIATION_MISS_THRESHOLD,
+                )
+                if mismatch_count >= ASYNC_RECONCILIATION_MISS_THRESHOLD:
+                    marker = getattr(
+                        self.client,
+                        "mark_async_property_unverified",
+                        None,
+                    )
+                    if marker is not None:
+                        marker(
+                            RadioStateProperty.FREQUENCY,
+                            reason=(
+                                "repeated_reconciliation_mismatch "
+                                f"count={mismatch_count} "
+                                f"cached={cached_frequency} polled={frequency_hz}"
+                            ),
+                        )
+                    with self._lock:
+                        self._async_reconciliation_misses = 0
+            else:
+                with self._lock:
+                    self._async_reconciliation_misses = 0
+        elif not async_verified:
+            with self._lock:
+                self._async_reconciliation_misses = 0
+        return RadioFrequencyObservation(
+            frequency_hz=frequency_hz,
+            classification=classification,
+            timestamp=now,
+            from_poll=True,
+        )
 
     def connection_generation(self) -> int:
         with self._lock:
@@ -143,6 +314,7 @@ class RadioManager:
             self._connected = True
             self._frequency_hz = frequency_hz
             self._last_read_at_utc = _utc_now()
+            self._last_reconciliation_poll_at = monotonic()
             self._error = None
             self._consecutive_failures = 0
         if not was_connected:
@@ -481,13 +653,9 @@ class RadioManager:
 
     def poll_once(self) -> RadioDeviceSnapshot:
         if not self.read_poll_enabled:
+            self.refresh_async_state()
             return self.snapshot()
-        try:
-            self.get_frequency()
-        except RadioOperationDeferred:
-            pass
-        except Exception:
-            pass
+        self.get_frequency_for_reconciliation()
         return self.snapshot()
 
     def _refresh_client_generation_locked(self) -> None:
@@ -499,6 +667,9 @@ class RadioManager:
             self._mode = None
             self._ctcss_tone_tenths_hz = None
             self._vfo = None
+            self._pending_state_events.clear()
+            self._last_reconciliation_poll_at = 0.0
+            self._async_reconciliation_misses = 0
         self._client_generation = generation
 
     def _snapshot_with_error(self, error: str) -> RadioDeviceSnapshot:

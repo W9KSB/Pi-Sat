@@ -47,6 +47,8 @@ Want more infomation about how you can get started? Be sure to check out the wik
   - `rotctl`
   - `rotctld`
 
+Hamlib 4.6 or newer can reduce radio read traffic by publishing generic asynchronous state updates. This optimization is optional: Pi-Sat detects the installed version and selected backend at runtime and retains normal polling when it is unavailable. Raspberry Pi OS Trixie's Hamlib 4.6.2 package is supported. See [Radio State Updates](docs/radio-state-updates.md) for behavior and hardware test procedures.
+
 ## Quick Install
 
 Run this on the Pi as the normal user:
