@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query
 
-from pi_sat_controller.backend.config import load_config
+from pi_sat_controller.backend.config import config_transaction, load_config
 from pi_sat_controller.backend.models import MySatellite, SatelliteProfile
 from pi_sat_controller.backend.satellites.satellite_profiles import (
     load_satellite_profiles,
@@ -19,6 +19,17 @@ from pi_sat_controller.backend.satellites.transponder_source_client import (
 )
 
 
+def _parse_boolean(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise HTTPException(status_code=400, detail=f"{field_name} must be a boolean")
+
+
 def register_satellites_api(
     app: FastAPI,
     *,
@@ -26,14 +37,15 @@ def register_satellites_api(
     serialize_frequency_profiles: Callable[[list[Any]], list[dict[str, object]]],
     qth_timezone_from_config: Callable[[], str],
     build_orbital_engine: Callable[[], Any],
-    load_my_satellites: Callable[[], tuple[list[Any], float, bool]],
-    save_my_satellites: Callable[[list[Any], float, bool], None],
+    load_my_satellites: Callable[[], tuple[list[Any], float, bool, set[int]]],
+    save_my_satellites: Callable[[list[Any], float, bool, set[int]], None],
     ensure_pass_cache: Callable[[], None],
     refresh_pass_cache: Callable[[bool], list[Any]],
     get_pass_cache: Callable[[], list[Any]],
     pass_cache_lock: Lock,
     pass_to_dict: Callable[[Any], dict[str, object]],
     get_pass_cache_refreshed_at_utc: Callable[[], str | None],
+    on_autotrack_changed: Callable[[bool], None],
 ) -> None:
     @app.get("/api/satellites")
     def get_satellites() -> list[dict[str, object]]:
@@ -42,7 +54,7 @@ def register_satellites_api(
             satellite.norad_id: satellite
             for satellite in load_satellite_profiles(config.profiles.satellites_file)
         }
-        my_satellites, _, _ = load_my_satellites()
+        my_satellites, _, _, _ = load_my_satellites()
         return [
             {
                 "name": my_satellite.name,
@@ -84,7 +96,7 @@ def register_satellites_api(
     @app.post("/api/frequency-profiles/{norad_id}/update")
     def update_frequency_profiles(norad_id: int) -> dict[str, object]:
         config = load_config()
-        my_satellites, _, _ = load_my_satellites()
+        my_satellites, _, _, _ = load_my_satellites()
         satellite_name = next(
             (
                 satellite.name
@@ -150,7 +162,7 @@ def register_satellites_api(
 
     @app.get("/api/my-satellites")
     def get_my_satellites() -> dict[str, object]:
-        satellites, min_elevation, autotrack = load_my_satellites()
+        satellites, min_elevation, autotrack, autotrack_norads = load_my_satellites()
         return {
             "satellites": [
                 {"norad_id": satellite.norad_id, "name": satellite.name}
@@ -158,6 +170,7 @@ def register_satellites_api(
             ],
             "min_pass_elevation_deg": min_elevation,
             "autotrack_next_pass": autotrack,
+            "autotrack_norad_ids": sorted(autotrack_norads),
         }
 
     @app.post("/api/my-satellites")
@@ -174,31 +187,100 @@ def register_satellites_api(
                 detail=f"NORAD {norad_id} was not found in the current TLE cache",
             )
 
-        satellites, min_elevation, autotrack = load_my_satellites()
-        name = str(payload.get("name") or engine.satellites[norad_id].name or norad_id)
-        updated = [satellite for satellite in satellites if satellite.norad_id != norad_id]
-        updated.append(MySatellite(norad_id=norad_id, name=name))
-        save_my_satellites(updated, min_elevation, autotrack)
+        with config_transaction():
+            satellites, min_elevation, autotrack, autotrack_norads = load_my_satellites()
+            name = str(payload.get("name") or engine.satellites[norad_id].name or norad_id)
+            updated = [satellite for satellite in satellites if satellite.norad_id != norad_id]
+            updated.append(MySatellite(norad_id=norad_id, name=name))
+            save_my_satellites(updated, min_elevation, autotrack, autotrack_norads)
+        refresh_pass_cache(False)
         return get_my_satellites()
 
     @app.delete("/api/my-satellites/{norad_id}")
     def delete_my_satellite(norad_id: int) -> dict[str, object]:
-        satellites, min_elevation, autotrack = load_my_satellites()
-        save_my_satellites(
-            [satellite for satellite in satellites if satellite.norad_id != norad_id],
-            min_elevation,
-            autotrack,
-        )
+        with config_transaction():
+            satellites, min_elevation, autotrack, autotrack_norads = load_my_satellites()
+            save_my_satellites(
+                [satellite for satellite in satellites if satellite.norad_id != norad_id],
+                min_elevation,
+                autotrack,
+                autotrack_norads,
+            )
+        refresh_pass_cache(False)
         return get_my_satellites()
 
     @app.post("/api/my-satellites/options")
     def update_my_satellite_options(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
-        satellites, min_elevation, autotrack = load_my_satellites()
+        with config_transaction():
+            satellites, min_elevation, autotrack, autotrack_norads = load_my_satellites()
+            if "min_pass_elevation_deg" in payload:
+                try:
+                    min_elevation = float(payload["min_pass_elevation_deg"])
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Minimum elevation must be a valid number",
+                    ) from exc
+                if not 0.0 <= min_elevation <= 90.0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Minimum elevation must be between 0 and 90 degrees",
+                    )
+            if "autotrack_next_pass" in payload:
+                autotrack = _parse_boolean(
+                    payload["autotrack_next_pass"],
+                    "autotrack_next_pass",
+                )
+            if "autotrack_norad_id" in payload:
+                try:
+                    changed_norad = int(payload["autotrack_norad_id"])
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="autotrack_norad_id must be an integer",
+                    ) from exc
+                configured_norads = {satellite.norad_id for satellite in satellites}
+                if changed_norad not in configured_norads:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unknown tracked NORAD ID: {changed_norad}",
+                    )
+                if _parse_boolean(payload.get("autotrack_enabled"), "autotrack_enabled"):
+                    autotrack_norads.add(changed_norad)
+                else:
+                    autotrack_norads.discard(changed_norad)
+            if "autotrack_norad_ids" in payload:
+                try:
+                    requested_norads = {
+                        int(norad_id) for norad_id in payload["autotrack_norad_ids"]
+                    }
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Autotrack NORAD IDs must be a list of integers",
+                    ) from exc
+                configured_norads = {satellite.norad_id for satellite in satellites}
+                unknown_norads = requested_norads - configured_norads
+                if unknown_norads:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unknown tracked NORAD IDs: {sorted(unknown_norads)}",
+                    )
+                autotrack_norads = requested_norads
+            save_my_satellites(
+                satellites,
+                min_elevation,
+                autotrack,
+                autotrack_norads,
+            )
         if "min_pass_elevation_deg" in payload:
-            min_elevation = float(payload["min_pass_elevation_deg"])
-        if "autotrack_next_pass" in payload:
-            autotrack = bool(payload["autotrack_next_pass"])
-        save_my_satellites(satellites, min_elevation, autotrack)
+            refresh_pass_cache(False)
+        if (
+            "autotrack_next_pass" in payload
+            or "autotrack_norad_ids" in payload
+            or "autotrack_norad_id" in payload
+        ):
+            on_autotrack_changed(autotrack)
         return get_my_satellites()
 
     @app.get("/api/my-satellites/passes")
@@ -211,7 +293,7 @@ def register_satellites_api(
 
         now_utc = datetime.now(timezone.utc)
         horizon_utc = now_utc + timedelta(hours=hours)
-        satellites, _, _ = load_my_satellites()
+        satellites, _, _, _ = load_my_satellites()
         selected_norad_ids = {satellite.norad_id for satellite in satellites}
 
         grouped: dict[int, list[dict[str, object]]] = {norad_id: [] for norad_id in selected_norad_ids}
@@ -271,7 +353,7 @@ def register_satellites_api(
             logger.exception("Pass cache refresh failed while serving /api/passes/next")
             return []
         now_utc = datetime.now(timezone.utc)
-        satellites, _, _ = load_my_satellites()
+        satellites, _, _, _ = load_my_satellites()
         if norad_ids:
             selected_norads = {
                 int(value.strip())
@@ -305,7 +387,7 @@ def register_satellites_api(
                 "timezone": qth_timezone_from_config(),
                 "positions": [],
             }
-        satellites, _, _ = load_my_satellites()
+        satellites, _, _, _ = load_my_satellites()
         if norad_ids:
             selected_norads = {
                 int(value.strip())

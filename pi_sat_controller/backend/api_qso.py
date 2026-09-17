@@ -16,7 +16,7 @@ def register_qso_api(
     app: FastAPI,
     *,
     resolve_tle_cache_file: Callable[[], Any],
-    load_my_satellites: Callable[[], tuple[list[Any], float, bool]],
+    load_my_satellites: Callable[[], tuple[list[Any], float, bool, set[int]]],
     build_qso_opportunities: Callable[..., list[dict[str, object]]],
 ) -> None:
     @app.post("/api/qso-finder/search")
@@ -24,9 +24,20 @@ def register_qso_api(
         grid_1 = str(payload.get("grid_1", "")).strip()
         grid_2 = str(payload.get("grid_2", "")).strip()
         satellite_filter = payload.get("norad_id")
-        min_elevation_deg = float(payload.get("min_elevation_deg", 10.0))
-        hours = int(payload.get("hours", 48))
-        min_duration_minutes = float(payload.get("min_duration_minutes", 2.0))
+        try:
+            min_elevation_deg = float(payload.get("min_elevation_deg", 10.0))
+            hours = int(payload.get("hours", 48))
+            min_duration_minutes = float(payload.get("min_duration_minutes", 2.0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Elevation, hours, and duration must be valid numbers.",
+            ) from exc
+        if not all(
+            math.isfinite(value)
+            for value in (min_elevation_deg, float(hours), min_duration_minutes)
+        ):
+            raise HTTPException(status_code=400, detail="Numeric values must be finite.")
 
         if not grid_1 or not grid_2:
             raise HTTPException(status_code=400, detail="Both grid locators are required.")

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import time
 
 from pi_sat_controller.backend.config import PROJECT_ROOT
@@ -115,10 +116,7 @@ def resolve_automation_script(script_name: str) -> Path:
 def _build_script_command(script_path: Path) -> list[str]:
     suffix = script_path.suffix.lower()
     if suffix == ".py":
-        python_path = shutil.which("python3") or shutil.which("python")
-        if not python_path:
-            raise RuntimeError("python3 is not available on this system.")
-        return [python_path, str(script_path)]
+        return [sys.executable, str(script_path)]
     if suffix == ".sh":
         bash_path = shutil.which("bash") or "/bin/bash"
         return [bash_path, str(script_path)]

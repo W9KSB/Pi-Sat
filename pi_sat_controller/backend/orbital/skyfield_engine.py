@@ -149,8 +149,9 @@ class SkyfieldEngine(OrbitalEngine):
         if satellite is None:
             raise KeyError(f"NORAD {norad_id} not found in {self.tle_file}")
 
-        start = datetime.now(timezone.utc)
-        end = start + timedelta(days=days_ahead)
+        now_utc = datetime.now(timezone.utc)
+        start = now_utc - timedelta(hours=2)
+        end = now_utc + timedelta(days=days_ahead)
         times, events = satellite.find_events(
             self.observer,
             self.timescale.from_datetime(start),
@@ -168,6 +169,9 @@ class SkyfieldEngine(OrbitalEngine):
             aos = times[index]
             maximum = times[index + 1]
             los = times[index + 2]
+            if los.utc_datetime() <= now_utc:
+                index += 3
+                continue
             _, start_azimuth, _ = (satellite - self.observer).at(aos).altaz()
             middle_altitude, middle_azimuth, _ = (satellite - self.observer).at(maximum).altaz()
             _, end_azimuth, _ = (satellite - self.observer).at(los).altaz()

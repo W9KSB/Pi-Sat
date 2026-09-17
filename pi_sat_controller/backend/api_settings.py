@@ -5,6 +5,48 @@ from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException
 
+from pi_sat_controller.backend.config import (
+    config_transaction,
+    normalize_cat_device_id,
+)
+
+MANUAL_ONLY_SETTINGS: dict[str, set[str]] = {
+    # Native Icom control uses LAN; keep the internal connectivity key out of
+    # browser-editable settings.
+    "icom": {"connectivity"},
+    "tx": {"shared_local_split_mode"},
+}
+
+
+def _payload_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{field_name} must be a boolean")
+
+
+def _sanitize_settings_payload(
+    settings_schema: dict[str, list[str]],
+    settings: dict[str, dict[str, str]],
+) -> dict[str, object]:
+    schema: dict[str, list[str]] = {}
+    sanitized_settings: dict[str, dict[str, str]] = {}
+    for section, keys in settings_schema.items():
+        hidden = MANUAL_ONLY_SETTINGS.get(section, set())
+        schema[section] = [key for key in keys if key not in hidden]
+        section_settings = dict(settings.get(section, {}))
+        for key in hidden:
+            section_settings.pop(key, None)
+        sanitized_settings[section] = section_settings
+    return {
+        "schema": schema,
+        "settings": sanitized_settings,
+    }
+
 
 def register_settings_api(
     app: FastAPI,
@@ -12,33 +54,42 @@ def register_settings_api(
     logger,
     settings_schema: dict[str, list[str]],
     load_settings: Callable[[], dict[str, dict[str, str]]],
-    save_settings: Callable[[dict[str, Any]], None],
-    reload_runtime_config: Callable[[], None],
+    load_cat_devices: Callable[[], list[dict[str, str]]],
+    save_settings: Callable[[dict[str, Any], list[dict[str, Any]] | None], None],
+    reload_runtime_config: Callable[[], list[str] | None],
     reload_rotator_config_only: Callable[[], None],
     list_serial_devices: Callable[[], list[dict[str, str]]],
-    run_device_test: Callable[[str, dict[str, Any]], dict[str, object]],
+    run_device_test: Callable[
+        [str, dict[str, Any], list[dict[str, Any]] | None],
+        dict[str, object],
+    ],
+    run_native_icom_test: Callable[[str, dict[str, Any]], dict[str, object]],
+    run_cat_device_test: Callable[[dict[str, Any]], dict[str, object]],
     list_automation_scripts: Callable[[], list[dict[str, str]]],
     run_automation_script_test: Callable[[str, str], dict[str, object]],
     build_status: Callable[[], dict[str, object]],
 ) -> None:
     @app.get("/api/settings")
     def get_settings() -> dict[str, object]:
-        return {
-            "schema": settings_schema,
-            "settings": load_settings(),
-        }
+        payload = _sanitize_settings_payload(settings_schema, load_settings())
+        payload["cat_devices"] = load_cat_devices()
+        return payload
 
     @app.post("/api/settings")
     def update_settings(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
         try:
-            save_settings(payload.get("settings", {}))
-            reload_runtime_config()
+            cat_devices = payload.get("cat_devices")
+            if cat_devices is not None and not isinstance(cat_devices, list):
+                raise ValueError("cat_devices must be an array")
+            with config_transaction():
+                save_settings(payload.get("settings", {}), cat_devices)
+                runtime_warnings = reload_runtime_config() or []
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {
-            "schema": settings_schema,
-            "settings": load_settings(),
-        }
+        response = _sanitize_settings_payload(settings_schema, load_settings())
+        response["cat_devices"] = load_cat_devices()
+        response["runtime_warnings"] = runtime_warnings
+        return response
 
     @app.post("/api/runtime/reload")
     def reload_runtime() -> dict[str, object]:
@@ -85,7 +136,18 @@ def register_settings_api(
             overrides = payload.get("settings", {})
             if not isinstance(overrides, dict):
                 raise ValueError("settings must be an object")
-            return run_device_test(normalized_role, overrides)
+            if (
+                normalized_role in {"rx", "tx"}
+                and str(overrides.get("device_id", "")).strip() == "native-ic9700"
+            ):
+                icom_settings = payload.get("icom_settings", {})
+                if not isinstance(icom_settings, dict):
+                    raise ValueError("icom_settings must be an object")
+                return run_native_icom_test(normalized_role, icom_settings)
+            cat_devices = payload.get("cat_devices")
+            if cat_devices is not None and not isinstance(cat_devices, list):
+                raise ValueError("cat_devices must be an array")
+            return run_device_test(normalized_role, overrides, cat_devices)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception:
@@ -97,30 +159,230 @@ def register_settings_api(
                 "details": {},
             }
 
+    @app.post("/api/cat-devices/test")
+    def test_cat_device(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        try:
+            device = payload.get("device", {})
+            if not isinstance(device, dict):
+                raise ValueError("device must be an object")
+            return run_cat_device_test(device)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            logger.exception("CAT device test failed unexpectedly")
+            return {
+                "ok": False,
+                "message": "CAT device test failed unexpectedly.",
+                "details": {},
+            }
+
+    @app.post("/api/cat-devices")
+    def save_cat_device(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        try:
+            raw_device = payload.get("device", {})
+            if not isinstance(raw_device, dict):
+                raise ValueError("device must be an object")
+            original_device_id = normalize_cat_device_id(
+                payload.get("original_device_id", "")
+            )
+            requested_device_id = normalize_cat_device_id(
+                raw_device.get("device_id", "")
+            )
+            if not requested_device_id:
+                raise ValueError("Device ID is required")
+            raw_device = dict(raw_device)
+            raw_device["device_id"] = requested_device_id
+
+            with config_transaction():
+                cat_devices = load_cat_devices()
+                match_id = original_device_id or requested_device_id
+                existing_device = next(
+                    (
+                        dict(device)
+                        for device in cat_devices
+                        if str(device.get("device_id", "")).strip() == match_id
+                    ),
+                    None,
+                )
+                merged_device = dict(raw_device)
+                if existing_device:
+                    for key in (
+                        "capability_comm",
+                        "capability_ptt",
+                        "capability_vfo",
+                        "capability_shared",
+                        "capability_targets",
+                        "capability_last_test_utc",
+                        "capability_notes",
+                        "capability_async",
+                        "capability_async_version",
+                        "capability_async_properties",
+                        "capability_async_notes",
+                    ):
+                        if key not in merged_device:
+                            merged_device[key] = existing_device.get(key, "")
+
+                next_devices: list[dict[str, Any]] = []
+                replaced = False
+                for device in cat_devices:
+                    device_id = str(device.get("device_id", "")).strip()
+                    if match_id and device_id == match_id:
+                        next_devices.append(dict(merged_device))
+                        replaced = True
+                    else:
+                        next_devices.append(dict(device))
+                if not replaced:
+                    next_devices.append(dict(merged_device))
+
+                role_updates: dict[str, dict[str, str]] = {}
+                if original_device_id and original_device_id != requested_device_id:
+                    current_settings = load_settings()
+                    for role in ("rx", "tx"):
+                        if (
+                            str(
+                                current_settings.get(role, {}).get("device_id", "")
+                            ).strip()
+                            == original_device_id
+                        ):
+                            role_updates[role] = {"device_id": requested_device_id}
+                save_settings(role_updates, next_devices)
+                refreshed_devices = load_cat_devices()
+                saved_device = dict(
+                    next(
+                        device
+                        for device in refreshed_devices
+                        if str(device.get("device_id", "")).strip()
+                        == requested_device_id
+                    )
+                )
+
+                capability_result = run_cat_device_test(saved_device)
+                message = "Device saved."
+                if capability_result.get("ok") and isinstance(
+                    capability_result.get("details"), dict
+                ):
+                    saved_device.update(capability_result["details"])
+                    refreshed_devices = [
+                        saved_device
+                        if str(device.get("device_id", "")).strip()
+                        == str(saved_device.get("device_id", "")).strip()
+                        else dict(device)
+                        for device in refreshed_devices
+                    ]
+                    save_settings({}, refreshed_devices)
+                    refreshed_devices = load_cat_devices()
+                    saved_device = dict(
+                        next(
+                            device
+                            for device in refreshed_devices
+                            if str(device.get("device_id", "")).strip()
+                            == str(saved_device.get("device_id", "")).strip()
+                        )
+                    )
+                    message = "Device saved. Capability check refreshed."
+                else:
+                    cached_capability_exists = any(
+                        str(existing_device.get(key, "")).strip()
+                        for key in (
+                            "capability_comm",
+                            "capability_ptt",
+                            "capability_vfo",
+                            "capability_shared",
+                            "capability_targets",
+                            "capability_last_test_utc",
+                            "capability_async",
+                            "capability_async_version",
+                        )
+                    ) if existing_device else False
+                    if cached_capability_exists:
+                        message = (
+                            "Device saved. Using last known capability result because the device is not currently reachable."
+                        )
+                    else:
+                        message = "Device saved. Capability check could not be refreshed."
+
+                runtime_warnings = reload_runtime_config() or []
+                if runtime_warnings:
+                    message = f"{message} {' '.join(runtime_warnings)}"
+            return {
+                "ok": True,
+                "message": message,
+                "device": saved_device,
+                "cat_devices": refreshed_devices,
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/cat-devices/{device_id}")
+    def remove_cat_device(device_id: str) -> dict[str, object]:
+        normalized_device_id = device_id.strip()
+        if not normalized_device_id:
+            raise HTTPException(status_code=400, detail="Device ID is required")
+        try:
+            with config_transaction():
+                settings = load_settings()
+                if str(settings.get("rx", {}).get("device_id", "")).strip() == normalized_device_id:
+                    raise ValueError("Remove the RX role assignment before deleting this device.")
+                if str(settings.get("tx", {}).get("device_id", "")).strip() == normalized_device_id:
+                    raise ValueError("Remove the TX role assignment before deleting this device.")
+
+                cat_devices = load_cat_devices()
+                next_devices = [
+                    dict(device)
+                    for device in cat_devices
+                    if str(device.get("device_id", "")).strip() != normalized_device_id
+                ]
+                save_settings({}, next_devices)
+                reload_runtime_config()
+            return {
+                "ok": True,
+                "message": "Device removed.",
+                "cat_devices": load_cat_devices(),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/device-controls")
     def update_device_controls(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
-        settings = load_settings()
-        rx_changed = False
-        tx_changed = False
-        rotator_changed = False
-        if "rx_enabled" in payload:
-            next_value = "true" if bool(payload["rx_enabled"]) else "false"
-            rx_changed = settings["rx"]["enabled"] != next_value
-            settings["rx"]["enabled"] = next_value
-        if "tx_enabled" in payload:
-            next_value = "true" if bool(payload["tx_enabled"]) else "false"
-            tx_changed = settings["tx"]["enabled"] != next_value
-            settings["tx"]["enabled"] = next_value
-        if "rotator_enabled" in payload:
-            next_value = "true" if bool(payload["rotator_enabled"]) else "false"
-            rotator_changed = settings["rotator"]["enabled"] != next_value
-            settings["rotator"]["enabled"] = next_value
         try:
-            save_settings(settings)
-            if rx_changed or tx_changed:
-                reload_runtime_config()
-            elif rotator_changed:
-                reload_rotator_config_only()
+            with config_transaction():
+                settings = load_settings()
+                rx_changed = False
+                tx_changed = False
+                rotator_changed = False
+                if "rx_enabled" in payload:
+                    next_value = (
+                        "true"
+                        if _payload_bool(payload["rx_enabled"], "rx_enabled")
+                        else "false"
+                    )
+                    rx_changed = settings["rx"]["enabled"] != next_value
+                    settings["rx"]["enabled"] = next_value
+                if "tx_enabled" in payload:
+                    next_value = (
+                        "true"
+                        if _payload_bool(payload["tx_enabled"], "tx_enabled")
+                        else "false"
+                    )
+                    tx_changed = settings["tx"]["enabled"] != next_value
+                    settings["tx"]["enabled"] = next_value
+                if "rotator_enabled" in payload:
+                    next_value = (
+                        "true"
+                        if _payload_bool(payload["rotator_enabled"], "rotator_enabled")
+                        else "false"
+                    )
+                    rotator_changed = settings["rotator"]["enabled"] != next_value
+                    settings["rotator"]["enabled"] = next_value
+                save_settings(settings)
+                if rx_changed or tx_changed:
+                    reload_runtime_config()
+                elif rotator_changed:
+                    reload_rotator_config_only()
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return build_status()

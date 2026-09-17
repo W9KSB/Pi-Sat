@@ -10,7 +10,7 @@ elevation, and can optionally send the rotator home when a tracked pass ends.
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any
 
 from pi_sat_controller.backend.rotator.rotctld_client import RotctldClient
@@ -61,6 +61,8 @@ class RotatorManager:
         self.home_elevation_deg = home_elevation_deg
         self.return_home_after_pass = return_home_after_pass
         self._lock = Lock()
+        self._operation_lock = RLock()
+        self._shutting_down = False
         self._snapshot = RotatorSnapshot(
             enabled=enabled,
             write_enabled=write_enabled,
@@ -86,11 +88,14 @@ class RotatorManager:
     def poll_once(self) -> RotatorSnapshot:
         if not self.enabled:
             return self.snapshot()
-        try:
-            position = self.client.get_position()
-        except Exception as exc:
-            self._set_error(str(exc))
-            return self.snapshot()
+        with self._operation_lock:
+            if self._shutting_down:
+                return self.snapshot()
+            try:
+                position = self.client.get_position()
+            except Exception as exc:
+                self._set_error(str(exc))
+                return self.snapshot()
 
         with self._lock:
             was_connected = self._snapshot.connected
@@ -180,11 +185,14 @@ class RotatorManager:
                 )
             return self.snapshot()
 
-        try:
-            self.client.set_position(azimuth_deg, elevation_deg)
-        except Exception as exc:
-            self._set_error(str(exc))
-            return self.snapshot()
+        with self._operation_lock:
+            if self._shutting_down:
+                return self.snapshot()
+            try:
+                self.client.set_position(azimuth_deg, elevation_deg)
+            except Exception as exc:
+                self._set_error(str(exc))
+                return self.snapshot()
 
         with self._lock:
             was_connected = self._snapshot.connected
@@ -225,11 +233,14 @@ class RotatorManager:
                 )
                 return self._snapshot
 
-        try:
-            self.client.set_position(azimuth_deg, elevation_deg)
-        except Exception as exc:
-            self._set_error(str(exc))
-            return self.snapshot()
+        with self._operation_lock:
+            if self._shutting_down:
+                return self.snapshot()
+            try:
+                self.client.set_position(azimuth_deg, elevation_deg)
+            except Exception as exc:
+                self._set_error(str(exc))
+                return self.snapshot()
 
         with self._lock:
             was_connected = self._snapshot.connected
@@ -255,11 +266,14 @@ class RotatorManager:
     def stop(self) -> RotatorSnapshot:
         if not self.enabled:
             return self.snapshot()
-        try:
-            self.client.stop()
-        except Exception as exc:
-            self._set_error(str(exc))
-            return self.snapshot()
+        with self._operation_lock:
+            if self._shutting_down:
+                return self.snapshot()
+            try:
+                self.client.stop()
+            except Exception as exc:
+                self._set_error(str(exc))
+                return self.snapshot()
         with self._lock:
             was_connected = self._snapshot.connected
             self._snapshot = _replace_snapshot(
@@ -271,6 +285,27 @@ class RotatorManager:
         if not was_connected:
             LOGGER.info("Rotator stop connection restored")
         return self.snapshot()
+
+    def shutdown(self) -> None:
+        """Stops and closes the client once, after any in-flight operation finishes."""
+
+        errors: list[str] = []
+        with self._operation_lock:
+            if self._shutting_down:
+                return
+            self._shutting_down = True
+            try:
+                self.client.stop()
+            except Exception as exc:
+                errors.append(f"stop failed: {exc}")
+            close = getattr(self.client, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as exc:
+                    errors.append(f"close failed: {exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     def _set_error(self, error: str) -> None:
         with self._lock:

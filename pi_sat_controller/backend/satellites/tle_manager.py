@@ -9,13 +9,17 @@ the cache keeps the entry with the newest epoch and discards older duplicates.
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
+import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import Lock
 from typing import NamedTuple
 
 import requests
 from skyfield.api import EarthSatellite, load
 
 LOGGER = logging.getLogger(__name__)
+_TLE_WRITE_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -95,7 +99,26 @@ class TleManager:
                 f"{name}\n{line1}\n{line2}"
                 for _, name, line1, line2, _ in merged_blocks
             ) + "\n"
-            self.cache_file.write_text(rendered, encoding="utf-8")
+            temporary_path: Path | None = None
+            with _TLE_WRITE_LOCK:
+                try:
+                    with NamedTemporaryFile(
+                        "w",
+                        encoding="utf-8",
+                        dir=self.cache_dir,
+                        prefix=f".{self.cache_file.name}.",
+                        suffix=".tmp",
+                        delete=False,
+                    ) as temporary:
+                        temporary.write(rendered)
+                        temporary.flush()
+                        os.fsync(temporary.fileno())
+                        temporary_path = Path(temporary.name)
+                    os.replace(temporary_path, self.cache_file)
+                    temporary_path = None
+                finally:
+                    if temporary_path is not None:
+                        temporary_path.unlink(missing_ok=True)
             LOGGER.info(
                 "TLE refresh complete: cached %s unique satellites at %s",
                 len(merged_blocks),
