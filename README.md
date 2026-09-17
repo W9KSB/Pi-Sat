@@ -53,7 +53,7 @@ compatibility problems or hardware-specific behavior in
   - `rotctl`
   - `rotctld`
 
-Hamlib 4.6 or newer can reduce radio read traffic by publishing generic asynchronous state updates. This optimization is optional: Pi-Sat detects the installed version and selected backend at runtime and retains normal polling when it is unavailable. Raspberry Pi OS Trixie's Hamlib 4.6.2 package is supported. See [Radio State Updates](docs/radio-state-updates.md) for configuration and troubleshooting.
+Hamlib 4.6 or newer can reduce radio read traffic by publishing generic asynchronous state updates. This optimization is optional: Pi-Sat detects the installed version and selected backend at runtime and retains normal polling when it is unavailable. Raspberry Pi OS Trixie's Hamlib 4.6.2 package is supported. See [Radio State Updates](https://github.com/W9KSB/Pi-Sat/wiki/Radio-State-Updates) for configuration and troubleshooting.
 
 ## Quick Install
 
@@ -80,7 +80,8 @@ After install, open `https://<PI-IP>/` in a browser on your local network.
 Pi-Sat defaults to HTTPS on port 443.
 On first start it generates a self-signed certificate if none exists, then reuses
 it on subsequent starts. Browser certificate acceptance/trust and microphone
-permission are still required. See [HTTPS setup](docs/https.md) for certificates,
+permission are still required. See
+[HTTPS setup](https://github.com/W9KSB/Pi-Sat/wiki/HTTPS-Setup) for certificates,
 custom ports, and the explicit HTTP option for reverse proxies.
 
 ### Useful Service Commands

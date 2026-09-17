@@ -491,8 +491,13 @@ class RxTrackingManager:
                 # milliseconds and must not hold the controller lock that PTT,
                 # transmit audio and telemetry all need.
                 position = self.orbital_engine.get_position(self.satellite.norad_id)
+                errors: list[str] = []
+                # The rotator is a separate device on its own transport, so it
+                # runs outside the batch: a slow rotctld round trip must not
+                # extend the radio lock hold that receive audio waits on.
+                self._apply_rotator(position, write_devices=True, errors=errors)
                 with self._radio_operation_batch():
-                    self._apply_update(position, write_devices=True)
+                    self._apply_update(position, write_devices=True, errors=errors)
             except Exception as exc:
                 self._record_error(str(exc))
 
@@ -500,12 +505,19 @@ class RxTrackingManager:
         with self._update_lock:
             try:
                 position = self.orbital_engine.get_position(self.satellite.norad_id)
-                self._apply_update(position, write_devices=False)
+                errors: list[str] = []
+                self._apply_rotator(position, write_devices=False, errors=errors)
+                self._apply_update(position, write_devices=False, errors=errors)
             except Exception as exc:
                 self._record_error(str(exc))
 
-    def _apply_update(self, position: SatellitePosition, write_devices: bool) -> None:
-        """Applies one orbital position update to SDR, TX, and rotator state."""
+    def _apply_update(
+        self,
+        position: SatellitePosition,
+        write_devices: bool,
+        errors: list[str] | None = None,
+    ) -> None:
+        """Applies one orbital position update to the radio and the snapshot."""
 
         pass_active = bool(position.elevation_deg >= 0.0)
         pass_transition: str | None = None
@@ -543,7 +555,8 @@ class RxTrackingManager:
 
         commanded_rx_hz = self._last_commanded_rx_hz
         commanded_tx_hz = self._last_commanded_tx_hz
-        errors: list[str] = []
+        if errors is None:
+            errors = []
         skip_rx_write = False
         skip_tx_write = False
         if write_devices:
@@ -718,22 +731,7 @@ class RxTrackingManager:
                     self._last_commanded_rx_hz = plan.downlink_hz
                     self._last_commanded_at = monotonic()
                     self._last_rx_write_at = self._last_commanded_at
-                rx_frequency_ready = True
-
-        if self.rotator_manager is not None:
-            self.rotator_manager.set_pass_active(
-                pass_active,
-                _python_float(position.azimuth_deg),
-                _python_float(position.elevation_deg),
-            )
-            if write_devices and pass_active:
-                try:
-                    self.rotator_manager.track_position(
-                        _python_float(position.azimuth_deg),
-                        _python_float(position.elevation_deg),
-                    )
-                except Exception as exc:
-                    errors.append(str(exc))
+            rx_frequency_ready = True
 
         tx_frequency_ready = bool(
             plan.uplink_hz is not None
@@ -831,6 +829,36 @@ class RxTrackingManager:
 
         if write_devices and pass_transition:
             self._emit_pass_transition(pass_transition, snapshot, position)
+
+    def _apply_rotator(
+        self,
+        position: SatellitePosition,
+        write_devices: bool,
+        errors: list[str],
+    ) -> None:
+        """Drives the rotator outside the radio operation batch.
+
+        rotctld is a blocking socket round trip to a separate device with a
+        multi-second timeout. Running it while the batch holds the CI-V lock
+        stalls the receive-audio path, which needs that same lock.
+        """
+
+        if self.rotator_manager is None:
+            return
+        pass_active = bool(position.elevation_deg >= 0.0)
+        self.rotator_manager.set_pass_active(
+            pass_active,
+            _python_float(position.azimuth_deg),
+            _python_float(position.elevation_deg),
+        )
+        if write_devices and pass_active:
+            try:
+                self.rotator_manager.track_position(
+                    _python_float(position.azimuth_deg),
+                    _python_float(position.elevation_deg),
+                )
+            except Exception as exc:
+                errors.append(str(exc))
 
     def _read_rx_frequency_for_reconciliation(
         self,
