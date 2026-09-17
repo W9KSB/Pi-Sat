@@ -66,6 +66,22 @@ class RotctldClient:
         if response and response != "RPRT 0":
             raise RuntimeError(f"rotctld rejected stop: {response}")
 
+    def close(self) -> None:
+        with socket.create_connection((self.host, self.port), self.timeout_s) as sock:
+            if self.debug_logging:
+                LOGGER.info(
+                    "rotctld_socket_request role=%s host=%s port=%s command=q",
+                    self.role_label,
+                    self.host,
+                    self.port,
+                )
+            sock.sendall(b"q\n")
+            try:
+                sock.recv(4096)
+            except Exception:
+                # Some rotctld builds close immediately after q without a payload.
+                pass
+
 
 def _parse_rotator_position(response: str) -> RotatorPosition:
     text = response.strip()

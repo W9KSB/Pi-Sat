@@ -8,12 +8,15 @@ tracking, orbital, and data-ingest behavior lives in the backend submodules.
 """
 
 from collections import deque
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, time, timedelta, timezone
 import logging
 import math
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock, RLock, Thread
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -30,8 +33,10 @@ from pi_sat_controller.backend.automation_scripts import (
     run_automation_script,
 )
 from pi_sat_controller.backend.config import (
+    NATIVE_ICOM_DEVICE_ID,
     PROJECT_ROOT,
     SETTINGS_SCHEMA,
+    load_cat_devices,
     load_config,
     load_my_satellites,
     load_settings,
@@ -39,11 +44,17 @@ from pi_sat_controller.backend.config import (
     save_settings,
 )
 from pi_sat_controller.backend.controller.rx_tracking import RxTrackingManager
+from pi_sat_controller.backend.controller.autotrack import (
+    AutotrackCoordinator,
+    TimedLosCoordinator,
+)
+from pi_sat_controller.backend.module_levels import configured_rx_gain_db, save_rx_gain_db
 from pi_sat_controller.backend.device_support import (
     build_radio_client,
     build_rotator_client,
     build_rx_manager,
     load_hamlib_model_caches,
+    run_cat_device_test,
     run_device_test,
     uses_same_local_radio,
 )
@@ -64,6 +75,19 @@ from pi_sat_controller.backend.radio.radio_manager import (
     disabled_radio_snapshot,
 )
 from pi_sat_controller.backend.radio.local_hamlib_client import LocalHamlibClient
+from pi_sat_controller.backend.radio.shared_radio_controller import (
+    SharedLocalRadioController,
+    SharedRadioRoleClient,
+)
+from pi_sat_controller.backend.radio.icom_lan_controller import (
+    IcomLanConfig,
+    IcomLanController,
+)
+from pi_sat_controller.backend.radio.icom_radio_controller import IcomRadioController
+from pi_sat_controller.backend.radio.native_icom_tracking import NativeIcomTrackingRole
+from pi_sat_controller.backend.api_radio import register_radio_api
+from pi_sat_controller.backend.api_sstv import register_sstv_api
+from pi_sat_controller.backend.api_aprs import register_aprs_api
 from pi_sat_controller.backend.runtime_fallbacks import (
     DisabledTrackingSdrManager,
     FailedRadioManager,
@@ -82,6 +106,9 @@ from pi_sat_controller.backend.sdr.polling_sdr import (
     PollingSdrManager,
     disabled_sdr_snapshot,
 )
+from pi_sat_controller.backend.aprs.manager import AprsManager
+from pi_sat_controller.backend.aprs.transmit import AprsTransmitter
+from pi_sat_controller.backend.sstv.manager import SstvManager
 from pi_sat_controller.backend.models import (SatellitePass, SatelliteProfile)
 
 logging.basicConfig(
@@ -144,12 +171,16 @@ sdr_manager: PollingSdrManager | None = None
 rx_tracking_manager: RxTrackingManager | None = None
 rotator_manager: RotatorManager | None = None
 tx_radio_manager: RadioManager | None = None
+icom_controller: IcomRadioController | None = None
 pass_cache_lock = Lock()
 pass_cache: list[SatellitePass] = []
 pass_cache_refreshed_at_utc: str | None = None
 pass_refresh_stop = Event()
 pass_refresh_thread: Thread | None = None
-pass_refresh_in_progress = False
+pass_refresh_gate = Lock()
+autotrack_stop = Event()
+autotrack_thread: Thread | None = None
+tracking_command_lock = RLock()
 transponder_refresh_stop = Event()
 transponder_refresh_thread: Thread | None = None
 hamlib_radio_models_cache: list[dict[str, object]] = []
@@ -158,22 +189,80 @@ hamlib_rotator_models_cache: list[dict[str, object]] = []
 hamlib_rotator_models_error: str | None = None
 
 
+def _sstv_capture_context() -> dict[str, object]:
+    frequency_hz = None
+    satellite = None
+    controller = icom_controller
+    if controller is not None:
+        try:
+            radio = controller.try_snapshot()
+            if radio is not None:
+                frequency_hz = radio.get("sub", {}).get("frequency_hz")
+        except Exception:
+            pass
+    manager = rx_tracking_manager
+    if manager is not None:
+        try:
+            satellite = manager.snapshot().satellite_name
+        except Exception:
+            pass
+    return {"frequency_hz": frequency_hz, "satellite": satellite}
+
+
+sstv_manager = SstvManager(
+    project_root=PROJECT_ROOT,
+    data_dir=PROJECT_ROOT / "data" / "sstv",
+    get_controller=lambda: icom_controller,
+    get_context=_sstv_capture_context,
+    rx_gain_db=configured_rx_gain_db("sstv"),
+)
+
+
+aprs_manager = AprsManager(
+    project_root=PROJECT_ROOT,
+    data_dir=PROJECT_ROOT / "data" / "aprs",
+    get_controller=lambda: icom_controller,
+    get_config=load_config,
+    rx_gain_db=configured_rx_gain_db("aprs"),
+)
+
+aprs_transmitter = AprsTransmitter(
+    project_root=PROJECT_ROOT,
+    data_dir=PROJECT_ROOT / "data" / "aprs",
+    get_controller=lambda: icom_controller,
+    get_config=load_config,
+)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _reload_runtime_config()
-    _refresh_transponder_profiles(reason="startup")
-    try:
-        _refresh_pass_cache(force_tle_download=True)
-    except Exception:
-        LOGGER.exception("Initial TLE/pass refresh failed; continuing startup without pass data")
     _start_pass_refresh_scheduler()
+    _start_autotrack_scheduler()
     _start_transponder_refresh_scheduler()
+    Thread(
+        target=_run_startup_data_refresh,
+        name="startup-data-refresh",
+        daemon=True,
+    ).start()
     try:
         yield
     finally:
         _stop_pass_refresh_scheduler()
+        _stop_autotrack_scheduler()
         _stop_transponder_refresh_scheduler()
+        sstv_manager.shutdown()
+        aprs_manager.shutdown()
+        aprs_transmitter.shutdown()
         _shutdown_runtime()
+
+
+def _run_startup_data_refresh() -> None:
+    _refresh_transponder_profiles(reason="startup")
+    try:
+        _refresh_pass_cache(force_tle_download=True)
+    except Exception:
+        LOGGER.exception("Initial TLE/pass refresh failed; continuing with available cache")
 
 
 app = FastAPI(title="Pi-Sat Controller", lifespan=lifespan)
@@ -183,7 +272,8 @@ def _build_status_payload() -> dict[str, object]:
     satellites = load_satellite_profiles(config.profiles.satellites_file)
     return {
         "project": "Pi-Sat Controller",
-        "server": {"host": config.server.host, "port": config.server.port},
+        "server": {"host": config.server.host, "port": config.server.listen_port,
+                   "https_enabled": config.server.https_enabled},
         "station": {
             "name": config.station.name,
             "latitude_deg": config.station.latitude_deg,
@@ -194,16 +284,85 @@ def _build_status_payload() -> dict[str, object]:
         "devices": {
             "rx_enabled": config.rx.enabled,
             "rx_connectivity": config.rx.connectivity,
-            "rx_write_enabled": config.rx.write_enabled,
             "tx_enabled": config.tx.enabled,
             "tx_connectivity": config.tx.connectivity,
-            "tx_write_enabled": config.tx.write_enabled,
             "rotator_enabled": config.rotator.enabled,
             "rotator_connectivity": config.rotator.connectivity,
-            "rotator_write_enabled": config.rotator.write_enabled,
+        },
+        "icom": {
+            "enabled": config.icom.enabled,
+            "connected": bool(icom_controller and icom_controller.snapshot().get("connected")),
+            "rx_native": bool(
+                config.icom.enabled
+                and config.rx.device_id == NATIVE_ICOM_DEVICE_ID
+            ),
         },
         "satellite_count": len(satellites),
     }
+
+
+def _load_cat_devices_with_runtime_state() -> list[dict[str, str]]:
+    devices = [dict(device) for device in load_cat_devices()]
+    try:
+        current_config = load_config()
+    except Exception:
+        return devices
+
+    runtime_sources = (
+        (current_config.rx.device_id, sdr_manager),
+        (current_config.tx.device_id, tx_radio_manager),
+    )
+    status_by_device: dict[str, dict[str, object]] = {}
+    for device_id, manager in runtime_sources:
+        status_reader = getattr(manager, "async_status", None)
+        if not device_id or status_reader is None:
+            continue
+        try:
+            status = dict(status_reader())
+        except Exception:
+            continue
+        existing = status_by_device.get(device_id)
+        if existing is None:
+            status_by_device[device_id] = status
+            continue
+        combined_properties = sorted(
+            {
+                str(value)
+                for value in (
+                    list(existing.get("verified_properties", []))
+                    + list(status.get("verified_properties", []))
+                )
+            }
+        )
+        states = {str(existing.get("state", "")), str(status.get("state", ""))}
+        existing["state"] = (
+            "verified" if "verified" in states else "available" if "available" in states else "unsupported"
+        )
+        existing["verified_properties"] = combined_properties
+
+    for device in devices:
+        device_id = str(device.get("device_id", ""))
+        status = status_by_device.get(device_id)
+        if status is None:
+            continue
+        state = str(status.get("state", "unsupported"))
+        properties = [str(value) for value in status.get("verified_properties", [])]
+        device["capability_async"] = state
+        device["capability_async_version"] = str(status.get("hamlib_version") or "")
+        device["capability_async_properties"] = ",".join(properties)
+        if str(status.get("preference", "automatic")) == "polling":
+            note = "Polling Only is selected; real-time pushed updates are disabled."
+        elif state == "verified":
+            note = (
+                f"Real-time updates active for {', '.join(properties) or 'radio state'}; "
+                "slow reconciliation polling remains enabled."
+            )
+        elif state == "available":
+            note = "Async available, waiting for verification; normal polling remains active."
+        else:
+            note = "Polling - async updates are unavailable or the listener is not healthy."
+        device["capability_async_notes"] = note
+    return devices
 
 
 def _build_hamlib_radio_models_payload() -> dict[str, object]:
@@ -220,6 +379,32 @@ def _build_hamlib_rotator_models_payload() -> dict[str, object]:
         "models": hamlib_rotator_models_cache,
         "error": hamlib_rotator_models_error,
     }
+
+
+def _clear_split_for_single_role_radios(
+    config,
+    rx_manager,
+    tx_manager,
+    shared_local_radio: bool,
+) -> None:
+    if shared_local_radio:
+        return
+
+    if config.rx.enabled and config.rx.connectivity == "local":
+        radio_manager = getattr(rx_manager, "radio_manager", None)
+        if radio_manager is not None and hasattr(radio_manager, "try_set_split_mode_disabled"):
+            radio_manager.try_set_split_mode_disabled(
+                source="startup.rx_single_role",
+                force=True,
+            )
+
+    if config.tx.enabled and config.tx.connectivity == "local":
+        if tx_manager is not None and hasattr(tx_manager, "try_set_split_mode_disabled"):
+            tx_manager.try_set_split_mode_disabled(
+                source="startup.tx_single_role",
+                force=True,
+            )
+
 
 def _get_or_create_rx_tracking_manager(
     norad_id: int | None = None,
@@ -241,22 +426,8 @@ def _get_or_create_rx_tracking_manager(
         )
     ):
         return rx_tracking_manager
-    if rx_tracking_manager is not None:
-        rx_tracking_manager.shutdown()
-        rx_tracking_manager = None
 
     config = load_config()
-    tle_manager = TleManager(config.tle.source_url, config.tle.cache_dir)
-    tle_status = tle_manager.status()
-    if not tle_status.exists:
-        try:
-            tle_status = tle_manager.download()
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"TLE download failed: {exc}",
-            ) from exc
-
     satellites = load_satellite_profiles(config.profiles.satellites_file)
     selected_satellite = next(
         (satellite for satellite in satellites if satellite.norad_id == selected_norad),
@@ -272,6 +443,22 @@ def _get_or_create_rx_tracking_manager(
         )
     if transponder_index < 0 or transponder_index >= len(selected_satellite.transponders):
         raise HTTPException(status_code=400, detail="Selected frequency profile is invalid")
+
+    selected_transponder = selected_satellite.transponders[transponder_index]
+    if rx_tracking_manager is not None:
+        rx_tracking_manager.update_target(selected_satellite, selected_transponder)
+        return rx_tracking_manager
+
+    tle_manager = TleManager(config.tle.source_url, config.tle.cache_dir)
+    tle_status = tle_manager.status()
+    if not tle_status.exists:
+        try:
+            tle_status = tle_manager.download()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"TLE download failed: {exc}",
+            ) from exc
 
     try:
         orbital_engine = SkyfieldEngine(
@@ -290,81 +477,392 @@ def _get_or_create_rx_tracking_manager(
         orbital_engine=orbital_engine,
         sdr_manager=sdr_manager or DisabledTrackingSdrManager(),
         satellite=selected_satellite,
-        transponder=selected_satellite.transponders[transponder_index],
+        transponder=selected_transponder,
         deadband_hz=config.safety.frequency_deadband_hz,
         rotator_manager=rotator_manager,
         tx_radio_manager=tx_radio_manager,
-        on_pass_start=lambda context: _trigger_automation_script_event("aos", context),
-        on_pass_end=lambda context: _trigger_automation_script_event("los", context),
+        on_pass_start=None,
+        on_pass_end=None,
         interval_s=max(0.1, config.safety.tracking_update_interval_ms / 1000.0),
+        cat_rate_limit_hz=config.safety.cat_rate_limit_hz,
+        manual_offset_readback_active_pass_only=(
+            config.safety.manual_offset_readback_active_pass_only
+        ),
     )
     return rx_tracking_manager
 
 
-def _shutdown_runtime() -> None:
-    global rotator_manager, rx_tracking_manager, sdr_manager, tx_radio_manager
+def _start_rx_tracking_manager(
+    norad_id: int | None,
+    transponder_index: int,
+    sync_offsets: bool | None,
+    source: str,
+) -> RxTrackingManager:
+    """Serializes target changes so concurrent browsers cannot create zombie trackers."""
 
-    if rx_tracking_manager is not None:
+    with tracking_command_lock:
+        previous_norad = (
+            rx_tracking_manager.satellite.norad_id
+            if rx_tracking_manager is not None
+            else None
+        )
+        manager = _get_or_create_rx_tracking_manager(norad_id, transponder_index)
+        if sync_offsets is not None:
+            manager.set_offset_sync(sync_offsets)
+        manager.start()
+        LOGGER.info(
+            "Tracking target accepted source=%s previous_norad=%s norad=%s profile=%s",
+            source,
+            previous_norad,
+            manager.satellite.norad_id,
+            manager.transponder.name,
+        )
+        return manager
+
+
+def _mutate_rx_tracking_manager(
+    norad_id: int | None,
+    transponder_index: int,
+    action: Callable[[RxTrackingManager], Any],
+) -> Any:
+    """Applies a command only if the browser still references the shared target."""
+
+    with tracking_command_lock:
+        manager = rx_tracking_manager
+        if manager is None:
+            raise HTTPException(status_code=409, detail="Start tracking before changing it.")
+        if norad_id is not None and manager.satellite.norad_id != norad_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Tracking target changed in another browser; wait for sync and try again.",
+            )
+        if (
+            transponder_index < 0
+            or transponder_index >= len(manager.satellite.transponders)
+            or manager.transponder != manager.satellite.transponders[transponder_index]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Tracking profile changed in another browser; wait for sync and try again.",
+            )
+        return action(manager)
+
+
+def _build_icom_lan_config(config) -> IcomLanConfig:
+    return IcomLanConfig(
+        enabled=config.icom.enabled,
+        host=config.icom.host,
+        username=config.icom.username,
+        password=config.icom.password,
+        control_port=config.icom.control_port,
+        serial_port=config.icom.serial_port,
+        audio_port=config.icom.audio_port,
+        civ_address=config.icom.civ_address,
+        controller_address=config.icom.controller_address,
+        sample_rate=config.icom.sample_rate,
+        rx_codec=config.icom.rx_codec,
+        tx_codec=config.icom.tx_codec,
+        full_duplex=config.icom.full_duplex,
+        scope_enabled=config.icom.scope_enabled,
+        debug_logging=config.icom.debug_logging,
+    )
+
+
+def _icom_config_with_test_overrides(overrides: dict[str, Any]):
+    config = load_config().icom
+
+    def text(name: str) -> str:
+        return str(overrides.get(name, getattr(config, name))).strip()
+
+    def integer(name: str) -> int:
+        raw = str(overrides.get(name, getattr(config, name))).strip()
+        try:
+            return int(raw, 0)
+        except ValueError as exc:
+            raise ValueError(f"Invalid native Icom {name.replace('_', ' ')}") from exc
+
+    def boolean(name: str) -> bool:
+        raw = str(overrides.get(name, getattr(config, name))).strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"Invalid native Icom {name.replace('_', ' ')}")
+
+    return replace(
+        config,
+        enabled=True,
+        connectivity="network",
+        host=text("host"),
+        username=text("username"),
+        password=text("password"),
+        control_port=integer("control_port"),
+        serial_port=integer("serial_port"),
+        audio_port=integer("audio_port"),
+        civ_address=integer("civ_address"),
+        controller_address=integer("controller_address"),
+        sample_rate=integer("sample_rate"),
+        rx_codec=text("rx_codec"),
+        tx_codec=text("tx_codec"),
+        full_duplex=boolean("full_duplex"),
+        scope_enabled=boolean("scope_enabled"),
+        debug_logging=boolean("debug_logging"),
+    )
+
+
+def _run_native_icom_device_test(role: str, overrides: dict[str, Any]) -> dict[str, object]:
+    side = "SUB" if role == "rx" else "MAIN"
+    runtime_controller = icom_controller
+    runtime_state = runtime_controller.snapshot() if runtime_controller is not None else {}
+    if runtime_state.get("connecting"):
+        raise ValueError("Native IC-9700 is already connecting on the Radio page; disconnect it before testing Settings.")
+
+    temporary = not bool(runtime_state.get("connected"))
+    controller = runtime_controller
+    if temporary:
+        native_config = _icom_config_with_test_overrides(overrides)
+        controller = IcomLanController(_build_icom_lan_config(SimpleNamespace(icom=native_config)))
+    if controller is None:
+        raise ValueError("Native IC-9700 controller is unavailable")
+
+    details: dict[str, object] = {"physical_side": side}
+    try:
+        if temporary:
+            controller.connect()
+        frequency_hz = controller.get_frequency(side)
+        snapshot = controller.snapshot()
+        details.update({
+            "frequency_hz": frequency_hz,
+            "transport": snapshot.get("transport"),
+            "audio_available": bool(snapshot.get("audio_available")),
+            "audio_state": (snapshot.get("audio") or {}).get("state")
+                if isinstance(snapshot.get("audio"), dict) else None,
+        })
+        if not details["audio_available"]:
+            audio = snapshot.get("audio") if isinstance(snapshot.get("audio"), dict) else {}
+            details["error"] = audio.get("last_error") or "Control succeeded, but radio audio is unavailable."
+            return {
+                "ok": False,
+                "role": role,
+                "message": f"Native IC-9700 {role.upper()} control succeeded; audio failed.",
+                "details": details,
+            }
+        return {
+            "ok": True,
+            "role": role,
+            "message": f"Native IC-9700 {role.upper()} control and audio succeeded.",
+            "details": details,
+        }
+    except Exception as exc:
+        details["error"] = str(exc)
+        return {
+            "ok": False,
+            "role": role,
+            "message": f"Native IC-9700 {role.upper()} test failed.",
+            "details": details,
+        }
+    finally:
+        if temporary:
+            try:
+                controller.stop()
+            except Exception:
+                LOGGER.exception("Temporary native Icom test cleanup failed role=%s", role)
+
+
+def _shutdown_runtime(
+    preserve_tracking_manager: bool = False,
+    preserve_icom_controller: bool = False,
+) -> None:
+    global rotator_manager, rx_tracking_manager, sdr_manager, tx_radio_manager, icom_controller
+
+    previous_rotator = rotator_manager
+    previous_sdr = sdr_manager
+    previous_tx = tx_radio_manager
+    rotator_manager = None
+    sdr_manager = None
+    tx_radio_manager = None
+    previous_icom = icom_controller
+    if not preserve_icom_controller:
+        icom_controller = None
+    if not preserve_tracking_manager and rx_tracking_manager is not None:
         rx_tracking_manager.shutdown()
         rx_tracking_manager = None
-    if rotator_manager is not None and hasattr(rotator_manager.client, "close"):
-        rotator_manager.client.close()
-    rotator_manager = None
-    if tx_radio_manager is not None and hasattr(tx_radio_manager.client, "close"):
-        tx_radio_manager.client.close()
-    tx_radio_manager = None
-    if sdr_manager is not None:
-        sdr_manager.stop()
-        sdr_manager = None
+    elif rx_tracking_manager is not None:
+        rx_tracking_manager.update_runtime_dependencies(
+            sdr_manager=DisabledTrackingSdrManager(),
+            tx_radio_manager=None,
+            rotator_manager=None,
+        )
+    if previous_sdr is not None:
+        try:
+            previous_sdr.stop()
+        except Exception:
+            LOGGER.exception("RX shutdown failed during runtime reload")
+    if previous_rotator is not None:
+        try:
+            shutdown = getattr(previous_rotator, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+            elif hasattr(previous_rotator.client, "close"):
+                previous_rotator.client.close()
+        except Exception:
+            LOGGER.exception("Rotator shutdown failed during runtime reload")
+    if previous_tx is not None and hasattr(previous_tx.client, "close"):
+        try:
+            previous_tx.client.close()
+        except Exception:
+            LOGGER.exception("TX shutdown failed during runtime reload")
+    if previous_icom is not None and not preserve_icom_controller:
+        try:
+            previous_icom.stop()
+        except Exception:
+            LOGGER.exception("Native Icom shutdown failed during runtime reload")
 
 
-def _reload_runtime_config() -> None:
-    global rotator_manager, sdr_manager, tx_radio_manager
+def _reload_runtime_config() -> list[str]:
+    with tracking_command_lock:
+        return _reload_runtime_config_locked()
+
+
+def _reload_runtime_config_locked() -> list[str]:
+    global rotator_manager, sdr_manager, tx_radio_manager, icom_controller
     global hamlib_radio_models_cache, hamlib_radio_models_error
     global hamlib_rotator_models_cache, hamlib_rotator_models_error
 
-    _shutdown_runtime()
+    startup_errors: list[str] = []
+    config = load_config()
+    native_selected = any(
+        role.device_id == NATIVE_ICOM_DEVICE_ID
+        for role in (config.rx, config.tx)
+    )
+    desired_icom_config = (
+        _build_icom_lan_config(config)
+        if config.icom.enabled and native_selected
+        else None
+    )
+    preserve_icom_controller = bool(
+        icom_controller is not None
+        and desired_icom_config is not None
+        and getattr(icom_controller.connectivity, "config", None) == desired_icom_config
+    )
+    _shutdown_runtime(
+        preserve_tracking_manager=True,
+        preserve_icom_controller=preserve_icom_controller,
+    )
     (
         hamlib_radio_models_cache,
         hamlib_radio_models_error,
         hamlib_rotator_models_cache,
         hamlib_rotator_models_error,
     ) = load_hamlib_model_caches(LOGGER)
-    config = load_config()
-    failure_threshold = max(1, config.safety.device_offline_failure_threshold)
-    shared_local_client = None
-    if uses_same_local_radio(config):
-        shared_local_client = LocalHamlibClient(
-            model_id=config.rx.model_id or config.tx.model_id or 0,
-            serial_port=config.rx.serial_port or config.tx.serial_port,
-            baud=config.rx.baud or config.tx.baud or 0,
-            timeout_s=max(config.rx.timeout_s, config.tx.timeout_s),
-            debug_logging=bool(config.rx.cat_debug_logging or config.tx.cat_debug_logging),
-            role_label="shared",
-        )
-    if config.rx.enabled:
+    if desired_icom_config is not None and icom_controller is None:
         try:
+            icom_controller = IcomLanController(desired_icom_config)
+            # Creating the owner does not power the radio session on. The Radio
+            # page's explicit Connect action starts it (including after reload).
+        except Exception as exc:
+            startup_errors.append(f"Native Icom startup failed: {exc}")
+            LOGGER.warning("Native Icom startup failed: %s", exc)
+    failure_threshold = max(1, config.safety.device_offline_failure_threshold)
+    # A selected native route is the sole radio owner.  Generic Hamlib remains
+    # available when neither role selects the first-class native device.
+    shared_local_radio = (not native_selected) and uses_same_local_radio(config)
+    shared_local_split_mode = (
+        shared_local_radio and bool(config.tx.shared_local_split_mode)
+    )
+    shared_local_client: LocalHamlibClient | None = None
+    shared_rx_client = None
+    shared_tx_client = None
+    shared_controller: SharedLocalRadioController | None = None
+    shared_setup_error: str | None = None
+    if shared_local_radio:
+        try:
+            shared_local_client = LocalHamlibClient(
+                model_id=config.rx.model_id or config.tx.model_id or 0,
+                serial_port=config.rx.serial_port or config.tx.serial_port,
+                baud=config.rx.baud or config.tx.baud or 0,
+                timeout_s=max(config.rx.timeout_s, config.tx.timeout_s),
+                target_vfo=config.rx.target_vfo,
+                debug_logging=bool(config.rx.cat_debug_logging or config.tx.cat_debug_logging),
+                role_label="shared",
+                vfo_mode=True,
+                state_updates=config.rx.state_updates,
+            )
+            shared_controller = SharedLocalRadioController(
+                client=shared_local_client,
+                rx_vfo=config.rx.target_vfo,
+                tx_vfo=config.tx.target_vfo,
+                split_enabled=shared_local_split_mode,
+            )
+            shared_controller.initialize()
+            shared_local_split_mode = shared_controller.split_enabled
+            shared_rx_client = SharedRadioRoleClient(shared_controller, "rx")
+            shared_tx_client = SharedRadioRoleClient(shared_controller, "tx")
+        except Exception as exc:
+            shared_setup_error = str(exc)
+            startup_errors.append(f"Shared radio startup failed: {exc}")
+            LOGGER.warning("Shared local radio setup failed: %s", exc)
+    if config.rx.enabled and config.rx.device_id == NATIVE_ICOM_DEVICE_ID:
+        if icom_controller is None:
+            error = "RX startup failed: Native IC-9700 is selected but native Icom control is disabled."
+            startup_errors.append(error)
+            sdr_manager = FailedTrackingSdrManager(error)
+        else:
+            sdr_manager = NativeIcomTrackingRole(icom_controller, "rx", enabled=True)
+    elif config.rx.enabled and native_selected:
+        error = "RX startup failed: Native IC-9700 cannot run beside a generic radio role."
+        startup_errors.append(error)
+        sdr_manager = FailedTrackingSdrManager(error)
+    elif config.rx.enabled:
+        try:
+            if shared_setup_error:
+                raise RuntimeError(shared_setup_error)
             sdr_manager = build_rx_manager(
                 config.rx,
-                shared_local_client,
+                shared_rx_client,
                 failure_threshold=failure_threshold,
             )
-            sdr_manager.start()
+            if hasattr(sdr_manager, "read_frequency_once"):
+                sdr_manager.read_frequency_once()
         except Exception as exc:
             error = f"RX startup failed: {exc}"
+            startup_errors.append(error)
             LOGGER.warning(error)
             sdr_manager = FailedTrackingSdrManager(error)
-    if config.tx.enabled:
+    if config.tx.enabled and config.tx.device_id == NATIVE_ICOM_DEVICE_ID:
+        if icom_controller is None:
+            error = "TX startup failed: Native IC-9700 is selected but native Icom control is disabled."
+            startup_errors.append(error)
+            tx_radio_manager = FailedRadioManager(error)
+        else:
+            tx_radio_manager = NativeIcomTrackingRole(icom_controller, "tx", enabled=True)
+    elif config.tx.enabled and native_selected:
+        error = "TX startup failed: Native IC-9700 cannot run beside a generic radio role."
+        startup_errors.append(error)
+        tx_radio_manager = FailedRadioManager(error)
+    elif config.tx.enabled:
         try:
+            if shared_setup_error:
+                raise RuntimeError(shared_setup_error)
             tx_radio_manager = RadioManager(
-                client=build_radio_client(config.tx, "TX", shared_local_client),
+                client=build_radio_client(config.tx, "TX", shared_tx_client),
                 enabled=config.tx.enabled,
-                write_enabled=config.tx.write_enabled,
+                write_enabled=True,
                 target_vfo=config.tx.target_vfo,
                 failure_threshold=failure_threshold,
+                read_poll_enabled=not shared_local_radio,
+                restore_vfo_after_write=(
+                    config.rx.target_vfo if shared_local_radio else None
+                ),
+                split_mode_vfo=(
+                    config.tx.target_vfo if shared_local_split_mode else None
+                ),
+                poll_target_vfo=False,
             )
+            tx_radio_manager.get_frequency()
         except Exception as exc:
             error = f"TX startup failed: {exc}"
+            startup_errors.append(error)
             LOGGER.warning(error)
             tx_radio_manager = FailedRadioManager(error)
     if config.rotator.enabled:
@@ -372,7 +870,7 @@ def _reload_runtime_config() -> None:
             rotator_manager = RotatorManager(
                 client=build_rotator_client(config.rotator),
                 enabled=config.rotator.enabled,
-                write_enabled=config.rotator.write_enabled,
+                write_enabled=True,
                 min_elevation_deg=config.rotator.min_elevation_deg or 0.0,
                 home_azimuth_deg=config.rotator.home_azimuth_deg or 0.0,
                 home_elevation_deg=config.rotator.home_elevation_deg or 0.0,
@@ -381,32 +879,79 @@ def _reload_runtime_config() -> None:
             )
         except Exception as exc:
             error = f"Rotator startup failed: {exc}"
+            startup_errors.append(error)
             LOGGER.warning(error)
             rotator_manager = FailedRotatorManager(
                 error,
                 enabled=config.rotator.enabled,
-                write_enabled=config.rotator.write_enabled,
+                write_enabled=True,
             )
+    _clear_split_for_single_role_radios(
+        config,
+        sdr_manager,
+        tx_radio_manager,
+        shared_local_radio,
+    )
+    if rx_tracking_manager is not None:
+        rx_tracking_manager.update_runtime_dependencies(
+            sdr_manager=sdr_manager or DisabledTrackingSdrManager(),
+            tx_radio_manager=tx_radio_manager,
+            rotator_manager=rotator_manager,
+            manual_offset_readback_active_pass_only=(
+                config.safety.manual_offset_readback_active_pass_only
+            ),
+        )
+    if sdr_manager is not None and not isinstance(sdr_manager, FailedTrackingSdrManager):
+        sdr_manager.start()
+    if rx_tracking_manager is not None:
+        try:
+            rx_tracking_manager.refresh_snapshot_only()
+        except Exception:
+            LOGGER.exception("Tracking snapshot refresh failed after runtime reload")
     try:
-        _ensure_pass_cache()
+        tle_manager = TleManager(config.tle.source_url, config.tle.cache_dir)
+        if tle_manager.status().exists:
+            _ensure_pass_cache()
+        else:
+            LOGGER.info("Pass cache initialization deferred until startup TLE refresh")
     except Exception:
         LOGGER.exception("TLE/pass cache unavailable during runtime reload; continuing startup")
+    return list(dict.fromkeys(startup_errors))
 
 
 def _reload_rotator_config_only() -> None:
+    with tracking_command_lock:
+        _reload_rotator_config_only_locked()
+
+
+def _reload_rotator_config_only_locked() -> None:
     global rotator_manager, rx_tracking_manager
 
     config = load_config()
     failure_threshold = max(1, config.safety.device_offline_failure_threshold)
-    if rotator_manager is not None and hasattr(rotator_manager.client, "close"):
-        rotator_manager.client.close()
+    previous_rotator_manager = rotator_manager
     rotator_manager = None
+    if rx_tracking_manager is not None:
+        rx_tracking_manager.update_runtime_dependencies(
+            sdr_manager=sdr_manager or DisabledTrackingSdrManager(),
+            tx_radio_manager=tx_radio_manager,
+            rotator_manager=None,
+        )
+    if previous_rotator_manager is not None:
+        try:
+            shutdown = getattr(previous_rotator_manager, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+            else:
+                previous_rotator_manager.stop()
+        except Exception:
+            LOGGER.exception("Failed to shut down rotator during control reload")
     if config.rotator.enabled:
         try:
             rotator_manager = RotatorManager(
                 client=build_rotator_client(config.rotator),
                 enabled=config.rotator.enabled,
-                write_enabled=config.rotator.write_enabled,
+                write_enabled=True,
                 min_elevation_deg=config.rotator.min_elevation_deg or 0.0,
                 home_azimuth_deg=config.rotator.home_azimuth_deg or 0.0,
                 home_elevation_deg=config.rotator.home_elevation_deg or 0.0,
@@ -419,10 +964,18 @@ def _reload_rotator_config_only() -> None:
             rotator_manager = FailedRotatorManager(
                 error,
                 enabled=config.rotator.enabled,
-                write_enabled=config.rotator.write_enabled,
+                write_enabled=True,
             )
     if rx_tracking_manager is not None:
-        rx_tracking_manager.rotator_manager = rotator_manager
+        rx_tracking_manager.update_runtime_dependencies(
+            sdr_manager=sdr_manager or DisabledTrackingSdrManager(),
+            tx_radio_manager=tx_radio_manager,
+            rotator_manager=rotator_manager,
+        )
+        try:
+            rx_tracking_manager.refresh_snapshot_only()
+        except Exception:
+            LOGGER.exception("Tracking snapshot refresh failed after rotator reload")
 
 
 def _build_orbital_engine() -> SkyfieldEngine:
@@ -581,11 +1134,8 @@ def _list_serial_devices() -> list[dict[str, str]]:
 def _refresh_pass_cache(force_tle_download: bool) -> list[SatellitePass]:
     """Refreshes the shared pass cache used by the dashboard and satellite pages."""
 
-    global pass_cache_refreshed_at_utc, pass_refresh_in_progress
-    if pass_refresh_in_progress:
-        with pass_cache_lock:
-            return list(pass_cache)
-    pass_refresh_in_progress = True
+    global pass_cache_refreshed_at_utc
+    pass_refresh_gate.acquire()
     try:
         config = load_config()
         tle_manager = TleManager(config.tle.source_url, config.tle.cache_dir)
@@ -593,7 +1143,16 @@ def _refresh_pass_cache(force_tle_download: bool) -> list[SatellitePass]:
             "Pass refresh started (force_tle_download=%s)",
             force_tle_download,
         )
-        if force_tle_download:
+        tle_status = tle_manager.status()
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(
+            hours=max(1, config.tle.stale_after_hours)
+        )
+        cache_is_stale = (
+            not tle_status.exists
+            or tle_status.downloaded_at_utc is None
+            or tle_status.downloaded_at_utc < stale_cutoff
+        )
+        if force_tle_download or cache_is_stale:
             try:
                 tle_manager.download()
             except Exception:
@@ -604,7 +1163,7 @@ def _refresh_pass_cache(force_tle_download: bool) -> list[SatellitePass]:
             LOGGER.exception("Unable to build orbital engine during pass refresh")
             with pass_cache_lock:
                 return list(pass_cache)
-        satellites, min_elevation, _ = load_my_satellites()
+        satellites, min_elevation, _, _ = load_my_satellites()
         all_passes: list[SatellitePass] = []
         for satellite in satellites:
             try:
@@ -633,7 +1192,7 @@ def _refresh_pass_cache(force_tle_download: bool) -> list[SatellitePass]:
         LOGGER.info("Pass refresh complete: %s pass(es) cached", len(refreshed))
         return refreshed
     finally:
-        pass_refresh_in_progress = False
+        pass_refresh_gate.release()
 
 
 def _ensure_pass_cache() -> None:
@@ -691,11 +1250,171 @@ def _stop_pass_refresh_scheduler() -> None:
         pass_refresh_thread = None
 
 
+def _load_autotrack_options() -> tuple[set[int], bool]:
+    _, _, enabled, autotrack_norads = load_my_satellites()
+    return autotrack_norads, enabled
+
+
+def _get_cached_passes() -> list[SatellitePass]:
+    with pass_cache_lock:
+        return list(pass_cache)
+
+
+def _start_autotrack_pass(satellite_pass: SatellitePass) -> bool:
+    with tracking_command_lock:
+        _, _, enabled, _ = load_my_satellites()
+        if not enabled:
+            return False
+        current_sync = (
+            bool(rx_tracking_manager.snapshot().sync_offsets)
+            if rx_tracking_manager is not None
+            else True
+        )
+        _start_rx_tracking_manager(
+            satellite_pass.norad_id,
+            0,
+            current_sync,
+            "backend_autotrack",
+        )
+        return True
+
+
+def _run_pre_aos_automation(satellite_pass: SatellitePass) -> None:
+    if not _rx_or_tx_control_enabled():
+        LOGGER.info(
+            "Skipping AOS automation because RX and TX control are disabled "
+            "satellite=%s norad=%s",
+            satellite_pass.satellite_name,
+            satellite_pass.norad_id,
+        )
+        return
+    _trigger_automation_script_event(
+        "aos",
+        _automation_context_for_pass(satellite_pass, "AOS"),
+    )
+
+
+def _run_timed_los_automation(satellite_pass: SatellitePass) -> None:
+    if not _rx_or_tx_control_enabled():
+        LOGGER.info(
+            "Skipping LOS automation because RX and TX control are disabled "
+            "satellite=%s norad=%s",
+            satellite_pass.satellite_name,
+            satellite_pass.norad_id,
+        )
+        return
+    _trigger_automation_script_event(
+        "los",
+        _automation_context_for_pass(satellite_pass, "LOS"),
+    )
+
+
+def _rx_or_tx_control_enabled() -> bool:
+    config = load_config()
+    return bool(config.rx.enabled or config.tx.enabled)
+
+
+def _automation_context_for_pass(
+    satellite_pass: SatellitePass,
+    event_name: str,
+) -> dict[str, object]:
+    manager = rx_tracking_manager
+    snapshot = manager.snapshot() if manager is not None else None
+    if manager is not None and manager.satellite.norad_id != satellite_pass.norad_id:
+        snapshot = None
+    return {
+        "event": event_name,
+        "norad_id": satellite_pass.norad_id,
+        "satellite_name": satellite_pass.satellite_name,
+        "aos_utc": satellite_pass.aos_utc.isoformat(),
+        "los_utc": satellite_pass.los_utc.isoformat(),
+        "transponder_name": getattr(snapshot, "transponder_name", None),
+        "azimuth_deg": getattr(snapshot, "azimuth_deg", None),
+        "elevation_deg": getattr(snapshot, "elevation_deg", None),
+        "latitude_deg": getattr(snapshot, "latitude_deg", None),
+        "longitude_deg": getattr(snapshot, "longitude_deg", None),
+        "range_km": getattr(snapshot, "range_km", None),
+        "range_rate_m_s": getattr(snapshot, "range_rate_m_s", None),
+        "target_rx_hz": getattr(snapshot, "target_rx_hz", None),
+        "target_tx_hz": getattr(snapshot, "calculated_tx_hz", None),
+    }
+
+
+def _get_active_tracking_norad() -> int | None:
+    manager = rx_tracking_manager
+    if manager is None or not manager.snapshot().active:
+        return None
+    return manager.satellite.norad_id
+
+
+autotrack_coordinator = AutotrackCoordinator(
+    load_options=_load_autotrack_options,
+    get_passes=_get_cached_passes,
+    start_pass=_start_autotrack_pass,
+    run_pre_aos=_run_pre_aos_automation,
+    logger=LOGGER,
+)
+
+timed_los_coordinator = TimedLosCoordinator(
+    get_active_norad=_get_active_tracking_norad,
+    get_passes=_get_cached_passes,
+    run_los=_run_timed_los_automation,
+    logger=LOGGER,
+)
+
+
+def _run_autotrack_scheduler() -> None:
+    """Runs timed LOS before the authoritative upcoming-pass selection loop."""
+
+    while not autotrack_stop.is_set():
+        try:
+            timed_los_coordinator.tick()
+        except Exception:
+            LOGGER.exception("Timed LOS evaluation failed")
+        try:
+            autotrack_coordinator.tick()
+        except Exception:
+            LOGGER.exception("Autotrack evaluation failed")
+        if autotrack_stop.wait(1.0):
+            break
+
+
+def _start_autotrack_scheduler() -> None:
+    global autotrack_thread
+    if autotrack_thread is not None:
+        return
+    autotrack_stop.clear()
+    autotrack_thread = Thread(
+        target=_run_autotrack_scheduler,
+        name="autotrack-scheduler",
+        daemon=True,
+    )
+    autotrack_thread.start()
+
+
+def _stop_autotrack_scheduler() -> None:
+    global autotrack_thread
+    autotrack_stop.set()
+    if autotrack_thread is not None:
+        autotrack_thread.join(timeout=2.0)
+        autotrack_thread = None
+
+
+def _handle_autotrack_changed(enabled: bool) -> None:
+    autotrack_coordinator.reset()
+    if not enabled:
+        return
+    try:
+        autotrack_coordinator.tick()
+    except Exception:
+        LOGGER.exception("Autotrack evaluation failed after enable")
+
+
 def _refresh_transponder_profiles(reason: str = "manual") -> None:
     """Refreshes stored transponder profiles for the tracked satellite list."""
 
     config = load_config()
-    my_satellites, _, _ = load_my_satellites()
+    my_satellites, _, _, _ = load_my_satellites()
     existing_profiles = {
         satellite.norad_id: satellite
         for satellite in load_satellite_profiles(config.profiles.satellites_file)
@@ -749,11 +1468,7 @@ def _refresh_transponder_profiles(reason: str = "manual") -> None:
 
 
 def _run_transponder_refresh_scheduler() -> None:
-    config = load_config()
-    timezone_name = qth_timezone_name(
-        config.station.latitude_deg,
-        config.station.longitude_deg,
-    )
+    timezone_name = qth_timezone_from_config()
     while not transponder_refresh_stop.is_set():
         wait_seconds = _seconds_until_next_midnight(timezone_name)
         if transponder_refresh_stop.wait(wait_seconds):
@@ -895,7 +1610,9 @@ register_tracking_api(
     get_tx_radio_manager=lambda: tx_radio_manager,
     get_rx_tracking_manager=lambda: rx_tracking_manager,
     get_rotator_manager=lambda: rotator_manager,
-    get_or_create_rx_tracking_manager=_get_or_create_rx_tracking_manager,
+    start_rx_tracking_manager=_start_rx_tracking_manager,
+    mutate_rx_tracking_manager=_mutate_rx_tracking_manager,
+    get_autotrack_enabled=lambda: load_my_satellites()[2],
     disabled_sdr_snapshot=disabled_sdr_snapshot,
     disabled_radio_snapshot=disabled_radio_snapshot,
     disabled_rotator_snapshot=disabled_rotator_snapshot,
@@ -909,17 +1626,38 @@ register_settings_api(
     logger=LOGGER,
     settings_schema=SETTINGS_SCHEMA,
     load_settings=load_settings,
+    load_cat_devices=_load_cat_devices_with_runtime_state,
     save_settings=save_settings,
     reload_runtime_config=_reload_runtime_config,
     reload_rotator_config_only=_reload_rotator_config_only,
     list_serial_devices=_list_serial_devices,
-    run_device_test=lambda role, overrides: run_device_test(role, overrides, LOGGER),
+    run_device_test=lambda role, overrides, cat_devices=None: run_device_test(
+        role,
+        overrides,
+        LOGGER,
+        cat_devices,
+    ),
+    run_native_icom_test=_run_native_icom_device_test,
+    run_cat_device_test=lambda device: run_cat_device_test(device, LOGGER),
     list_automation_scripts=lambda: [script.to_dict() for script in list_automation_scripts()],
     run_automation_script_test=lambda event_name, script_name: _run_automation_script_test(
         event_name,
         script_name,
     ),
     build_status=_build_status_payload,
+)
+
+register_radio_api(app, get_controller=lambda: icom_controller)
+register_sstv_api(
+    app,
+    get_manager=lambda: sstv_manager,
+    save_rx_gain=lambda value: save_rx_gain_db("sstv", value),
+)
+register_aprs_api(
+    app,
+    get_manager=lambda: aprs_manager,
+    get_transmitter=lambda: aprs_transmitter,
+    save_rx_gain=lambda value: save_rx_gain_db("aprs", value),
 )
 
 register_satellites_api(
@@ -936,6 +1674,7 @@ register_satellites_api(
     pass_cache_lock=pass_cache_lock,
     pass_to_dict=_pass_to_dict,
     get_pass_cache_refreshed_at_utc=lambda: pass_cache_refreshed_at_utc,
+    on_autotrack_changed=_handle_autotrack_changed,
 )
 
 register_qso_api(

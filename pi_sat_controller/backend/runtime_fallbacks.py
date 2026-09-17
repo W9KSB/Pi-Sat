@@ -21,6 +21,9 @@ class DisabledTrackingSdrManager:
     def try_set_frequency(self, frequency_hz: int):
         return disabled_sdr_snapshot()
 
+    def read_frequency_once(self):
+        raise RuntimeError(disabled_sdr_snapshot().error)
+
 
 class FailedTrackingSdrManager:
     """Fallback RX manager used when startup cannot build the real device path."""
@@ -48,9 +51,16 @@ class FailedTrackingSdrManager:
     def try_set_frequency(self, frequency_hz: int):
         return self.snapshot()
 
+    def read_frequency_once(self):
+        raise RuntimeError(self.error)
+
 
 class FailedRadioManager:
     """Fallback TX manager used when startup cannot build the real device path."""
+
+    target_vfo = None
+    restore_vfo_after_write = None
+    split_mode_vfo = None
 
     def __init__(self, error: str) -> None:
         self.error = error
@@ -73,16 +83,40 @@ class FailedRadioManager:
     def try_set_frequency(self, frequency_hz: int, source: str = ""):
         return self.snapshot()
 
-    def set_mode(self, mode: str, passband_hz: int = 0, source: str = ""):
+    def set_mode(
+        self,
+        mode: str,
+        passband_hz: int = 0,
+        source: str = "",
+        force: bool = False,
+    ):
         raise RuntimeError(self.error)
 
-    def try_set_mode(self, mode: str, passband_hz: int = 0, source: str = ""):
+    def try_set_mode(
+        self,
+        mode: str,
+        passband_hz: int = 0,
+        source: str = "",
+        force: bool = False,
+    ):
         return self.snapshot()
 
     def set_vfo(self, vfo: str | None, source: str = ""):
         raise RuntimeError(self.error)
 
     def try_set_vfo(self, vfo: str | None, source: str = ""):
+        return self.snapshot()
+
+    def set_split_mode_enabled(self, tx_vfo: str | None, source: str = ""):
+        raise RuntimeError(self.error)
+
+    def try_set_split_mode_enabled(self, tx_vfo: str | None, source: str = ""):
+        return self.snapshot()
+
+    def set_split_mode_disabled(self, source: str = "", force: bool = False):
+        raise RuntimeError(self.error)
+
+    def try_set_split_mode_disabled(self, source: str = "", force: bool = False):
         return self.snapshot()
 
 

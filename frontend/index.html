@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Pi-Sat Controller</title>
     <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
-    <link rel="stylesheet" href="/style.css?v=20260613-responsive1">
+    <link rel="stylesheet" href="/style.css?v=20260916-controls1">
+    <link rel="stylesheet" href="/radio-console.css?v=20260909-controls4">
   </head>
   <body>
     <main class="container-fluid py-3 app-shell">
@@ -25,28 +26,29 @@
               <div class="home-header-nav">
                 <nav class="nav nav-pills gap-2" aria-label="Primary navigation">
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="home">Home</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="radio">Radio</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="satellites">Satellites</button>
-                  <button type="button" class="btn btn-outline-primary nav-button" data-page="qso-finder">QSO Finder</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="modules">Modules</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="monitor">Monitor</button>
-                  <button type="button" class="btn btn-outline-primary nav-button" data-page="map">Map</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="settings">Settings</button>
                 </nav>
               </div>
               <div class="home-header-controls">
                 <div class="header-switches">
                   <label class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="rx-control-toggle">
+                    <input class="form-check-input" type="checkbox" role="switch" id="rx-control-toggle" data-device-control="rx">
                     <span class="form-check-label">RX control</span>
                   </label>
                   <label class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="tx-control-toggle">
+                    <input class="form-check-input" type="checkbox" role="switch" id="tx-control-toggle" data-device-control="tx">
                     <span class="form-check-label">TX control</span>
                   </label>
                   <label class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="rotator-control-toggle">
+                    <input class="form-check-input" type="checkbox" role="switch" id="rotator-control-toggle" data-device-control="rotator">
                     <span class="form-check-label">Rotator control</span>
                   </label>
                 </div>
+              </div>
             </div>
           </div>
         </header>
@@ -111,6 +113,7 @@
                     <div class="summary-box-label">Selected Satellite</div>
                     <div class="selected-satellite-row">
                       <strong id="selected-satellite">None</strong>
+                      <span id="tracking-pass-state" class="text-body-secondary small">--</span>
                       <span id="selected-satellite-azimuth" class="text-body-secondary small">Az --</span>
                       <span id="selected-satellite-elevation" class="text-body-secondary small">El --</span>
                     </div>
@@ -118,6 +121,10 @@
                   <section class="summary-box summary-controls-box">
                     <div class="summary-box-label">Offset Controls</div>
                     <div class="summary-controls-row">
+                      <label class="form-check form-switch sync-toggle mb-0">
+                        <span class="form-check-label">Enable Manual Offsets</span>
+                        <input class="form-check-input" type="checkbox" role="switch" id="manual-offsets-toggle" checked>
+                      </label>
                       <label class="form-check form-switch sync-toggle mb-0">
                         <span class="form-check-label">Sync RX / TX Offsets</span>
                         <input class="form-check-input" type="checkbox" role="switch" id="sync-rx-tx-toggle" checked>
@@ -142,13 +149,37 @@
                         </dl>
                         <form id="rx-frequency-form" class="visually-hidden"></form>
                         <div class="step-controls" aria-label="RX frequency step controls">
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="-1000">-1000 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="-100">-100 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="-10">-10 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="10">+10 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="100">+100 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-khz="1000">+1000 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="-1000">-1000 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="-100">-100 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="-10">-10 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="10">+10 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="100">+100 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-rx-step-hz="1000">+1000 Hz</button>
                         </div>
+                        <section class="virtual-rit-section" aria-label="Receive RIT">
+                          <div id="virtual-rit-controls" class="virtual-rit-controls">
+                            <div class="virtual-rit-header">
+                              <h4 class="virtual-rit-title mb-0" id="virtual-rit-heading">
+                                Virtual RIT <span class="text-body-secondary">(RX only)</span>
+                              </h4>
+                              <div class="virtual-rit-status">
+                                <output id="tracking-virtual-rit" aria-live="polite">0 Hz</output>
+                                <button type="button" class="btn btn-sm btn-outline-warning" id="reset-virtual-rit">Reset RIT</button>
+                              </div>
+                            </div>
+                            <div class="step-controls" aria-label="Virtual RIT step controls">
+                              <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="-250">-250 Hz</button>
+                              <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="-100">-100 Hz</button>
+                              <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="-10">-10 Hz</button>
+                              <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="10">+10 Hz</button>
+                              <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="100">+100 Hz</button>
+                              <button type="button" class="btn btn-sm btn-primary" data-virtual-rit-step-hz="250">+250 Hz</button>
+                            </div>
+                          </div>
+                          <p id="virtual-rit-native-note" class="virtual-rit-native-note mb-0" hidden>
+                            RIT is controlled natively from the Radio page.
+                          </p>
+                        </section>
                       </div>
                     </div>
                   </section>
@@ -166,13 +197,14 @@
                           <div><dt>Target TX</dt><dd id="tracking-calculated-tx">--</dd></div>
                         </dl>
                         <div class="step-controls" aria-label="TX frequency step controls">
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="-1000">-1000 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="-100">-100 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="-10">-10 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="10">+10 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="100">+100 kHz</button>
-                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-khz="1000">+1000 kHz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="-1000">-1000 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="-100">-100 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="-10">-10 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="10">+10 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="100">+100 Hz</button>
+                          <button type="button" class="btn btn-sm btn-primary" data-tx-step-hz="1000">+1000 Hz</button>
                         </div>
+                        <div class="virtual-rit-placeholder" aria-hidden="true"></div>
                       </div>
                     </div>
                   </section>
@@ -254,6 +286,10 @@
                     <input class="form-check-input" type="checkbox" role="switch" id="monitor-rotator-cat-debug">
                     <span class="form-check-label monitor-label-rotator">Rotator debug logging</span>
                   </label>
+                  <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-icom-debug">
+                    <span class="form-check-label">Icom LAN verbose debug logging</span>
+                  </label>
                 </div>
                 <p id="monitor-status" class="command-status mb-0"></p>
               </div>
@@ -268,6 +304,12 @@
               <div class="card-body">
                 <div id="log-list" class="log-list log-list-tall"></div>
               </div>
+            </div>
+          </section>
+          <section class="col-12">
+            <div class="card">
+              <div class="card-header py-2"><h2 class="h6 mb-0">Icom LAN protocol log <span class="text-body-secondary">(Last 100)</span></h2></div>
+              <div class="card-body"><div id="icom-log-list" class="log-list log-list-tall"></div></div>
             </div>
           </section>
         </div>
@@ -374,8 +416,11 @@
         </div>
       </section>
 
-      <section class="page-view" id="qso-finder-page" data-page-view="qso-finder" hidden>
-        <header class="card app-header mb-3 standard-page-header" data-page-title="QSO Finder" data-page-subtitle="Find overlapping satellite windows between two grid squares"></header>
+      <section class="page-view" id="modules-page" data-page-view="modules" hidden>
+        <header class="card app-header mb-3 standard-page-header" data-page-title="Modules" data-page-subtitle="Pi-Sat utilities and operating tools" data-subnav="modules"></header>
+
+        <div class="module-panels">
+          <section class="module-view" id="qso-finder-page" data-module-view="qso-finder" role="tabpanel" aria-labelledby="modules-nav-qso-finder">
 
         <div class="row g-3">
           <section class="col-12">
@@ -498,17 +543,195 @@
             </div>
           </section>
         </div>
+          </section>
+
+          <section class="module-view" id="map-page" data-module-view="map" role="tabpanel" aria-labelledby="modules-nav-map" hidden>
+            <div class="row g-3">
+              <section class="col-12">
+                <div class="card">
+                  <div class="card-header d-flex align-items-center justify-content-between gap-3">
+                    <h2 class="h5 mb-0">Current Tracked Satellite Locations</h2>
+                    <span class="small text-body-secondary">Map update <strong id="tracked-map-update" class="text-body">--</strong></span>
+                  </div>
+                  <div class="card-body">
+                    <div class="tracked-map-wrap mx-auto">
+                      <canvas id="tracked-satellites-map" width="1400" height="700"></canvas>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section class="module-view" id="sstv-decoder-page" data-module-view="sstv-decoder" role="tabpanel" aria-labelledby="modules-nav-sstv-decoder" hidden>
+            <div class="sstv-toolbar card">
+              <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
+                <div>
+                  <div class="d-flex flex-wrap align-items-center gap-2">
+                  <h2 class="h5 mb-0">SSTV Decoder</h2>
+                    <span id="sstv-state" class="sstv-state-badge">Disabled</span>
+                  </div>
+                  <p id="sstv-detail" class="text-body-secondary small mb-0 mt-2">Decoder is off. Radio audio continues normally.</p>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                  <input type="range" class="form-range module-level-slider" id="sstv-rx-gain" min="-30" max="12" step="1" value="-6"
+                         title="Decoder input level" aria-label="Decoder input level">
+                  <output class="small text-body-secondary module-level-value" id="sstv-rx-gain-value" for="sstv-rx-gain">-6 dB</output>
+                  <button type="button" id="sstv-enable" class="btn btn-primary" aria-pressed="false">Enable</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="row g-3">
+              <section class="col-12 col-xl-8">
+                <div class="card h-100">
+                  <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
+                    <h3 class="h6 mb-0">Live Decode</h3>
+                    <span id="sstv-progress-label" class="small text-body-secondary">0%</span>
+                  </div>
+                  <div class="card-body">
+                    <div id="sstv-active-indicator" class="sstv-active-indicator mb-3" role="status" aria-live="polite" hidden>
+                      <span class="sstv-active-dot" aria-hidden="true"></span>
+                      <strong>Image decoding in progress</strong>
+                      <span id="sstv-active-mode"></span>
+                    </div>
+                    <div class="progress sstv-progress" role="progressbar" aria-label="SSTV decode progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                      <div id="sstv-progress" class="progress-bar" style="width: 0%"></div>
+                    </div>
+                    <div id="sstv-canvas-wrap" class="sstv-canvas-wrap mt-3">
+                      <canvas id="sstv-canvas" aria-label="Live SSTV image"></canvas>
+                      <p id="sstv-canvas-empty" class="text-body-secondary mb-0">Enable the decoder to listen for an SSTV transmission.</p>
+                    </div>
+                  </div>
+                </div>
+              </section>
+              <section class="col-12 col-xl-4">
+                <div class="card h-100">
+                  <div class="card-header"><h3 class="h6 mb-0">Decoder Status</h3></div>
+                  <div class="card-body">
+                    <dl class="sstv-readouts mb-0">
+                      <div><dt>Mode</dt><dd id="sstv-mode">--</dd></div>
+                      <div><dt>Line</dt><dd id="sstv-line">--</dd></div>
+                      <div><dt>Audio source</dt><dd id="sstv-source">Native IC-9700 SUB/RX PCM</dd></div>
+                      <div><dt>Engine</dt><dd id="sstv-engine">slowrx.rs 0.5.3</dd></div>
+                      <div><dt>Decoder level</dt><dd id="sstv-decoder-level">silent</dd></div>
+                    </dl>
+                    <p class="small text-body-secondary mt-3 mb-0">SSTV decoding powered by slowrx.rs, based on slowrx by Oona Räisänen (OH2EIQ).</p>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <section class="card">
+              <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
+                <h3 class="h6 mb-0">Recent Images</h3>
+                <span class="small text-body-secondary">Latest 25 completed decodes</span>
+              </div>
+              <div class="card-body">
+                <div id="sstv-gallery" class="sstv-gallery">
+                  <p class="text-body-secondary mb-0">No completed SSTV images yet.</p>
+                </div>
+              </div>
+            </section>
+
+            <dialog id="sstv-image-dialog" class="sstv-image-dialog">
+              <form method="dialog" class="d-flex justify-content-end"><button class="btn btn-sm btn-outline-light" aria-label="Close image">Close</button></form>
+              <img id="sstv-large-image" alt="Completed SSTV decode">
+              <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3">
+                <p id="sstv-large-meta" class="small text-body-secondary mb-0"></p>
+                <a id="sstv-large-download" class="btn btn-sm btn-outline-info" href="#" download>Download</a>
+              </div>
+            </dialog>
+          </section>
+
+          <section class="module-view" id="aprs-page" data-module-view="aprs" role="tabpanel" aria-labelledby="modules-nav-aprs" hidden>
+            <div class="aprs-toolbar card">
+              <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
+                <div>
+                  <div class="d-flex flex-wrap align-items-center gap-2">
+                    <h2 class="h5 mb-0">APRS</h2>
+                    <span id="aprs-state" class="aprs-state-badge">Disabled</span>
+                  </div>
+                  <p id="aprs-detail" class="text-body-secondary small mb-0 mt-2">Decoder is off. Radio audio continues normally.</p>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                  <input type="range" class="form-range module-level-slider" id="aprs-rx-gain" min="-30" max="12" step="1" value="-6"
+                         title="Decoder input level" aria-label="Decoder input level">
+                  <output class="small text-body-secondary module-level-value" id="aprs-rx-gain-value" for="aprs-rx-gain">-6 dB</output>
+                  <button type="button" id="aprs-enable" class="btn btn-primary" aria-pressed="false">Enable</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="aprs-split">
+              <section class="aprs-panel card">
+                <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
+                  <h3 class="h6 mb-0">Received Packets</h3>
+                  <span id="aprs-retained" class="small text-body-secondary">0 / 25</span>
+                </div>
+                <div class="card-body aprs-packet-scroll">
+                  <div id="aprs-packets" class="aprs-packets">
+                    <p class="text-body-secondary mb-0">Enable the decoder to listen for APRS traffic.</p>
+                  </div>
+                </div>
+              </section>
+
+              <section class="aprs-panel card">
+                <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
+                  <h3 class="h6 mb-0">Transmit</h3>
+                  <div class="form-check form-switch d-flex align-items-center gap-2 mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="aprs-arm" aria-label="Arm APRS transmit">
+                    <label class="form-check-label small" for="aprs-arm">Arm</label>
+                  </div>
+                </div>
+                <div class="card-body">
+                  <div class="aprs-tx-actions">
+                    <button type="button" class="btn btn-outline-info" id="aprs-send-beacon" disabled>Send Beacon</button>
+                    <button type="button" class="btn btn-outline-info" id="aprs-send-status" disabled>Custom Message</button>
+                    <button type="button" class="btn btn-outline-info" id="aprs-send-message" disabled>Direct Message</button>
+                  </div>
+                  <div class="aprs-tx-fields">
+                    <input type="text" class="form-control form-control-sm" id="aprs-tx-addressee" maxlength="9" placeholder="Callsign" aria-label="APRS message addressee" disabled>
+                    <input type="text" class="form-control form-control-sm" id="aprs-tx-text" maxlength="67" placeholder="Message" aria-label="APRS message text" disabled>
+                  </div>
+                  <dl class="sstv-readouts mt-3 mb-0">
+                    <div><dt>Status</dt><dd id="aprs-tx-state">Disarmed</dd></div>
+                    <div><dt>Last transmit</dt><dd id="aprs-tx-last">Never</dd></div>
+                  </dl>
+                  <p id="aprs-tx-detail" class="small text-body-secondary mt-2 mb-0"></p>
+                </div>
+              </section>
+            </div>
+
+            <section class="aprs-meta card">
+              <div class="card-body">
+                <dl class="sstv-readouts mb-0">
+                  <div><dt>Audio source</dt><dd id="aprs-source">Native IC-9700 RX PCM</dd></div>
+                  <div><dt>Engine</dt><dd id="aprs-engine">Dire Wolf</dd></div>
+                  <div><dt>Packets</dt><dd id="aprs-count">0 received</dd></div>
+                  <div><dt>Decoder input</dt><dd id="aprs-input">No audio yet</dd></div>
+                  <div><dt>Channel levels</dt><dd id="aprs-levels">Left silent, right silent</dd></div>
+                  <div><dt>Decoder level</dt><dd id="aprs-decoder-level">silent</dd></div>
+                  <div><dt>Decoder link</dt><dd id="aprs-kiss">Not connected</dd></div>
+                </dl>
+                <p class="small text-body-secondary mt-3 mb-0">APRS decoding powered by Dire Wolf by John Langner (WB2OSZ).</p>
+                <details class="aprs-raw mt-2">
+                  <summary>Decoder log</summary>
+                  <button type="button" class="btn btn-sm btn-outline-info my-2" id="aprs-log-refresh">Refresh</button>
+                  <pre id="aprs-decoder-log" class="mb-0">Enable the decoder to collect its output.</pre>
+                </details>
+              </div>
+            </section>
+          </section>
+        </div>
       </section>
 
       <section class="page-view" id="settings-page" data-page-view="settings" hidden>
-        <header class="card app-header mb-3 standard-page-header" data-page-title="Settings" data-page-subtitle="Configuration is saved to pi-sat-controller.conf"></header>
+        <header class="card app-header mb-3 standard-page-header" data-page-title="Settings" data-page-subtitle="Configuration is saved to pi-sat-controller.conf" data-subnav="settings"></header>
 
         <div class="row g-3">
           <section class="col-12">
             <div class="card">
-              <div class="card-header">
-                <h2 class="h5 mb-0">Application Settings</h2>
-              </div>
               <div class="card-body">
                 <form id="settings-form" class="settings-form"></form>
                   <div class="d-flex justify-content-end gap-2 mt-3">
@@ -522,25 +745,11 @@
         </div>
       </section>
 
-      <section class="page-view" id="map-page" data-page-view="map" hidden>
-        <header class="card app-header mb-3 standard-page-header" data-page-title="Map" data-page-subtitle="Current tracked satellite locations"></header>
-
-        <div class="row g-3">
-          <section class="col-12">
-            <div class="card">
-              <div class="card-header d-flex align-items-center justify-content-between gap-3">
-                <h2 class="h5 mb-0">Current Tracked Satellite Locations</h2>
-                <span class="small text-body-secondary">Map update <strong id="tracked-map-update" class="text-body">--</strong></span>
-              </div>
-              <div class="card-body">
-                <div class="tracked-map-wrap mx-auto">
-                  <canvas id="tracked-satellites-map" width="1400" height="700"></canvas>
-                </div>
-              </div>
-            </div>
-          </section>
-        </div>
+      <section class="page-view" id="radio-page" data-page-view="radio" hidden>
+        <header class="card app-header mb-3 standard-page-header" data-page-title="Pi-Sat Radio" data-page-subtitle="Native LAN radio · IC-9700"></header>
+        <div id="radio-console" class="radio-console"></div>
       </section>
+
     </main>
     <footer class="app-footer">
       <span>Pi-Sat Controller</span>
@@ -550,6 +759,9 @@
       <a href="https://github.com/w9ksb" target="_blank" rel="noopener noreferrer">github.com/w9ksb</a>
     </footer>
     <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
-    <script src="/app.js?v=20260613-responsive1"></script>
+  <script src="/app.js?v=20260916-uplink1"></script>
+  <script src="/radio-console.js?v=20260916-uplink1"></script>
+    <script src="/sstv.js?v=20260909-sstv2"></script>
+    <script src="/aprs.js?v=20260914-aprs4"></script>
   </body>
 </html>

@@ -1,13 +1,29 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 from threading import RLock
+from time import monotonic
 from typing import Any, Protocol
+
+from pi_sat_controller.backend.radio.radio_state import (
+    ASYNC_RECONCILIATION_MISS_THRESHOLD,
+    ASYNC_RECONCILIATION_POLL_S,
+    PENDING_EXTERNAL_EVENT_WINDOW_S,
+    RadioFrequencyObservation,
+    RadioStateClassification,
+    RadioStateEvent,
+    RadioStateProperty,
+)
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_FAILURE_THRESHOLD = 3
+
+
+class RadioOperationDeferred(RuntimeError):
+    """A temporary radio state prevented an otherwise valid operation."""
 
 
 class RadioClient(Protocol):
@@ -20,7 +36,22 @@ class RadioClient(Protocol):
     def set_mode(self, mode: str, passband_hz: int = 0) -> None:
         ...
 
+    def set_ctcss_tone(self, tone_tenths_hz: int) -> None:
+        ...
+
+    def set_tone_enabled(self, enabled: bool) -> None:
+        ...
+
     def select_vfo(self, vfo: str) -> None:
+        ...
+
+    def set_split(self, enabled: bool, tx_vfo: str | None = None) -> None:
+        ...
+
+    def set_split_frequency(self, frequency_hz: int) -> None:
+        ...
+
+    def set_split_mode(self, mode: str, passband_hz: int = 0) -> None:
         ...
 
 
@@ -46,23 +77,49 @@ class RadioManager:
         write_enabled: bool,
         target_vfo: str | None = None,
         failure_threshold: int = DEFAULT_FAILURE_THRESHOLD,
+        read_poll_enabled: bool = True,
+        restore_vfo_after_write: str | None = None,
+        poll_target_vfo: bool = True,
+        split_mode_vfo: str | None = None,
     ) -> None:
         self.client = client
         self.enabled = enabled
         self.write_enabled = write_enabled
         self.target_vfo = target_vfo
+        self.read_poll_enabled = read_poll_enabled
+        self.restore_vfo_after_write = restore_vfo_after_write
+        self.poll_target_vfo = poll_target_vfo
+        self.split_mode_vfo = split_mode_vfo
         self._lock = RLock()
         self._connected = False
         self._frequency_hz: int | None = None
         self._mode: str | None = None
+        self._ctcss_tone_tenths_hz: int | None = None
         self._vfo: str | None = None
+        self._client_generation: int | None = None
         self._last_read_at_utc: str | None = None
         self._last_write_at_utc: str | None = None
         self._error: str | None = None
         self._consecutive_failures = 0
         self._failure_threshold = max(1, int(failure_threshold))
+        self._pending_state_events: deque[RadioStateEvent] = deque(maxlen=64)
+        self._last_reconciliation_poll_at = 0.0
+        self._async_reconciliation_misses = 0
+
+    def _select_vfo_locked(self, vfo: str | None, source: str = "") -> None:
+        normalized_vfo = normalize_hamlib_vfo(vfo)
+        if normalized_vfo is None:
+            return
+        LOGGER.info(
+            "cat_command source=%s op=set_vfo vfo=%s",
+            source or "unknown",
+            normalized_vfo,
+        )
+        self.client.select_vfo(normalized_vfo)
+        self._vfo = normalized_vfo
 
     def snapshot(self) -> RadioDeviceSnapshot:
+        self.refresh_async_state()
         with self._lock:
             return RadioDeviceSnapshot(
                 enabled=self.enabled,
@@ -74,10 +131,181 @@ class RadioManager:
                 error=self._error,
             )
 
+    def refresh_async_state(self) -> list[RadioStateEvent]:
+        drain = getattr(self.client, "drain_radio_state_events", None)
+        if drain is None:
+            return []
+        try:
+            events = list(drain())
+        except Exception as exc:
+            LOGGER.warning("Unable to consume async radio state: %s", exc)
+            return []
+        if not events:
+            return []
+        with self._lock:
+            for event in events:
+                if event.property == RadioStateProperty.FREQUENCY:
+                    if not event.requires_reconciliation:
+                        try:
+                            self._frequency_hz = int(event.value)
+                        except (TypeError, ValueError):
+                            continue
+                        self._last_read_at_utc = _utc_now()
+                        self._async_reconciliation_misses = 0
+                elif event.property == RadioStateProperty.MODE:
+                    if not event.requires_reconciliation:
+                        self._mode = str(event.value)
+                elif event.property == RadioStateProperty.VFO:
+                    if not event.requires_reconciliation:
+                        self._vfo = str(event.value)
+                self._connected = True
+                self._error = None
+                self._consecutive_failures = 0
+                self._pending_state_events.append(event)
+        return events
+
+    def is_async_property_verified(self, property: RadioStateProperty | str) -> bool:
+        checker = getattr(self.client, "is_async_property_verified", None)
+        return bool(checker and checker(property))
+
+    def async_status(self) -> dict[str, object]:
+        status = getattr(self.client, "async_status", None)
+        if status is None:
+            return {
+                "preference": "polling",
+                "state": "unsupported",
+                "available": False,
+                "healthy": False,
+                "verified_properties": [],
+            }
+        return dict(status())
+
+    def get_frequency_for_reconciliation(self) -> RadioFrequencyObservation:
+        self.refresh_async_state()
+        now = monotonic()
+        external_event: RadioStateEvent | None = None
+        self_echo_seen = False
+        requires_reconciliation = False
+        with self._lock:
+            while (
+                self._pending_state_events
+                and now - self._pending_state_events[0].timestamp
+                > PENDING_EXTERNAL_EVENT_WINDOW_S
+            ):
+                self._pending_state_events.popleft()
+            retained: deque[RadioStateEvent] = deque(maxlen=64)
+            while self._pending_state_events:
+                event = self._pending_state_events.popleft()
+                if event.property != RadioStateProperty.FREQUENCY:
+                    retained.append(event)
+                    continue
+                if event.requires_reconciliation:
+                    requires_reconciliation = True
+                elif event.classification == RadioStateClassification.EXTERNAL_CHANGE:
+                    external_event = event
+                elif event.classification == RadioStateClassification.SELF_ECHO:
+                    self_echo_seen = True
+            self._pending_state_events = retained
+            cached_frequency = self._frequency_hz
+            reconciliation_due = (
+                now - self._last_reconciliation_poll_at >= ASYNC_RECONCILIATION_POLL_S
+            )
+
+        if external_event is not None:
+            return RadioFrequencyObservation(
+                frequency_hz=int(external_event.value),
+                classification=RadioStateClassification.EXTERNAL_CHANGE,
+                timestamp=external_event.timestamp,
+            )
+
+        async_verified = self.is_async_property_verified(RadioStateProperty.FREQUENCY)
+        if async_verified and not requires_reconciliation and not reconciliation_due:
+            return RadioFrequencyObservation(
+                frequency_hz=cached_frequency,
+                classification=(
+                    RadioStateClassification.SELF_ECHO
+                    if self_echo_seen
+                    else RadioStateClassification.STATE_REFRESH
+                ),
+                timestamp=now,
+            )
+
+        try:
+            frequency_hz = self.get_frequency()
+        except Exception as exc:
+            return RadioFrequencyObservation(
+                frequency_hz=cached_frequency,
+                classification=RadioStateClassification.STATE_REFRESH,
+                timestamp=now,
+                from_poll=True,
+                error=str(exc),
+            )
+        classification = RadioStateClassification.STATE_REFRESH
+        if async_verified and cached_frequency is not None:
+            if frequency_hz != cached_frequency:
+                classification = RadioStateClassification.EXTERNAL_CHANGE
+                with self._lock:
+                    self._async_reconciliation_misses += 1
+                    mismatch_count = self._async_reconciliation_misses
+                LOGGER.info(
+                    "async_reconciliation_miss vfo=%s cached=%s polled=%s "
+                    "count=%s/%s recovered_by_poll",
+                    self.target_vfo or "current",
+                    cached_frequency,
+                    frequency_hz,
+                    mismatch_count,
+                    ASYNC_RECONCILIATION_MISS_THRESHOLD,
+                )
+                if mismatch_count >= ASYNC_RECONCILIATION_MISS_THRESHOLD:
+                    marker = getattr(
+                        self.client,
+                        "mark_async_property_unverified",
+                        None,
+                    )
+                    if marker is not None:
+                        marker(
+                            RadioStateProperty.FREQUENCY,
+                            reason=(
+                                "repeated_reconciliation_mismatch "
+                                f"count={mismatch_count} "
+                                f"cached={cached_frequency} polled={frequency_hz}"
+                            ),
+                        )
+                    with self._lock:
+                        self._async_reconciliation_misses = 0
+            else:
+                with self._lock:
+                    self._async_reconciliation_misses = 0
+        elif not async_verified:
+            with self._lock:
+                self._async_reconciliation_misses = 0
+        return RadioFrequencyObservation(
+            frequency_hz=frequency_hz,
+            classification=classification,
+            timestamp=now,
+            from_poll=True,
+        )
+
+    def connection_generation(self) -> int:
+        with self._lock:
+            self._refresh_client_generation_locked()
+            return self._client_generation or 0
+
     def get_frequency(self) -> int:
         with self._lock:
             try:
-                frequency_hz = self.client.get_frequency()
+                if self.poll_target_vfo and hasattr(self.client, "get_frequency_on_vfo"):
+                    frequency_hz = self.client.get_frequency_on_vfo(
+                        normalize_hamlib_vfo(self.target_vfo)
+                    )
+                    self._vfo = normalize_hamlib_vfo(self.target_vfo)
+                elif self.poll_target_vfo:
+                    self._select_vfo_locked(self.target_vfo, source="radio_manager.get_frequency")
+                    frequency_hz = self.client.get_frequency()
+                else:
+                    frequency_hz = self.client.get_frequency()
+            except RadioOperationDeferred:
+                raise
             except Exception as exc:
                 self._record_error(exc)
                 raise
@@ -86,6 +314,7 @@ class RadioManager:
             self._connected = True
             self._frequency_hz = frequency_hz
             self._last_read_at_utc = _utc_now()
+            self._last_reconciliation_poll_at = monotonic()
             self._error = None
             self._consecutive_failures = 0
         if not was_connected:
@@ -109,7 +338,29 @@ class RadioManager:
                     source or "unknown",
                     frequency_hz,
                 )
-                self.client.set_frequency(frequency_hz)
+                normalized_vfo = normalize_hamlib_vfo(self.target_vfo)
+                restore_vfo = normalize_hamlib_vfo(self.restore_vfo_after_write)
+                split_mode_vfo = normalize_hamlib_vfo(self.split_mode_vfo)
+                if split_mode_vfo and hasattr(self.client, "set_split_frequency"):
+                    self.client.set_split_frequency(frequency_hz)
+                elif restore_vfo and hasattr(self.client, "set_frequency_on_vfo_and_restore"):
+                    self.client.set_frequency_on_vfo_and_restore(
+                        normalized_vfo,
+                        frequency_hz,
+                        restore_vfo,
+                    )
+                    self._vfo = restore_vfo
+                elif hasattr(self.client, "set_frequency_on_vfo"):
+                    self.client.set_frequency_on_vfo(normalized_vfo, frequency_hz)
+                    self._vfo = normalized_vfo
+                else:
+                    self._select_vfo_locked(
+                        self.target_vfo,
+                        source=source or "radio_manager.set_frequency",
+                    )
+                    self.client.set_frequency(frequency_hz)
+            except RadioOperationDeferred:
+                raise
             except Exception as exc:
                 self._record_error(exc)
                 raise
@@ -133,20 +384,31 @@ class RadioManager:
             return self.set_frequency(frequency_hz, source=source)
         except ValueError:
             raise
-        except Exception:
-            return self.snapshot()
+        except RadioOperationDeferred as exc:
+            return self._snapshot_with_error(str(exc))
+        except Exception as exc:
+            return self._snapshot_with_error(str(exc))
 
     def set_mode(
         self,
         mode: str,
         passband_hz: int = 0,
         source: str = "",
+        force: bool = False,
     ) -> RadioDeviceSnapshot:
         normalized_mode = normalize_hamlib_mode(mode)
-        if not self.write_enabled or normalized_mode is None:
+        if not self.write_enabled:
+            return self.snapshot()
+        if normalized_mode is None:
+            LOGGER.info(
+                "cat_command source=%s op=set_mode skipped=unsupported_profile_mode profile_mode=%s",
+                source or "unknown",
+                mode,
+            )
             return self.snapshot()
         with self._lock:
-            if self._mode == normalized_mode:
+            self._refresh_client_generation_locked()
+            if self._mode == normalized_mode and not force:
                 return self.snapshot()
 
             try:
@@ -156,7 +418,34 @@ class RadioManager:
                     normalized_mode,
                     passband_hz,
                 )
-                self.client.set_mode(normalized_mode, passband_hz)
+                normalized_vfo = normalize_hamlib_vfo(self.target_vfo)
+                restore_vfo = normalize_hamlib_vfo(self.restore_vfo_after_write)
+                split_mode_vfo = normalize_hamlib_vfo(self.split_mode_vfo)
+                if split_mode_vfo and hasattr(self.client, "set_split_mode"):
+                    self.client.set_split_mode(normalized_mode, passband_hz)
+                elif restore_vfo and hasattr(self.client, "set_mode_on_vfo_and_restore"):
+                    self.client.set_mode_on_vfo_and_restore(
+                        normalized_vfo,
+                        normalized_mode,
+                        passband_hz,
+                        restore_vfo,
+                    )
+                    self._vfo = restore_vfo
+                elif hasattr(self.client, "set_mode_on_vfo"):
+                    self.client.set_mode_on_vfo(
+                        normalized_vfo,
+                        normalized_mode,
+                        passband_hz,
+                    )
+                    self._vfo = normalized_vfo
+                else:
+                    self._select_vfo_locked(
+                        self.target_vfo,
+                        source=source or "radio_manager.set_mode",
+                    )
+                    self.client.set_mode(normalized_mode, passband_hz)
+            except RadioOperationDeferred:
+                raise
             except Exception as exc:
                 self._record_error(exc)
                 raise
@@ -171,16 +460,86 @@ class RadioManager:
             LOGGER.info("Radio mode connection restored")
         return self.snapshot()
 
+    def set_ctcss_tone(
+        self,
+        tone_hz: float | None,
+        source: str = "",
+    ) -> RadioDeviceSnapshot:
+        if not self.write_enabled:
+            return self.snapshot()
+        tone_tenths_hz = 0 if tone_hz is None else int(round(float(tone_hz) * 10.0))
+        if tone_tenths_hz < 0:
+            raise ValueError("CTCSS tone cannot be negative")
+        with self._lock:
+            self._refresh_client_generation_locked()
+            if self._ctcss_tone_tenths_hz == tone_tenths_hz:
+                return self.snapshot()
+            normalized_vfo = normalize_hamlib_vfo(self.target_vfo)
+            try:
+                LOGGER.info(
+                    "cat_command source=%s op=set_ctcss_tone tone_tenths_hz=%s",
+                    source or "unknown",
+                    tone_tenths_hz,
+                )
+                if hasattr(self.client, "set_ctcss_tone_on_vfo"):
+                    self.client.set_ctcss_tone_on_vfo(
+                        normalized_vfo,
+                        tone_tenths_hz,
+                    )
+                else:
+                    self._select_vfo_locked(
+                        normalized_vfo,
+                        source=source or "radio_manager.set_ctcss_tone",
+                    )
+                    self.client.set_ctcss_tone(tone_tenths_hz)
+                enabled = tone_tenths_hz > 0
+                if hasattr(self.client, "set_tone_enabled_on_vfo"):
+                    self.client.set_tone_enabled_on_vfo(normalized_vfo, enabled)
+                else:
+                    self.client.set_tone_enabled(enabled)
+            except RadioOperationDeferred:
+                raise
+            except Exception as exc:
+                self._record_error(exc)
+                raise
+            self._ctcss_tone_tenths_hz = tone_tenths_hz
+            self._last_write_at_utc = _utc_now()
+            self._error = None
+            self._consecutive_failures = 0
+        return self.snapshot()
+
+    def try_set_ctcss_tone(
+        self,
+        tone_hz: float | None,
+        source: str = "",
+    ) -> RadioDeviceSnapshot:
+        try:
+            return self.set_ctcss_tone(tone_hz, source=source)
+        except ValueError:
+            raise
+        except RadioOperationDeferred as exc:
+            return self._snapshot_with_error(str(exc))
+        except Exception as exc:
+            return self._snapshot_with_error(str(exc))
+
     def try_set_mode(
         self,
         mode: str,
         passband_hz: int = 0,
         source: str = "",
+        force: bool = False,
     ) -> RadioDeviceSnapshot:
         try:
-            return self.set_mode(mode, passband_hz=passband_hz, source=source)
-        except Exception:
-            return self.snapshot()
+            return self.set_mode(
+                mode,
+                passband_hz=passband_hz,
+                source=source,
+                force=force,
+            )
+        except RadioOperationDeferred as exc:
+            return self._snapshot_with_error(str(exc))
+        except Exception as exc:
+            return self._snapshot_with_error(str(exc))
 
     def set_vfo(self, vfo: str | None, source: str = "") -> RadioDeviceSnapshot:
         normalized_vfo = normalize_hamlib_vfo(vfo)
@@ -191,12 +550,9 @@ class RadioManager:
                 return self.snapshot()
 
             try:
-                LOGGER.info(
-                    "cat_command source=%s op=set_vfo vfo=%s",
-                    source or "unknown",
-                    normalized_vfo,
-                )
-                self.client.select_vfo(normalized_vfo)
+                self._select_vfo_locked(normalized_vfo, source=source or "radio_manager.set_vfo")
+            except RadioOperationDeferred:
+                raise
             except Exception as exc:
                 self._record_error(exc)
                 raise
@@ -214,15 +570,119 @@ class RadioManager:
     def try_set_vfo(self, vfo: str | None, source: str = "") -> RadioDeviceSnapshot:
         try:
             return self.set_vfo(vfo, source=source)
-        except Exception:
+        except RadioOperationDeferred as exc:
+            return self._snapshot_with_error(str(exc))
+        except Exception as exc:
+            return self._snapshot_with_error(str(exc))
+
+    def set_split_mode_enabled(self, tx_vfo: str | None, source: str = "") -> RadioDeviceSnapshot:
+        normalized_tx_vfo = normalize_hamlib_vfo(tx_vfo)
+        if not self.write_enabled or normalized_tx_vfo is None:
             return self.snapshot()
+        with self._lock:
+            try:
+                LOGGER.info(
+                    "cat_command source=%s op=set_split tx_vfo=%s",
+                    source or "unknown",
+                    normalized_tx_vfo,
+                )
+                self.client.set_split(True, normalized_tx_vfo)
+            except RadioOperationDeferred:
+                raise
+            except Exception as exc:
+                self._record_error(exc)
+                raise
+
+            was_connected = self._connected
+            self._connected = True
+            self._last_write_at_utc = _utc_now()
+            self._error = None
+            self._consecutive_failures = 0
+        if not was_connected:
+            LOGGER.info("Radio split connection restored")
+        return self.snapshot()
+
+    def try_set_split_mode_enabled(self, tx_vfo: str | None, source: str = "") -> RadioDeviceSnapshot:
+        try:
+            return self.set_split_mode_enabled(tx_vfo, source=source)
+        except RadioOperationDeferred as exc:
+            return self._snapshot_with_error(str(exc))
+        except Exception as exc:
+            return self._snapshot_with_error(str(exc))
+
+    def set_split_mode_disabled(
+        self,
+        source: str = "",
+        force: bool = False,
+    ) -> RadioDeviceSnapshot:
+        if not self.write_enabled and not force:
+            return self.snapshot()
+        with self._lock:
+            try:
+                LOGGER.info(
+                    "cat_command source=%s op=clear_split",
+                    source or "unknown",
+                )
+                self.client.set_split(False, None)
+            except RadioOperationDeferred:
+                raise
+            except Exception as exc:
+                self._record_error(exc)
+                raise
+
+            was_connected = self._connected
+            self._connected = True
+            self._last_write_at_utc = _utc_now()
+            self._error = None
+            self._consecutive_failures = 0
+        if not was_connected:
+            LOGGER.info("Radio split-clear connection restored")
+        return self.snapshot()
+
+    def try_set_split_mode_disabled(
+        self,
+        source: str = "",
+        force: bool = False,
+    ) -> RadioDeviceSnapshot:
+        try:
+            return self.set_split_mode_disabled(source=source, force=force)
+        except RadioOperationDeferred as exc:
+            return self._snapshot_with_error(str(exc))
+        except Exception as exc:
+            return self._snapshot_with_error(str(exc))
 
     def poll_once(self) -> RadioDeviceSnapshot:
-        try:
-            self.get_frequency()
-        except Exception:
-            pass
+        if not self.read_poll_enabled:
+            self.refresh_async_state()
+            return self.snapshot()
+        self.get_frequency_for_reconciliation()
         return self.snapshot()
+
+    def _refresh_client_generation_locked(self) -> None:
+        ensure_connected = getattr(self.client, "ensure_connected", None)
+        if ensure_connected is None:
+            return
+        generation = int(ensure_connected())
+        if self._client_generation is not None and generation != self._client_generation:
+            self._mode = None
+            self._ctcss_tone_tenths_hz = None
+            self._vfo = None
+            self._pending_state_events.clear()
+            self._last_reconciliation_poll_at = 0.0
+            self._async_reconciliation_misses = 0
+        self._client_generation = generation
+
+    def _snapshot_with_error(self, error: str) -> RadioDeviceSnapshot:
+        state = self.snapshot()
+        return RadioDeviceSnapshot(
+            enabled=state.enabled,
+            connected=state.connected,
+            write_enabled=state.write_enabled,
+            frequency_hz=state.frequency_hz,
+            last_read_at_utc=state.last_read_at_utc,
+            last_write_at_utc=state.last_write_at_utc,
+            error=error,
+        )
 
     def _record_error(self, exc: Exception) -> None:
         with self._lock:
@@ -262,11 +722,39 @@ def normalize_hamlib_mode(mode: str | None) -> str | None:
         "NFM": "FM",
         "FM-N": "FM",
         "FM-W": "WFM",
+        "FM-D": "PKTFM",
         "WIDEFM": "WFM",
         "PKT": "PKTFM",
         "PACKET": "PKTFM",
+        "AFSK": "PKTFM",
+        "SSTV": "FM",
     }
-    return mapping.get(first, first)
+    normalized = mapping.get(first, first)
+    supported_modes = {
+        "AM",
+        "AMS",
+        "CW",
+        "CWR",
+        "DD",
+        "DSB",
+        "DV",
+        "ECSSLSB",
+        "ECSSUSB",
+        "FAX",
+        "FM",
+        "LSB",
+        "PKTFM",
+        "PKTLSB",
+        "PKTUSB",
+        "RTTY",
+        "RTTYR",
+        "SAH",
+        "SAL",
+        "SAM",
+        "USB",
+        "WFM",
+    }
+    return normalized if normalized in supported_modes else None
 
 
 def normalize_hamlib_vfo(vfo: str | None) -> str | None:
@@ -278,5 +766,11 @@ def normalize_hamlib_vfo(vfo: str | None) -> str | None:
         "B": "VFOB",
         "VFOA": "VFOA",
         "VFOB": "VFOB",
+        "MAINA": "MainA",
+        "MAINB": "MainB",
+        "MAINC": "MainC",
+        "SUBA": "SubA",
+        "SUBB": "SubB",
+        "SUBC": "SubC",
     }
     return mapping.get(value, value)

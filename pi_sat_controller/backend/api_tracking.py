@@ -7,6 +7,17 @@ from typing import Any
 from fastapi import Body, FastAPI, HTTPException, Query
 
 
+def _parse_boolean(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise HTTPException(status_code=400, detail=f"{field_name} must be a boolean")
+
+
 def register_tracking_api(
     app: FastAPI,
     *,
@@ -14,7 +25,9 @@ def register_tracking_api(
     get_tx_radio_manager: Callable[[], Any],
     get_rx_tracking_manager: Callable[[], Any],
     get_rotator_manager: Callable[[], Any],
-    get_or_create_rx_tracking_manager: Callable[[int | None, int], Any],
+    start_rx_tracking_manager: Callable[[int | None, int, bool | None, str], Any],
+    mutate_rx_tracking_manager: Callable[[int | None, int, Callable[[Any], Any]], Any],
+    get_autotrack_enabled: Callable[[], bool],
     disabled_sdr_snapshot: Callable[[], Any],
     disabled_radio_snapshot: Callable[[], Any],
     disabled_rotator_snapshot: Callable[[], Any],
@@ -22,6 +35,17 @@ def register_tracking_api(
     payload_frequency_profile_index: Callable[[dict[str, Any]], int],
     build_orbital_engine: Callable[[], Any],
 ) -> None:
+    def tracking_payload(manager: Any, snapshot: Any) -> dict[str, object]:
+        result = snapshot.to_dict()
+        try:
+            result["frequency_profile_index"] = manager.satellite.transponders.index(
+                manager.transponder
+            )
+        except (AttributeError, ValueError):
+            result["frequency_profile_index"] = None
+        result["autotrack_next_pass"] = get_autotrack_enabled()
+        return result
+
     @app.get("/api/devices/sdr/frequency")
     def get_sdr_frequency() -> dict[str, object]:
         sdr_manager = get_sdr_manager()
@@ -66,25 +90,46 @@ def register_tracking_api(
         if rx_tracking_manager is None:
             return {
                 "active": False,
+                "manual_offsets_enabled": True,
                 "sync_offsets": True,
+                "virtual_rit_hz": 0,
+                "frequency_profile_index": None,
+                "autotrack_next_pass": get_autotrack_enabled(),
                 "error": "RX tracking has not been started",
             }
-        return rx_tracking_manager.snapshot().to_dict()
+        snapshot = rx_tracking_manager.snapshot()
+        if not snapshot.active:
+            rx_tracking_manager.refresh_snapshot_only()
+            snapshot = rx_tracking_manager.snapshot()
+        return tracking_payload(rx_tracking_manager, snapshot)
 
     @app.post("/api/tracking/rx/start")
     def start_rx_tracking(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, object]:
         norad_id = None
         frequency_profile_index = 0
         if payload:
-            raw_norad = payload.get("norad_id")
-            norad_id = int(raw_norad) if raw_norad else None
-            raw_profile_index = payload.get("frequency_profile_index")
-            frequency_profile_index = int(raw_profile_index) if raw_profile_index else 0
-        manager = get_or_create_rx_tracking_manager(norad_id, frequency_profile_index)
-        if payload and "sync_offsets" in payload:
-            manager.set_offset_sync(bool(payload["sync_offsets"]))
-        manager.start()
-        return manager.snapshot().to_dict()
+            try:
+                raw_norad = payload.get("norad_id")
+                norad_id = int(raw_norad) if raw_norad else None
+                raw_profile_index = payload.get("frequency_profile_index")
+                frequency_profile_index = int(raw_profile_index) if raw_profile_index else 0
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="NORAD ID and frequency profile index must be integers",
+                ) from exc
+        requested_sync = (
+            _parse_boolean(payload["sync_offsets"], "sync_offsets")
+            if payload and "sync_offsets" in payload
+            else None
+        )
+        manager = start_rx_tracking_manager(
+            norad_id,
+            frequency_profile_index,
+            requested_sync,
+            "browser",
+        )
+        return tracking_payload(manager, manager.snapshot())
 
     @app.post("/api/tracking/rx/stop")
     def stop_rx_tracking() -> dict[str, object]:
@@ -97,49 +142,99 @@ def register_tracking_api(
     @app.post("/api/tracking/rx/reset-offset")
     def reset_rx_tracking_offset(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, object]:
         payload = payload or {}
-        manager = get_or_create_rx_tracking_manager(
+        def reset(manager):
+            if "sync_offsets" in payload:
+                manager.set_offset_sync(
+                    _parse_boolean(payload["sync_offsets"], "sync_offsets")
+                )
+            return manager.reset_offset()
+
+        return mutate_rx_tracking_manager(
             payload_norad_id(payload),
             payload_frequency_profile_index(payload),
-        )
-        if "sync_offsets" in payload:
-            manager.set_offset_sync(bool(payload["sync_offsets"]))
-        return manager.reset_offset().to_dict()
+            reset,
+        ).to_dict()
 
     @app.post("/api/tracking/offset-sync")
     def set_tracking_offset_sync(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
-        manager = get_or_create_rx_tracking_manager(
+        return mutate_rx_tracking_manager(
             payload_norad_id(payload),
             payload_frequency_profile_index(payload),
-        )
-        return manager.set_offset_sync(bool(payload.get("enabled", True))).to_dict()
+            lambda manager: manager.set_offset_sync(
+                _parse_boolean(payload.get("enabled", True), "enabled")
+            ),
+        ).to_dict()
+
+    @app.post("/api/tracking/manual-offsets")
+    def set_tracking_manual_offsets(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        return mutate_rx_tracking_manager(
+            payload_norad_id(payload),
+            payload_frequency_profile_index(payload),
+            lambda manager: manager.set_manual_offsets_enabled(
+                _parse_boolean(payload.get("enabled", True), "enabled")
+            ),
+        ).to_dict()
 
     @app.post("/api/tracking/rx/step")
     def step_rx_tracking_offset(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
-        manager = get_or_create_rx_tracking_manager(
-            payload_norad_id(payload),
-            payload_frequency_profile_index(payload),
-        )
-        if "sync_offsets" in payload:
-            manager.set_offset_sync(bool(payload["sync_offsets"]))
         try:
             step_hz = int(payload["step_hz"])
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Request body must include integer step_hz") from exc
-        return manager.adjust_downlink_offset(step_hz).to_dict()
+        def step(manager):
+            if "sync_offsets" in payload:
+                manager.set_offset_sync(
+                    _parse_boolean(payload["sync_offsets"], "sync_offsets")
+                )
+            return manager.adjust_downlink_offset(step_hz)
+
+        return mutate_rx_tracking_manager(
+            payload_norad_id(payload),
+            payload_frequency_profile_index(payload),
+            step,
+        ).to_dict()
+
+    @app.post("/api/tracking/rx/virtual-rit/step")
+    def step_rx_virtual_rit(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        try:
+            step_hz = int(payload["step_hz"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Request body must include integer step_hz",
+            ) from exc
+        return mutate_rx_tracking_manager(
+            payload_norad_id(payload),
+            payload_frequency_profile_index(payload),
+            lambda manager: manager.adjust_virtual_rit(step_hz),
+        ).to_dict()
+
+    @app.post("/api/tracking/rx/virtual-rit/reset")
+    def reset_rx_virtual_rit(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        return mutate_rx_tracking_manager(
+            payload_norad_id(payload),
+            payload_frequency_profile_index(payload),
+            lambda manager: manager.reset_virtual_rit(),
+        ).to_dict()
 
     @app.post("/api/tracking/tx/step")
     def step_tx_tracking_offset(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
-        manager = get_or_create_rx_tracking_manager(
-            payload_norad_id(payload),
-            payload_frequency_profile_index(payload),
-        )
-        if "sync_offsets" in payload:
-            manager.set_offset_sync(bool(payload["sync_offsets"]))
         try:
             step_hz = int(payload["step_hz"])
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Request body must include integer step_hz") from exc
-        return manager.adjust_uplink_offset(step_hz).to_dict()
+        def step(manager):
+            if "sync_offsets" in payload:
+                manager.set_offset_sync(
+                    _parse_boolean(payload["sync_offsets"], "sync_offsets")
+                )
+            return manager.adjust_uplink_offset(step_hz)
+
+        return mutate_rx_tracking_manager(
+            payload_norad_id(payload),
+            payload_frequency_profile_index(payload),
+            step,
+        ).to_dict()
 
     @app.get("/api/devices/rotator")
     def get_rotator_status() -> dict[str, object]:

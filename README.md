@@ -15,9 +15,10 @@ Pi-Sat is a local web control surface for satellite operations. It combines pass
 
 The Raspberry Pi owns the backend, device control, and tracking logic. The browser is the operator console.
 
-I had a few use cases for myself that existing software was not doing for me, so I decided to make this for my own use and share it freely. I have zero plans to monitize any of this. If you want to try it, feel free to do so. Report issues, make suggestions for features, and submit code improvements as well if you'd like!
-
-Want more infomation about how you can get started? Be sure to check out the wiki: [Pi-sat Controller Wiki](https://github.com/W9KSB/Pi-Sat/wiki) 
+Setup and operating guidance is available in the [Pi-Sat Controller Wiki](https://github.com/W9KSB/Pi-Sat/wiki).
+Hardware support depends on the selected Hamlib backend and device. Report
+compatibility problems or hardware-specific behavior in
+[GitHub Issues](https://github.com/W9KSB/Pi-Sat/issues).
 
 <p align="center">
   <img alt="Dashboard" src="https://www.w9ksb.com/wp-content/uploads/2026/06/Dashboard.jpg">
@@ -28,22 +29,31 @@ Want more infomation about how you can get started? Be sure to check out the wik
 - Live pass tracking with map and pass arc display
 - Doppler-aware RX/TX tuning
 - SDR, radio, and rotator control
+- Native IC-9700 CI-V control and bidirectional audio over LAN connectivity
 - Multi-source TLE loading and merge handling
 - Satellite profile management
 - Monitor page with backend event logging
+- Optional live SSTV decoding from the existing native IC-9700 SUB/RX audio stream
+- Optional APRS decoding from a selectable side of the native IC-9700 RX audio
+  stream, plus manual APRS transmit of a beacon, status line, or message
 - Systemd-based Pi service install and update flow
 
 ## Software Requirements
 
 - Raspberry Pi OS or another Debian-based Linux environment
-- Raspberry Pi 3B and above tested
+- Raspberry Pi 3B or newer
 - Python 3 with `venv`
 - `git`
+- Rust 1.85 or newer and Cargo (the installer uses the OS packages and verifies the version)
+- Dire Wolf for the optional APRS receiver and `gen_packets` transmit modulator
+  (installed by the installer, or built from source)
 - Hamlib utilities through `libhamlib-utils`
   - `rigctl`
   - `rigctld`
   - `rotctl`
   - `rotctld`
+
+Hamlib 4.6 or newer can reduce radio read traffic by publishing generic asynchronous state updates. This optimization is optional: Pi-Sat detects the installed version and selected backend at runtime and retains normal polling when it is unavailable. Raspberry Pi OS Trixie's Hamlib 4.6.2 package is supported. See [Radio State Updates](docs/radio-state-updates.md) for configuration and troubleshooting.
 
 ## Quick Install
 
@@ -60,10 +70,18 @@ curl -fsSL https://raw.githubusercontent.com/W9KSB/Pi-Sat/main/install/install_p
 - creates `update_pi.sh` from `updater.template` if needed
 - creates `.venv`
 - installs Python dependencies from `requirements.txt`
+- grants the service user serial-device access for local USB/serial radios and rotators
+- builds the persistent `slowrx.rs` SSTV decoder worker
+- installs Dire Wolf for the optional APRS receiver
 - installs the `pi-sat` systemd service
 - starts the service
 
-After install, open the Pi in a browser on your local network.
+After install, open `https://<PI-IP>/` in a browser on your local network.
+Pi-Sat defaults to HTTPS on port 443.
+On first start it generates a self-signed certificate if none exists, then reuses
+it on subsequent starts. Browser certificate acceptance/trust and microphone
+permission are still required. See [HTTPS setup](docs/https.md) for certificates,
+custom ports, and the explicit HTTP option for reverse proxies.
 
 ### Useful Service Commands
 
@@ -73,11 +91,10 @@ sudo systemctl restart pi-sat
 journalctl -u pi-sat -f
 ```
 
-## Manual Control
-Be sure to check out the wiki if you want more manual control in terms of installing or updating. The whole project is open source as well if you need to change anything and personalize your setup.
+## Manual Installation and Updates
 
-## AI Usage
-This always comes up so I want to be upfront. I've been coding with python for 8-10 years or so now and have had many fun projects as part of my hobbies. That being said, I do use AI to assist with tasks and productivity. A couple of examples are documentation and the gui interface. I'll admit it, I do not have an artistic bone in my body, so helping with visuals is a great use for me. That being said, I am transparent with this code - it's all open source. You're free to evaluate any functionality as you wish and customize as you please.
+See the [Pi-Sat Controller Wiki](https://github.com/W9KSB/Pi-Sat/wiki) for
+manual installation, update, and customization guidance.
 
 
 ## Credits
@@ -86,6 +103,10 @@ This always comes up so I want to be upfront. I've been coding with python for 8
 
 - [Hamlib](https://hamlib.github.io/) for radio and rotator control interfaces
 - [Skyfield](https://rhodesmill.org/skyfield/) for orbital calculations and pass prediction
+- [slowrx.rs](https://github.com/jasonherald/slowrx.rs), based on slowrx by Oona Räisänen (OH2EIQ), for SSTV decoding
+- [Dire Wolf](https://github.com/wb2osz/direwolf) by John Langner (WB2OSZ) for APRS and AX.25 decoding
+
+Full third-party notices for the SSTV decoder and the APRS receiver are preserved in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 
 ### Data Sources

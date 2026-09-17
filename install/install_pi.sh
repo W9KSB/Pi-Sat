@@ -7,7 +7,7 @@ REPO_URL="${REPO_URL:-https://github.com/W9KSB/Pi-Sat.git}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/pi-sat}"
 RUN_USER="$(id -un)"
 STEP=0
-TOTAL_STEPS=6
+TOTAL_STEPS=7
 
 log_step() {
   STEP=$((STEP + 1))
@@ -39,8 +39,10 @@ echo "That is normal."
 log_step "Installing system packages"
 log_info "Running apt update"
 sudo apt update
-log_info "Installing python3-venv, python3-pip, git, and libhamlib-utils"
-sudo apt install -y python3-venv python3-pip git libhamlib-utils
+log_info "Installing Python, Git, Hamlib, Dire Wolf, and the Rust build toolchain"
+sudo apt install -y python3-venv python3-pip git libhamlib-utils direwolf cargo build-essential
+log_info "Granting the service user serial-device access"
+sudo usermod -aG dialout "${RUN_USER}"
 
 if [ -d "${INSTALL_DIR}/.git" ]; then
   log_step "Updating existing Pi-Sat checkout"
@@ -105,6 +107,27 @@ python -m pip install --upgrade pip
 log_info "Installing Python dependencies from requirements.txt"
 python -m pip install -r requirements.txt
 
+log_step "Building the slowrx.rs SSTV decoder"
+RUST_VERSION="$(rustc --version | awk '{print $2}')"
+RUST_MAJOR="$(printf '%s' "${RUST_VERSION}" | cut -d. -f1)"
+RUST_MINOR="$(printf '%s' "${RUST_VERSION}" | cut -d. -f2)"
+if [ "${RUST_MAJOR}" -lt 1 ] || { [ "${RUST_MAJOR}" -eq 1 ] && [ "${RUST_MINOR}" -lt 85 ]; }; then
+  echo "slowrx.rs requires Rust 1.85 or newer; installed version is ${RUST_VERSION}."
+  echo "Install a current Rust toolchain, then run this installer again."
+  exit 1
+fi
+cargo build --locked --release --manifest-path sstv_decoder/Cargo.toml
+mkdir -p bin
+install -m 0755 sstv_decoder/target/release/pi-sat-sstv-decoder bin/pi-sat-sstv-decoder
+log_info "Installed the persistent decoder worker in ${INSTALL_DIR}/bin"
+
+log_step "Checking Dire Wolf for the APRS module"
+if command -v direwolf >/dev/null 2>&1; then
+  log_info "Dire Wolf is available at $(command -v direwolf)"
+else
+  log_info "Dire Wolf is unavailable; the APRS module will report that when enabled."
+fi
+
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 TMP_SERVICE="$(mktemp)"
 
@@ -141,11 +164,15 @@ fi
 log_step "Enabling and starting Pi-Sat"
 log_info "Reloading systemd"
 sudo systemctl daemon-reload
-log_info "Enabling and starting ${SERVICE_NAME}"
-sudo systemctl enable --now "${SERVICE_NAME}"
+log_info "Enabling ${SERVICE_NAME}"
+sudo systemctl enable "${SERVICE_NAME}"
+log_info "Starting or restarting ${SERVICE_NAME} with the installed code"
+sudo systemctl restart "${SERVICE_NAME}"
 
 echo ""
 echo "Install complete."
 echo "Service: sudo systemctl status ${SERVICE_NAME}"
 echo "Logs:    journalctl -u ${SERVICE_NAME} -f"
-echo "URL:     http://$(hostname -I | awk '{print $1}')"
+echo "Default URL: https://$(hostname -I | awk '{print $1}')"
+echo "Custom ports / HTTP opt-out: see [server] in pi-sat-controller.conf."
+echo "First HTTPS start generates a self-signed certificate using OpenSSL if none exists."

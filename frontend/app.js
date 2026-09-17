@@ -1,4 +1,4 @@
-﻿let currentRxFrequencyHz = null;
+﻿
 let latestTracking = null;
 let selectedSatelliteNorad = null;
 let selectedFrequencyProfileIndex = 0;
@@ -9,18 +9,29 @@ let managedSatellitesCache = [];
 let managedSatelliteProfilesByNorad = new Map();
 let managedSatellitePassesByNorad = new Map();
 let trackedSatelliteNorads = new Set();
-let activeAutotrackPassKey = null;
+let trackFilterLoaded = false;
+let manualOffsetsEnabled = true;
 let syncRxTx = true;
+let nativeIcomRxActive = false;
 let frontendLogMessages = [];
 let backendLogMessages = [];
 let hamlibRadioModels = [];
 let hamlibRotatorModels = [];
 let serialDevices = [];
 let automationScripts = [];
+let catDevicesCache = [];
+let currentSettingsState = {};
 let qthTimezone = 'UTC';
 let rotatorControlEnabled = false;
+let deviceControlUpdatesPending = 0;
+const pendingDeviceControlValues = {};
+let deviceControlFlushTimer = null;
+let deviceControlFlushActive = false;
+const pendingTrackingStepsHz = { rx: 0, tx: 0, virtualRit: 0 };
+let trackingStepFlushActive = false;
 let mapRefreshPending = false;
 let mapRefreshRequestedAtMs = 0;
+let manualOffsetsToggleUpdatePending = false;
 let syncToggleUpdatePending = false;
 let trackedSatelliteLocations = [];
 let stationLatitudeDeg = null;
@@ -31,18 +42,56 @@ let groundTrackFetchedAtMs = 0;
 let qsoFinderResult = null;
 let qsoOpportunities = [];
 let selectedQsoOpportunityIndex = -1;
-const PAGE_NAMES = ['home', 'satellites', 'qso-finder', 'monitor', 'map', 'settings'];
+const PAGE_NAMES = ['home', 'radio', 'satellites', 'modules', 'monitor', 'settings'];
+const MODULE_NAV = [
+  { id: 'sstv-decoder', label: 'SSTV Decoder' },
+  { id: 'qso-finder', label: 'QSO Finder' },
+  { id: 'map', label: 'Map' },
+  { id: 'aprs', label: 'APRS' },
+];
+const SETTINGS_NAV = [
+  { id: 'application', label: 'Application Settings' },
+  { id: 'devices', label: 'Device Settings' },
+  { id: 'other', label: 'Other' },
+];
+const MODULE_NAMES = MODULE_NAV.map(({ id }) => id);
+let activeModuleName = MODULE_NAV[0].id;
+let activeSettingsSection = SETTINGS_NAV[0].id;
+let activePrimaryPageName = '';
 const MAP_REFRESH_TIMEOUT_MS = 5000;
 const MONITOR_GENERAL_DEBUG_STORAGE_KEY = 'pi-sat.monitor.general-debug';
-const DASHBOARD_MOBILE_MAX_WIDTH = 900;
+const DASHBOARD_MOBILE_MAX_WIDTH = 1100;
+const NATIVE_ICOM_DEVICE_ID = 'native-ic9700';
 let currentDashboardMode = '';
+let radioAudioSocket = null;
+let radioAudioContext = null;
+let radioAudioNextTime = 0;
+let radioMicStream = null;
+let radioMicProcessor = null;
+let radioMicSource = null;
+let radioMicStarting = false;
+let radioMicGeneration = 0;
+let radioAudioGeneration = 0;
+let radioAudioWorklet = null;
+let radioAudioWorkletLoading = null;
+let radioMicDeviceId = '';
+let radioMicGain = 1;
+let radioMicSocket = null;
+let radioMicWorklet = null;
+let radioMicWorkletLoading = null;
+let radioMicMeterAt = 0;
+let radioMicUplinkHealthy = false;
+let radioMicUplinkRetryAt = 0;
+let radioSampleRate = 16000;
+let radioRxChannels = 2;
 const hiddenSettingsKeys = {
-  server: new Set(['host', 'port', 'gui_resources_caching']),
+  server: new Set(['host', 'port', 'gui_resources_caching', 'https_enabled', 'https_port',
+    'tls_certfile', 'tls_keyfile', 'tls_names']),
   station: new Set(['latitude_deg', 'longitude_deg']),
   my_satellites: new Set(['autotrack_next_pass']),
-  rx: new Set(['cat_debug_logging', 'write_enabled']),
-  tx: new Set(['cat_debug_logging', 'write_enabled']),
-  rotator: new Set(['home_azimuth_deg', 'home_elevation_deg', 'cat_debug_logging', 'write_enabled']),
+  rx: new Set(['cat_debug_logging']),
+  tx: new Set(['cat_debug_logging', 'shared_local_split_mode']),
+  rotator: new Set(['home_azimuth_deg', 'home_elevation_deg', 'cat_debug_logging']),
   tle: new Set(['cache_dir']),
   profiles: new Set(['satellites_file']),
 };
@@ -55,25 +104,43 @@ const lastLoggedErrors = {
 const worldMapImage = new Image();
 worldMapImage.src = '/assets/world-map-equirectangular.png';
 const ADVANCED_SETTING_DESCRIPTIONS = {
-  tx_inhibit_below_horizon: 'Prevents transmit control when the tracked satellite is below the horizon.',
-  tx_inhibit_on_cat_loss: 'Stops TX-side control when CAT communication with the transmit device is lost.',
-  tx_inhibit_without_valid_pass: 'Blocks TX-side control unless the current tracking state is tied to a valid computed pass.',
   frequency_deadband_hz: 'Minimum frequency change required before a new CAT tuning command is sent.',
   cat_rate_limit_hz: 'Maximum number of CAT control updates per second sent to the live device path while tracking.',
   tracking_update_interval_ms: 'How often the tracking loop recalculates satellite position, Doppler, and control targets.',
   device_offline_failure_threshold: 'How many consecutive device failures must happen before RX, TX, SDR, or rotator is marked offline.',
+  manual_offset_readback_active_pass_only: 'When enabled, physical radio tuning is adopted as an offset only during a live pass. When disabled, it is adopted whenever tracking is active.',
 };
 const STANDARD_PAGE_NAV = PAGE_NAMES.map((page) => {
   const labelByPage = {
     home: 'Home',
+    radio: 'Radio',
     satellites: 'Satellites',
-    'qso-finder': 'QSO Finder',
+    modules: 'Modules',
     monitor: 'Monitor',
-    map: 'Map',
     settings: 'Settings',
   };
   return `<button type="button" class="btn btn-outline-primary nav-button" data-page="${page}">${labelByPage[page]}</button>`;
 }).join('');
+
+function secondaryNavigationMarkup(name) {
+  const configuration = name === 'modules'
+    ? { items: MODULE_NAV, attribute: 'data-module', label: 'Modules' }
+    : name === 'settings'
+      ? { items: SETTINGS_NAV, attribute: 'data-settings-section', label: 'Settings sections' }
+      : null;
+  if (!configuration) return '';
+  const buttons = configuration.items.map(({ id, label }) => `
+    <button type="button" class="btn btn-outline-primary section-nav-button" id="${name}-nav-${id}"
+      ${configuration.attribute}="${id}" role="tab" aria-selected="false">${label}</button>
+  `).join('');
+  return `
+    <div class="app-section-nav">
+      <nav class="nav nav-pills gap-2" aria-label="${configuration.label}" role="tablist">
+        ${buttons}
+      </nav>
+    </div>
+  `;
+}
 
 function addLog(message) {
   if (!message) {
@@ -126,6 +193,36 @@ function renderLogs() {
     time.textContent = formatLogTime(entry.timestampMs);
     const message = document.createElement('span');
     message.className = `log-message-${category}`;
+    message.textContent = formatLogMessage(entry);
+    item.append(time, message);
+    list.appendChild(item);
+  });
+  renderIcomLogs();
+}
+
+function renderIcomLogs() {
+  const list = document.getElementById('icom-log-list');
+  if (!list) return;
+  list.replaceChildren();
+  const entries = [...backendLogMessages, ...frontendLogMessages]
+    .filter((entry) => String(entry.source || '').includes('.radio.icom_') || String(entry.message || '').includes('icom_debug'))
+    .sort((left, right) => (right.timestampMs || 0) - (left.timestampMs || 0))
+    .slice(0, 100);
+  if (!entries.length) {
+    const empty = document.createElement('div');
+    empty.className = 'text-body-secondary small';
+    empty.textContent = 'No native Icom entries yet.';
+    list.appendChild(empty);
+    return;
+  }
+  entries.forEach((entry) => {
+    const item = document.createElement('div');
+    item.className = 'log-item';
+    const time = document.createElement('span');
+    time.className = 'log-time';
+    time.textContent = formatLogTime(entry.timestampMs);
+    const message = document.createElement('span');
+    message.className = 'log-message-general';
     message.textContent = formatLogMessage(entry);
     item.append(time, message);
     list.appendChild(item);
@@ -217,10 +314,56 @@ async function fetchJson(url, fallback) {
   }
 }
 
+// The device master switches appear in every page header, so they are addressed
+// by role instead of by element id and are kept in step with each other.
+const DEVICE_CONTROLS = [
+  ['rx', 'RX control', 'rx_enabled'],
+  ['tx', 'TX control', 'tx_enabled'],
+  ['rotator', 'Rotator control', 'rotator_enabled'],
+];
+const DEVICE_CONTROL_SETTINGS_KEYS = Object.fromEntries(
+  DEVICE_CONTROLS.map(([control, , settingsKey]) => [control, settingsKey]),
+);
+
+function deviceControlToggles(control) {
+  return Array.from(document.querySelectorAll(`[data-device-control="${control}"]`));
+}
+
+function deviceControlChecked(control) {
+  const toggles = deviceControlToggles(control);
+  return toggles.length ? Boolean(toggles[0].checked) : false;
+}
+
+function setDeviceControlChecked(control, enabled) {
+  deviceControlToggles(control).forEach((toggle) => {
+    toggle.checked = enabled;
+  });
+}
+
+function bindDeviceControlToggles(root) {
+  root.querySelectorAll('[data-device-control]').forEach((toggle) => {
+    if (toggle.dataset.deviceControlBound) {
+      return;
+    }
+    toggle.dataset.deviceControlBound = '1';
+    toggle.addEventListener('change', updateDeviceControl);
+  });
+}
+
+function deviceControlSwitchesMarkup() {
+  return `<div class="header-switches">${DEVICE_CONTROLS.map(([control, label]) => `
+        <label class="form-check form-switch mb-0">
+          <input class="form-check-input" type="checkbox" role="switch" data-device-control="${control}">
+          <span class="form-check-label">${label}</span>
+        </label>`).join('')}
+      </div>`;
+}
+
 function renderStandardPageHeaders() {
   document.querySelectorAll('.standard-page-header').forEach((header) => {
     const title = header.dataset.pageTitle || '';
     const subtitle = header.dataset.pageSubtitle || '';
+    const secondaryNavigation = secondaryNavigationMarkup(header.dataset.subnav || '');
     header.innerHTML = `
       <div class="card-body">
         <div class="standard-header-grid">
@@ -238,9 +381,10 @@ function renderStandardPageHeaders() {
               ${STANDARD_PAGE_NAV}
             </nav>
           </div>
-          <div class="standard-header-spacer" aria-hidden="true"></div>
+          <div class="standard-header-controls">${deviceControlSwitchesMarkup()}</div>
         </div>
       </div>
+      ${secondaryNavigation}
     `;
   });
 }
@@ -262,41 +406,499 @@ async function refreshMonitorLogs() {
 }
 
 async function loadStatus() {
-  const response = await fetch('/api/status');
-  const status = await response.json();
+  try {
+    const response = await fetch('/api/status');
+    const status = await response.json();
 
-  document.getElementById('station').textContent =
-    `${status.station.name}: ${status.station.latitude_deg}, ${status.station.longitude_deg}`;
-  stationLatitudeDeg = Number(status.station.latitude_deg);
-  stationLongitudeDeg = Number(status.station.longitude_deg);
-  qthTimezone = status.station.timezone || 'UTC';
-  const rxToggle = document.getElementById('rx-control-toggle');
-  const txToggle = document.getElementById('tx-control-toggle');
-  const rotatorToggle = document.getElementById('rotator-control-toggle');
-  if (rxToggle) {
-    rxToggle.checked = Boolean(status.devices.rx_enabled);
-  }
-  if (txToggle) {
-    txToggle.checked = Boolean(status.devices.tx_enabled);
-  }
-  if (rotatorToggle) {
-    rotatorToggle.checked = Boolean(status.devices.rotator_enabled);
-    rotatorControlEnabled = rotatorToggle.checked;
+    document.getElementById('station').textContent =
+      `${status.station.name}: ${status.station.latitude_deg}, ${status.station.longitude_deg}`;
+    stationLatitudeDeg = Number(status.station.latitude_deg);
+    stationLongitudeDeg = Number(status.station.longitude_deg);
+    qthTimezone = status.station.timezone || 'UTC';
+    if (deviceControlUpdatesPending === 0) {
+      // Every page header carries a copy of these switches; all of them have to
+      // show the radio's actual state, not just the Home page's pair.
+      for (const [control, , settingsKey] of DEVICE_CONTROLS) {
+        setDeviceControlChecked(control, Boolean(status.devices[settingsKey]));
+      }
+      rotatorControlEnabled = Boolean(status.devices.rotator_enabled);
+    }
+    nativeIcomRxActive = status.icom?.rx_native === true;
+    updateManualOffsetControlState();
+  } catch (error) {
+    // Other polling paths surface connection failures; avoid repeating log noise here.
   }
 }
 
+function renderRadioState(result) {
+  const reportedRate = Number(result?.sample_rate);
+  if (reportedRate > 0 && reportedRate !== radioSampleRate) {
+    radioSampleRate = reportedRate;
+    // The capture worklet converts to the radio's rate, so a renegotiated rate
+    // has to reach the audio thread rather than only the main-thread path.
+    radioMicWorklet?.port.postMessage({ type: 'config', outputRate: radioSampleRate });
+  }
+  if ([1, 2].includes(Number(result?.rx_channels))) radioRxChannels = Number(result.rx_channels);
+  window.RadioConsole?.render(result);
+}
+
+async function loadRadioState() {
+  const result = await fetchJson('/api/radio', null);
+  if (result) renderRadioState(result);
+  return result;
+}
+
+async function radioAction(path, body = {}) {
+  try {
+    const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || 'Radio command failed.');
+    renderRadioState(result);
+    addLog(path === '/api/radio/connect'
+      ? 'Icom radio connection attempt started.'
+      : `Icom radio command completed: ${path}`);
+    return result;
+  } catch (error) {
+    addLog(error.message || 'Icom radio command failed.');
+    window.RadioConsole?.error(error.message || 'Icom radio command failed.');
+    return null;
+  }
+}
+
+async function prepareRadioAudio() {
+  radioAudioContext = radioAudioContext || new AudioContext({ latencyHint: 'interactive' });
+  await radioAudioContext.resume();
+}
+
+function stopRadioAudio() {
+  radioAudioGeneration += 1;
+  if (radioAudioSocket) {
+    radioAudioSocket.onclose = radioAudioSocket.onmessage = radioAudioSocket.onerror = null;
+    radioAudioSocket.close();
+    radioAudioSocket = null;
+  }
+  stopRadioMicrophone();
+  // The uplink belongs to the session, not to a capture device, so it closes
+  // here rather than with every microphone restart.
+  closeRadioMicUplink();
+  if (radioAudioWorklet) {
+    radioAudioWorklet.port.postMessage({ type: 'stop' });
+    radioAudioWorklet.port.onmessage = null;
+    radioAudioWorklet.disconnect();
+    radioAudioWorklet.port.close();
+  }
+  radioAudioWorklet = radioAudioWorkletLoading = null;
+  if (radioAudioContext) void radioAudioContext.close().catch(() => {});
+  radioAudioContext = null;
+  radioAudioNextTime = 0;
+  document.getElementById('radio-audio-status').textContent = 'Audio off';
+}
+
+function handleRadioAudioPacket(data) {
+  if (!radioAudioContext) return;
+  if (radioAudioContext.state !== 'running') {
+    document.getElementById('radio-audio-status').textContent = 'Audio paused by browser; click anywhere or press a key to resume automatically.';
+    return;
+  }
+  if (radioAudioWorklet) {
+    radioAudioWorklet.port.postMessage({ type: 'pcm', packet: data,
+      rate: radioSampleRate, channels: radioRxChannels,
+      listen: window.RadioConsole?.listen, volume: window.RadioConsole?.volume ?? 1 }, [data]);
+    return;
+  }
+  const bytes = new Uint8Array(data);
+  if (bytes.length <= 24) return;
+  const header = new DataView(bytes.buffer, bytes.byteOffset, 24);
+  const pcmLength = header.getUint16(22, false);
+  if (header.getUint32(0, true) !== bytes.length || header.getUint16(4, true) !== 0
+      || pcmLength !== bytes.length - 24 || pcmLength % (2 * radioRxChannels) !== 0) return;
+  const pcm = new DataView(bytes.buffer, bytes.byteOffset + 24, pcmLength);
+  const frames = pcmLength / (2 * radioRxChannels);
+  if (!frames) return;
+  const listen = window.RadioConsole?.listen;
+  if (['SUB', 'BOTH'].includes(listen) && radioRxChannels < 2) {
+    document.getElementById('radio-audio-status').textContent = `${listen === 'BOTH' ? 'Dual' : 'SUB'} audio needs stereo RX codec in Settings.`;
+    return;
+  }
+  const channels = listen && listen !== 'BOTH' ? 1 : radioRxChannels;
+  const volume = window.RadioConsole?.volume ?? 1;
+  const buffer = radioAudioContext.createBuffer(channels, frames, radioSampleRate);
+  let peak = 0;
+  for (let channel = 0; channel < channels; channel += 1) {
+    const inputChannel = listen === 'SUB' ? 1 : listen === 'MAIN' ? 0 : channel;
+    const output = buffer.getChannelData(channel);
+    for (let frame = 0; frame < frames; frame += 1) {
+      const sample = pcm.getInt16((frame * radioRxChannels + inputChannel) * 2, true) / 32768;
+      peak = Math.max(peak, Math.abs(sample));
+      output[frame] = sample * volume;
+    }
+  }
+  // Drop an old burst instead of turning a stalled tab into seconds of delay.
+  if (radioAudioNextTime > radioAudioContext.currentTime + 0.5) return;
+  const source = radioAudioContext.createBufferSource();
+  source.buffer = buffer;
+  source.connect(radioAudioContext.destination);
+  const start = Math.max(radioAudioContext.currentTime + 0.03, radioAudioNextTime);
+  source.start(start);
+  radioAudioNextTime = start + buffer.duration;
+  document.getElementById('radio-audio-status').textContent = `RX audio · ${listen || (radioRxChannels > 1 ? 'BOTH' : 'MAIN')} · PCM ${peak ? `${Math.round(20 * Math.log10(peak))} dBFS` : 'silent'}`;
+}
+
+async function startRadioAudio() {
+  const generation = radioAudioGeneration;
+  try {
+    radioAudioContext = radioAudioContext || new AudioContext({ latencyHint: 'interactive' });
+    if (radioAudioContext.state !== 'running') {
+      document.getElementById('radio-audio-status').textContent = 'Starting audio; if the browser blocks playback, click anywhere or press a key.';
+    }
+    // Automatic on connected state; ordinary page interaction retries autoplay.
+    await radioAudioContext.resume();
+    if (generation !== radioAudioGeneration || !radioAudioContext) return false;
+    if (radioAudioSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(radioAudioSocket.readyState)) return true;
+    await loadRadioState();
+    if (generation !== radioAudioGeneration || !radioAudioContext) return false;
+    await initializeRadioAudioWorklet();
+    if (generation !== radioAudioGeneration || !radioAudioContext) return false;
+    // Another click may have opened the socket while the settings were loading.
+    if (radioAudioSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(radioAudioSocket.readyState)) return true;
+    radioAudioNextTime = radioAudioContext.currentTime;
+    const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    radioAudioSocket = new WebSocket(`${scheme}://${window.location.host}/api/radio/audio`);
+    radioAudioSocket.binaryType = 'arraybuffer';
+    radioAudioSocket.onopen = () => { document.getElementById('radio-audio-status').textContent = 'Audio socket connected; waiting for RX packets.'; };
+    radioAudioSocket.onmessage = (event) => handleRadioAudioPacket(event.data);
+    radioAudioSocket.onerror = () => { document.getElementById('radio-audio-status').textContent = 'Audio stream error.'; };
+    radioAudioSocket.onclose = () => {
+      radioAudioWorklet?.port.postMessage({ type: 'reset' });
+      document.getElementById('radio-audio-status').textContent = 'Audio stream disconnected.';
+      radioAudioSocket = null;
+    };
+    return true;
+  } catch (error) {
+    if (generation !== radioAudioGeneration) return false;
+    document.getElementById('radio-audio-status').textContent = `Audio startup failed: ${error.message || error}`;
+    return false;
+  }
+}
+
+async function initializeRadioAudioWorklet() {
+  const context = radioAudioContext;
+  if (!context?.audioWorklet || typeof AudioWorkletNode === 'undefined' || radioAudioWorklet) return;
+  if (radioAudioWorkletLoading) return radioAudioWorkletLoading;
+  const generation = radioAudioGeneration;
+  const pending = (async () => {
+    await context.audioWorklet.addModule('/radio-audio-worklet.js?v=20260914-stream1');
+    if (generation !== radioAudioGeneration || context !== radioAudioContext) return;
+    const node = new AudioWorkletNode(context, 'radio-pcm', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+    });
+    node.port.onmessage = ({ data }) => {
+      if (node !== radioAudioWorklet || data.type !== 'stats' || !radioAudioSocket) return;
+      const status = document.getElementById('radio-audio-status');
+      if (data.needsStereo) { status.textContent = 'SUB / Both audio needs stereo RX codec in Settings.'; return; }
+      const level = data.peak ? `${Math.round(20 * Math.log10(data.peak))} dBFS` : 'silent';
+      status.textContent = `RX ${window.RadioConsole?.listen || 'BOTH'} · ${Math.round(data.bufferedMs)} ms buffer · gaps ${data.underruns} · trimmed ${Math.round(data.trimmedMs)} ms · ${level}`;
+      status.title = `Browser audio engine: ${Math.round((context.baseLatency || 0) * 1000)} ms base latency. Buffer is not total radio-to-speaker latency.`;
+    };
+    node.onprocessorerror = () => {
+      if (node === radioAudioWorklet) {
+        stopRadioAudio();
+        document.getElementById('radio-audio-status').textContent = 'Audio renderer failed; retrying automatically.';
+      }
+    };
+    node.connect(context.destination);
+    radioAudioWorklet = node;
+  })();
+  radioAudioWorkletLoading = pending;
+  try { await pending; }
+  finally { if (radioAudioWorkletLoading === pending) radioAudioWorkletLoading = null; }
+}
+
+async function startRadioMicrophone() {
+  if (radioMicStarting) return false;
+  radioMicStarting = true;
+  const generation = radioMicGeneration;
+  try {
+    if (radioMicStream) return true;
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Microphone capture requires HTTPS or localhost. LAN HTTP supports listening, but not your laptop microphone.');
+    }
+    if (!await startRadioAudio() || generation !== radioMicGeneration) return false;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      ...(radioMicDeviceId ? { deviceId: { exact: radioMicDeviceId } } : {}),
+      channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false,
+    } });
+    if (generation !== radioMicGeneration || !radioAudioContext) {
+      stream.getTracks().forEach(track => track.stop()); return false;
+    }
+    radioMicStream = stream;
+    radioMicSource = radioAudioContext.createMediaStreamSource(stream);
+    // The uplink owns a connection of its own. Sharing the RX socket made the
+    // two directions head-of-line coupled: a backpressured microphone stream
+    // delayed listening audio on the same TCP connection.
+    openRadioMicUplink();
+    await initializeRadioMicWorklet();
+    if (generation !== radioMicGeneration || radioMicStream !== stream) return false;
+    if (radioMicWorklet) {
+      radioMicWorklet.port.onmessage = (event) => {
+        if (event.data?.type === 'pcm') handleRadioMicBlock(event.data);
+      };
+      radioMicWorklet.port.postMessage({ type: 'config', gain: radioMicGain, outputRate: radioSampleRate });
+      radioMicSource.connect(radioMicWorklet);
+      radioMicWorklet.connect(radioAudioContext.destination);
+    } else {
+      // Without a worklet the same 20 ms encode runs on the main thread. Capture
+      // keeps working; only the audio-thread resampler is missing.
+      radioMicProcessor = radioAudioContext.createScriptProcessor(1024, 1, 1);
+      radioMicProcessor.onaudioprocess = (event) => {
+        const { pcm, peak } = encodeMicrophonePcm(event.inputBuffer.getChannelData(0), radioAudioContext.sampleRate, radioSampleRate, radioMicGain);
+        updateRadioMicMeter(peak);
+        sendRadioMicBlock(pcm.buffer);
+      };
+      radioMicSource.connect(radioMicProcessor);
+      radioMicProcessor.connect(radioAudioContext.destination);
+    }
+    stream.getTracks().forEach(track => track.addEventListener('ended', () => {
+      if (radioMicStream === stream) { stopRadioMicrophone(); window.RadioConsole?.error('Microphone disconnected. Release PTT.'); }
+    }));
+    await refreshRadioMicrophones();
+    if (generation !== radioMicGeneration || radioMicStream !== stream) return false;
+    document.getElementById('radio-audio-status').textContent = 'Microphone streaming to Pi-Sat; PTT when ready.';
+    return true;
+  } catch (error) {
+    if (generation === radioMicGeneration) stopRadioMicrophone();
+    addLog(`Microphone access failed: ${error.message || error}`);
+    window.RadioConsole?.error(`Microphone access failed: ${error.message || error}`);
+    return false;
+  } finally { radioMicStarting = false; }
+}
+
+function stopRadioMicrophone() {
+  radioMicGeneration += 1;
+  radioMicStream?.getTracks().forEach(track => track.stop());
+  radioMicStream = null;
+  if (radioMicWorklet) {
+    radioMicWorklet.port.postMessage({ type: 'stop' });
+    radioMicWorklet.port.onmessage = null;
+    radioMicWorklet.disconnect();
+    radioMicWorklet.port.close();
+  }
+  radioMicWorklet = radioMicWorkletLoading = null;
+  if (radioMicProcessor) radioMicProcessor.onaudioprocess = null;
+  radioMicProcessor?.disconnect(); radioMicProcessor = null;
+  radioMicSource?.disconnect(); radioMicSource = null;
+  radioMicMeterAt = 0;
+  const meter = document.getElementById('rc-mic-meter');
+  if (meter) meter.value = 0;
+}
+
+function encodeMicrophonePcm(input, inputRate, outputRate, gain) {
+  if (!input.length) return { pcm: new Int16Array(0), peak: 0 };
+  const count = Math.max(1, Math.round(input.length * outputRate / inputRate));
+  const pcm = new Int16Array(count);
+  let peak = 0;
+  for (let index = 0; index < count; index++) {
+    const start = index * input.length / count, end = (index + 1) * input.length / count;
+    let total = 0;
+    // Average each source interval when downsampling instead of discarding
+    // all but one sample. Browser audio processing remains enabled for speech.
+    for (let at = Math.floor(start); at < Math.ceil(end); at++) {
+      total += input[Math.min(at, input.length - 1)] * (Math.min(end, at + 1) - Math.max(start, at));
+    }
+    const sample = Math.max(-1, Math.min(1, total / (end - start) * gain));
+    peak = Math.max(peak, Math.abs(sample));
+    pcm[index] = Math.round(sample * (sample < 0 ? 32768 : 32767));
+  }
+  return { pcm, peak };
+}
+
+// The microphone uplink is deliberately not gated on PTT. Capture streams for as
+// long as the session is up, and the core decides what the radio should hear:
+// transmit audio only reaches the radio while a key is commanded and no paced
+// stream owns the buffer. An always-on uplink costs about 256 kbit/s upstream and
+// removes the key-up transient entirely, because there is no stream to start.
+function openRadioMicUplink() {
+  const current = radioMicSocket;
+  if (current && [WebSocket.OPEN, WebSocket.CONNECTING].includes(current.readyState)) return;
+  // Each capture frame calls in here while the uplink is down, so a failed
+  // attempt is not retried again until the backoff expires.
+  if (Date.now() < radioMicUplinkRetryAt) return;
+  radioMicUplinkRetryAt = Date.now() + 2000;
+  const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const socket = new WebSocket(`${scheme}://${window.location.host}/api/radio/mic`);
+  socket.binaryType = 'arraybuffer';
+  radioMicSocket = socket;
+  socket.onopen = () => {
+    if (radioMicSocket !== socket) return;
+    if (!radioMicUplinkHealthy) addLog('Microphone uplink to Pi-Sat connected.');
+    radioMicUplinkHealthy = true;
+  };
+  socket.onerror = () => reportRadioMicUplinkLoss(socket);
+  socket.onclose = () => reportRadioMicUplinkLoss(socket);
+}
+
+function reportRadioMicUplinkLoss(socket) {
+  // A socket that has already been replaced cannot report for the live one, or a
+  // late event would hide the next real disconnect.
+  if (radioMicSocket !== socket) return;
+  // Drop the dead socket even when only an error arrived: one that never opens
+  // must not block the reconnect that follows it.
+  radioMicSocket = null;
+  // Report the transition rather than every failed retry, so an outage cannot
+  // flood the monitor log while capture keeps trying to reconnect.
+  if (!radioMicUplinkHealthy) return;
+  radioMicUplinkHealthy = false;
+  addLog('Microphone uplink closed; it reconnects while capture is on.');
+}
+
+function closeRadioMicUplink() {
+  const socket = radioMicSocket;
+  radioMicSocket = null;
+  radioMicUplinkHealthy = false;
+  radioMicUplinkRetryAt = 0;
+  if (!socket) return;
+  socket.onopen = socket.onclose = socket.onerror = socket.onmessage = null;
+  socket.close();
+}
+
+function handleRadioMicBlock(data) {
+  updateRadioMicMeter(data.level);
+  sendRadioMicBlock(data.pcm);
+}
+
+function sendRadioMicBlock(pcm) {
+  if (!(pcm instanceof ArrayBuffer) || !pcm.byteLength || pcm.byteLength % 2) return;
+  let socket = radioMicSocket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    // Capture is running, so the uplink is expected to exist. A dropped
+    // connection is reopened instead of discarding transmit audio silently.
+    openRadioMicUplink();
+    socket = radioMicSocket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  }
+  if (socket.bufferedAmount > 32768) return; // Never queue seconds of old microphone audio.
+  socket.send(pcm);
+}
+
+function updateRadioMicMeter(level) {
+  // A level meter does not need the capture cadence: the worklet reports once per
+  // 20 ms frame and the DOM needs a handful of updates a second.
+  const now = Date.now();
+  if (now - radioMicMeterAt < 120) return;
+  radioMicMeterAt = now;
+  const peak = Number.isFinite(level) ? Math.max(0, Math.min(1, level)) : 0;
+  const meter = document.getElementById('rc-mic-meter');
+  if (meter) meter.value = peak;
+  const output = document.getElementById('rc-mic-level');
+  if (output) output.textContent = peak >= 0.999 ? 'CLIPPING · reduce gain' : peak ? `${Math.round(20 * Math.log10(peak))} dBFS` : 'Silent';
+}
+
+function applyRadioMicGain(gain) {
+  radioMicGain = gain;
+  radioMicWorklet?.port.postMessage({ type: 'config', gain });
+}
+
+async function initializeRadioMicWorklet() {
+  const context = radioAudioContext;
+  if (!context?.audioWorklet || typeof AudioWorkletNode === 'undefined' || radioMicWorklet) return;
+  if (radioMicWorkletLoading) return radioMicWorkletLoading;
+  const generation = radioMicGeneration;
+  const pending = (async () => {
+    await context.audioWorklet.addModule('/radio-mic-worklet.js?v=20260916-uplink1');
+    if (generation !== radioMicGeneration || context !== radioAudioContext) return;
+    radioMicWorklet = new AudioWorkletNode(context, 'radio-mic', {
+      numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+      channelCount: 1, channelCountMode: 'explicit',
+    });
+  })().catch((error) => {
+    // Capture keeps working through the main-thread encoder; only the
+    // audio-thread resampler is lost. A load that lost its session must not clear
+    // a renderer another attempt already installed.
+    if (generation !== radioMicGeneration || context !== radioAudioContext) return;
+    radioMicWorklet = null;
+    addLog(`Microphone worklet unavailable; using the main-thread capture path: ${error.message || error}`);
+  });
+  radioMicWorkletLoading = pending;
+  try { await pending; }
+  finally { if (radioMicWorkletLoading === pending) radioMicWorkletLoading = null; }
+}
+
+async function refreshRadioMicrophones() {
+  const select = document.getElementById('rc-mic-device');
+  if (!select) return;
+  const option = (value, label) => { const item = document.createElement('option'); item.value = value; item.textContent = label; return item; };
+  // The control is never left blank: the reason the list is short is part of
+  // what it reports, because a browser silently withholds this list until the
+  // page is a secure context *and* has been granted capture.
+  const unavailable = (label) => {
+    radioMicDeviceId = '';
+    select.replaceChildren(option('', 'System default microphone'));
+    const note = option('', label);
+    note.disabled = true;
+    select.append(note);
+  };
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    unavailable('Microphone list needs HTTPS or localhost');
+    return;
+  }
+  try {
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'audioinput');
+    // These are inputs on the computer running the browser; the Pi's own audio
+    // hardware is not visible here and never was.
+    const inputs = devices.filter(device => device.deviceId && device.deviceId !== 'default');
+    if (!inputs.length) {
+      unavailable('No microphones listed by the browser yet');
+      return;
+    }
+    select.replaceChildren(option('', 'System default microphone'), ...inputs
+      .map((device, index) => option(device.deviceId, device.label || `Microphone ${index + 1} (name appears after access is granted)`)));
+    select.value = radioMicDeviceId;
+  } catch { window.RadioConsole?.error('Could not list microphones. Check browser permission.'); }
+}
+
+// Capture follows the radio session, so a new device has to take effect now:
+// close the running capture and reopen it on the chosen source. This is also
+// the recovery path when a capture failed on a stale saved device. With no live
+// session, or on HTTP where capture is impossible, the choice is remembered for
+// the next Connect instead.
+async function selectRadioMicrophone(deviceId) {
+  radioMicDeviceId = deviceId || '';
+  if (radioMicStarting) return;
+  const listening = Boolean(radioAudioSocket) && radioAudioSocket.readyState === WebSocket.OPEN;
+  if (!listening || !window.isSecureContext || !navigator.mediaDevices?.getUserMedia) return;
+  stopRadioMicrophone();
+  await startRadioMicrophone();
+}
+
 function showPage(pageName) {
-  const selectedPage = PAGE_NAMES.includes(pageName)
+  const selectedPage = MODULE_NAMES.includes(pageName)
     ? pageName
-    : 'home';
+    : PAGE_NAMES.includes(pageName)
+      ? (pageName === 'modules' ? activeModuleName : pageName)
+      : 'home';
+  const primaryPage = MODULE_NAMES.includes(selectedPage) ? 'modules' : selectedPage;
+  const primaryPageChanged = primaryPage !== activePrimaryPageName;
+  activePrimaryPageName = primaryPage;
+  if (MODULE_NAMES.includes(selectedPage)) activeModuleName = selectedPage;
   document.querySelectorAll('[data-page-view]').forEach((view) => {
-    view.hidden = view.dataset.pageView !== selectedPage;
+    view.hidden = view.dataset.pageView !== primaryPage;
+  });
+  document.querySelectorAll('[data-module-view]').forEach((view) => {
+    view.hidden = view.dataset.moduleView !== selectedPage;
   });
   document.querySelectorAll('[data-page]').forEach((button) => {
-    button.classList.toggle('active', button.dataset.page === selectedPage);
+    const active = button.dataset.page === primaryPage;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-current', active ? 'page' : 'false');
+  });
+  document.querySelectorAll('[data-module]').forEach((button) => {
+    const active = button.dataset.module === selectedPage;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
   });
   if (selectedPage === 'settings') {
-    loadSettings();
+    setActiveSettingsSection(settingsSectionFromHash());
+    if (primaryPageChanged || !document.querySelector('[data-settings-panel]')) loadSettings();
   } else if (selectedPage === 'satellites') {
     loadMySatellites();
   } else if (selectedPage === 'monitor') {
@@ -306,6 +908,8 @@ function showPage(pageName) {
   } else if (selectedPage === 'map') {
     loadTrackedSatelliteLocations();
     drawTrackedSatellitesMap();
+  } else if (selectedPage === 'radio') {
+    loadRadioState();
   } else {
     loadSdrFrequency();
     loadTracking(true);
@@ -315,8 +919,33 @@ function showPage(pageName) {
 }
 
 function pageFromHash() {
-  const page = window.location.hash.replace('#', '');
+  const route = window.location.hash.replace(/^#/, '').split('/').filter(Boolean);
+  const page = route[0] || 'home';
+  if (page === 'modules') {
+    return MODULE_NAMES.includes(route[1]) ? route[1] : activeModuleName;
+  }
+  if (MODULE_NAMES.includes(page)) return page;
   return PAGE_NAMES.includes(page) ? page : 'home';
+}
+
+function settingsSectionFromHash() {
+  const [page, section] = window.location.hash.replace(/^#/, '').split('/');
+  if (page !== 'settings') return activeSettingsSection;
+  return SETTINGS_NAV.some(({ id }) => id === section) ? section : activeSettingsSection;
+}
+
+function setActiveSettingsSection(sectionName) {
+  activeSettingsSection = SETTINGS_NAV.some(({ id }) => id === sectionName)
+    ? sectionName
+    : SETTINGS_NAV[0].id;
+  document.querySelectorAll('[data-settings-panel]').forEach((panel) => {
+    panel.hidden = panel.dataset.settingsPanel !== activeSettingsSection;
+  });
+  document.querySelectorAll('[data-settings-section]').forEach((button) => {
+    const active = button.dataset.settingsSection === activeSettingsSection;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
 }
 
 function resolveDashboardMode() {
@@ -395,15 +1024,16 @@ async function loadSatellites() {
 
   renderTrackFilter();
   renderQsoSatelliteOptions();
-  if (selectedSatelliteNorad) {
-    await selectSatelliteByNorad(selectedSatelliteNorad);
-  } else if (latestTracking?.norad_id) {
+  if (latestTracking?.norad_id) {
     restoreSelectionFromTracking();
   }
 }
 
 async function loadSdrFrequency() {
   const frequencyElement = document.getElementById('rx-frequency');
+  if (!frequencyElement) {
+    return;
+  }
 
   try {
     const response = await fetch('/api/devices/sdr/frequency');
@@ -416,48 +1046,118 @@ async function loadSdrFrequency() {
 
     frequencyElement.textContent =
       `${Number(result.frequency_hz).toLocaleString()} Hz`;
-    currentRxFrequencyHz = Number(result.frequency_hz);
   } catch (error) {
     frequencyElement.textContent = 'Read failed';
   }
 }
 
 async function stepSdrFrequency(event) {
-  const stepKhz = Number(event.currentTarget.dataset.rxStepKhz);
-  await stepTrackingOffset('rx', stepKhz * 1000);
+  const stepHz = Number(event.currentTarget.dataset.rxStepHz);
+  queueTrackingOffsetStep('rx', stepHz);
 }
 
 async function stepTxFrequency(event) {
-  const stepKhz = Number(event.currentTarget.dataset.txStepKhz);
-  await stepTrackingOffset('tx', stepKhz * 1000);
+  const stepHz = Number(event.currentTarget.dataset.txStepHz);
+  queueTrackingOffsetStep('tx', stepHz);
 }
 
-async function stepTrackingOffset(role, stepHz) {
+async function stepVirtualRit(event) {
+  if (nativeIcomRxActive) return;
+  const stepHz = Number(event.currentTarget.dataset.virtualRitStepHz);
+  queueTrackingOffsetStep('virtualRit', stepHz);
+}
+
+function queueTrackingOffsetStep(role, stepHz) {
+  pendingTrackingStepsHz[role] += stepHz;
+  if (!trackingStepFlushActive) {
+    void flushTrackingOffsetSteps();
+  }
+}
+
+async function flushTrackingOffsetSteps() {
+  trackingStepFlushActive = true;
   try {
-    const response = await fetch(`/api/tracking/${role}/step`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    while (
+      pendingTrackingStepsHz.rx
+      || pendingTrackingStepsHz.tx
+      || pendingTrackingStepsHz.virtualRit
+    ) {
+      const role = pendingTrackingStepsHz.rx
+        ? 'rx'
+        : (pendingTrackingStepsHz.tx ? 'tx' : 'virtualRit');
+      const stepHz = pendingTrackingStepsHz[role];
+      pendingTrackingStepsHz[role] = 0;
+      const path = role === 'virtualRit'
+        ? '/api/tracking/rx/virtual-rit/step'
+        : `/api/tracking/${role}/step`;
+      const payload = {
         step_hz: stepHz,
         norad_id: selectedSatelliteNorad,
         frequency_profile_index: selectedFrequencyProfileIndex,
-        sync_offsets: syncRxTx,
-      }),
-    });
-    const result = await response.json();
-    if (!response.ok) {
-      addLog(result.detail || 'Offset step failed.');
-      return;
+      };
+      if (role !== 'virtualRit') {
+        payload.sync_offsets = syncRxTx;
+      }
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        addLog(result.detail || 'Offset step failed.');
+        continue;
+      }
+      renderTracking(result);
     }
-    renderTracking(result);
   } catch (error) {
     addLog('Offset step failed.');
+  } finally {
+    trackingStepFlushActive = false;
+    if (
+      pendingTrackingStepsHz.rx
+      || pendingTrackingStepsHz.tx
+      || pendingTrackingStepsHz.virtualRit
+    ) {
+      void flushTrackingOffsetSteps();
+    }
   }
 }
 
 function getSelectedFrequencyProfile() {
   const satellite = getSelectedSatellite();
   return satellite?.frequency_profiles?.[selectedFrequencyProfileIndex] || null;
+}
+
+async function updateManualOffsetsMode(event) {
+  const requestedValue = event.currentTarget.checked;
+  manualOffsetsEnabled = requestedValue;
+  manualOffsetsToggleUpdatePending = true;
+  updateManualOffsetControlState();
+  addLog(requestedValue ? 'Manual offsets enabled.' : 'Manual offsets disabled and reset.');
+  try {
+    const response = await fetch('/api/tracking/manual-offsets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: requestedValue,
+        norad_id: selectedSatelliteNorad,
+        frequency_profile_index: selectedFrequencyProfileIndex,
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.detail || 'Manual offset mode update failed.');
+    }
+    manualOffsetsToggleUpdatePending = false;
+    renderTracking(result);
+  } catch (error) {
+    manualOffsetsToggleUpdatePending = false;
+    manualOffsetsEnabled = !requestedValue;
+    event.currentTarget.checked = manualOffsetsEnabled;
+    updateManualOffsetControlState();
+    addLog('Manual offset mode update failed.');
+  }
 }
 
 async function updateSyncMode(event) {
@@ -493,13 +1193,20 @@ async function postTrackingAction(path, statusText, options = {}) {
   addLog(statusText);
 
   try {
+    const includeTrackingSelection = Boolean(
+      options.includeTrackingSelection
+      || path.endsWith('/start')
+      || path.endsWith('/reset-offset')
+    );
     const response = await fetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: path.endsWith('/start') || path.endsWith('/reset-offset')
+      body: includeTrackingSelection
         ? JSON.stringify({
           norad_id: selectedSatelliteNorad,
           frequency_profile_index: selectedFrequencyProfileIndex,
+          // RX-only profiles leave the remembered RX/TX sync preference
+          // untouched, so this is false only after RX/TX sync was disabled.
           sync_offsets: syncRxTx,
         })
         : '{}',
@@ -537,7 +1244,6 @@ async function loadPasses() {
     const selectedNorads = Array.from(trackedSatelliteNorads);
     if (!selectedNorads.length) {
       latestPasses = [];
-      activeAutotrackPassKey = null;
       renderPasses(latestPasses);
       return;
     }
@@ -548,9 +1254,6 @@ async function loadPasses() {
     latestPasses = await response.json();
     qthTimezone = latestPasses[0]?.timezone || qthTimezone;
     renderPasses(latestPasses);
-    if (!selectedSatelliteNorad && !latestTracking?.norad_id && latestPasses.length) {
-      await selectSatelliteByNorad(latestPasses[0].norad_id);
-    }
   } catch (error) {
     list.textContent = 'Pass prediction failed.';
     addLog('Pass prediction failed.');
@@ -597,7 +1300,14 @@ async function selectPass(satellitePass, options = {}) {
   }
   beginMapRefresh(satellitePass.norad_id, satellitePass.satellite_name);
   drawMap();
-  await selectSatelliteByNorad(satellitePass.norad_id, { suppressRender: true });
+  const trackingResult = await selectSatelliteByNorad(
+    satellitePass.norad_id,
+    { suppressRender: true }
+  );
+  if (!trackingResult) {
+    addLog(`Unable to load ${satellitePass.satellite_name} pass.`);
+    return;
+  }
   addLog(`${satellitePass.satellite_name} pass loaded.`);
   await loadTracking(true);
   drawMap();
@@ -608,35 +1318,57 @@ function renderTrackFilter() {
   if (!filter) {
     return;
   }
-  if (!trackedSatelliteNorads.size) {
+  if (!trackFilterLoaded) {
     trackedSatelliteNorads = new Set(
       satellitesCache.map((satellite) => Number(satellite.norad_id))
     );
   }
   filter.replaceChildren();
   satellitesCache.forEach((satellite) => {
+    const row = document.createElement('div');
+    row.className = 'track-filter-item';
     const label = document.createElement('label');
     label.className = 'form-check';
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.className = 'form-check-input';
     checkbox.checked = trackedSatelliteNorads.has(Number(satellite.norad_id));
-    checkbox.addEventListener('change', () => {
+    checkbox.addEventListener('change', async () => {
+      const noradId = Number(satellite.norad_id);
       if (checkbox.checked) {
-        trackedSatelliteNorads.add(Number(satellite.norad_id));
+        trackedSatelliteNorads.add(noradId);
       } else {
-        trackedSatelliteNorads.delete(Number(satellite.norad_id));
+        trackedSatelliteNorads.delete(noradId);
       }
       selectedSatelliteNorad = trackedSatelliteNorads.has(Number(selectedSatelliteNorad))
         ? selectedSatelliteNorad
         : null;
+      try {
+        await persistTrackFilter(noradId, checkbox.checked);
+      } catch (error) {
+        if (checkbox.checked) {
+          trackedSatelliteNorads.delete(noradId);
+        } else {
+          trackedSatelliteNorads.add(noradId);
+        }
+        checkbox.checked = !checkbox.checked;
+        addLog(error.message || 'Satellite filter update failed.');
+      }
       loadPasses();
     });
     const text = document.createElement('span');
     text.className = 'form-check-label';
     text.textContent = `${satellite.name} (${satellite.norad_id})`;
     label.append(checkbox, text);
-    filter.appendChild(label);
+    const trackButton = document.createElement('button');
+    trackButton.type = 'button';
+    trackButton.className = 'btn btn-success btn-sm flex-shrink-0 track-filter-track-now';
+    trackButton.textContent = 'Track Now';
+    trackButton.addEventListener('click', async () => {
+      await trackManagedSatelliteNow(satellite.norad_id);
+    });
+    row.append(label, trackButton);
+    filter.appendChild(row);
   });
 }
 
@@ -645,7 +1377,7 @@ async function selectSatelliteByNorad(noradId, options = {}) {
     return Number(item.norad_id) === Number(noradId);
   });
   if (!satellite) {
-    return;
+    return null;
   }
   beginMapRefresh(satellite.norad_id, satellite.name);
   selectedSatelliteNorad = satellite.norad_id;
@@ -653,6 +1385,7 @@ async function selectSatelliteByNorad(noradId, options = {}) {
   document.getElementById('selected-satellite').textContent = satellite.name;
   document.getElementById('selected-satellite-azimuth').textContent = 'Az --';
   document.getElementById('selected-satellite-elevation').textContent = 'El --';
+  document.getElementById('tracking-pass-state').textContent = '--';
   renderFrequencyProfileOptions(satellite);
   const result = await syncTrackingForSelection(options);
   if (
@@ -663,6 +1396,7 @@ async function selectSatelliteByNorad(noradId, options = {}) {
   ) {
     renderTracking(result);
   }
+  return result;
 }
 
 function restoreSelectionFromTracking() {
@@ -672,14 +1406,23 @@ function restoreSelectionFromTracking() {
   if (!satellite) {
     return;
   }
-  const profileIndex = satellite.frequency_profiles.findIndex((profile) => {
-    return profile.name === latestTracking.transponder_name;
-  });
+  const sharedProfileIndex = Number(latestTracking.frequency_profile_index);
+  const hasSharedProfileIndex = latestTracking.frequency_profile_index !== null
+    && latestTracking.frequency_profile_index !== undefined
+    && Number.isInteger(sharedProfileIndex)
+    && sharedProfileIndex >= 0
+    && sharedProfileIndex < satellite.frequency_profiles.length;
+  const profileIndex = hasSharedProfileIndex
+    ? sharedProfileIndex
+    : satellite.frequency_profiles.findIndex((profile) => {
+      return profile.name === latestTracking.transponder_name;
+    });
   selectedSatelliteNorad = satellite.norad_id;
   selectedFrequencyProfileIndex = profileIndex >= 0 ? profileIndex : 0;
   document.getElementById('selected-satellite').textContent = satellite.name;
   document.getElementById('selected-satellite-azimuth').textContent = 'Az --';
   document.getElementById('selected-satellite-elevation').textContent = 'El --';
+  document.getElementById('tracking-pass-state').textContent = '--';
   renderFrequencyProfileOptions(satellite);
 }
 
@@ -776,11 +1519,11 @@ function updateTxProfileState(profile) {
     txBadge.className = rxOnly ? 'badge text-bg-secondary' : 'badge text-bg-success';
     txBadge.textContent = rxOnly ? 'Disabled (RX-only)' : 'Active';
   }
-  document.querySelectorAll('[data-tx-step-khz]').forEach((button) => {
-    button.disabled = rxOnly;
+  document.querySelectorAll('[data-tx-step-hz]').forEach((button) => {
+    button.disabled = rxOnly || !manualOffsetsEnabled;
   });
   if (syncToggle) {
-    syncToggle.disabled = rxOnly;
+    syncToggle.disabled = rxOnly || !manualOffsetsEnabled;
     if (rxOnly) {
       syncToggle.checked = false;
     } else {
@@ -788,37 +1531,50 @@ function updateTxProfileState(profile) {
     }
   }
   if (syncLabel) {
-    syncLabel.classList.toggle('control-disabled', rxOnly);
+    syncLabel.classList.toggle('control-disabled', rxOnly || !manualOffsetsEnabled);
   }
 }
 
-function checkAutotrackNextPass() {
-  const autoTrackToggle = document.getElementById('auto-track-toggle');
-  if (autoTrackToggle && !autoTrackToggle.checked) {
-    return;
+function shouldDisableVirtualRit(manualEnabled, nativeRxActive) {
+  return !manualEnabled || nativeRxActive;
+}
+
+function updateManualOffsetControlState() {
+  const toggle = document.getElementById('manual-offsets-toggle');
+  const resetButton = document.getElementById('reset-rx-offset');
+  const resetVirtualRitButton = document.getElementById('reset-virtual-rit');
+  const virtualRitSection = document.querySelector('.virtual-rit-section');
+  const virtualRitControls = document.getElementById('virtual-rit-controls');
+  const virtualRitNativeNote = document.getElementById('virtual-rit-native-note');
+  const virtualRitDisabled = shouldDisableVirtualRit(manualOffsetsEnabled, nativeIcomRxActive);
+  if (toggle) {
+    toggle.checked = manualOffsetsEnabled;
   }
-  if (!latestPasses.length) {
-    return;
+  document.querySelectorAll('[data-rx-step-hz]').forEach((button) => {
+    button.disabled = !manualOffsetsEnabled;
+  });
+  document.querySelectorAll('[data-virtual-rit-step-hz]').forEach((button) => {
+    button.disabled = virtualRitDisabled;
+  });
+  if (resetButton) {
+    resetButton.disabled = !manualOffsetsEnabled;
   }
-  const nextPass = latestPasses[0];
-  const now = Date.now();
-  const aos = new Date(nextPass.aos_utc).getTime();
-  const los = new Date(nextPass.los_utc).getTime();
-  const passKey = `${nextPass.norad_id}:${nextPass.aos_utc}`;
-  if (now > los) {
-    activeAutotrackPassKey = null;
+  if (resetVirtualRitButton) {
+    resetVirtualRitButton.disabled = virtualRitDisabled;
   }
-  if (activeAutotrackPassKey === passKey) {
-    return;
+  if (virtualRitSection) {
+    virtualRitSection.setAttribute('aria-disabled', String(virtualRitDisabled));
   }
-  activeAutotrackPassKey = passKey;
-  selectPass(nextPass, { source: 'auto' });
+  if (virtualRitControls) {
+    virtualRitControls.hidden = nativeIcomRxActive;
+  }
+  if (virtualRitNativeNote) {
+    virtualRitNativeNote.hidden = !nativeIcomRxActive;
+  }
+  updateTxProfileState(getSelectedFrequencyProfile());
 }
 
 async function persistAutotrackSetting(enabled) {
-  if (!enabled) {
-    activeAutotrackPassKey = null;
-  }
   const response = await fetch('/api/my-satellites/options', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -829,6 +1585,21 @@ async function persistAutotrackSetting(enabled) {
   const result = await response.json();
   if (!response.ok) {
     throw new Error(result.detail || 'Autotrack update failed.');
+  }
+}
+
+async function persistTrackFilter(noradId, enabled) {
+  const response = await fetch('/api/my-satellites/options', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      autotrack_norad_id: Number(noradId),
+      autotrack_enabled: Boolean(enabled),
+    }),
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.detail || 'Satellite filter update failed.');
   }
 }
 
@@ -848,11 +1619,6 @@ async function setAutotrackEnabled(enabled, options = {}) {
       if (logOnEnable) {
         addLog('Autotrack enabled.');
       }
-      if (latestPasses.length) {
-        activeAutotrackPassKey = null;
-        await selectPass(latestPasses[0], { source: 'auto' });
-      }
-      checkAutotrackNextPass();
     } else if (logOnDisable) {
       addLog('Autotrack disabled.');
     }
@@ -1375,9 +2141,6 @@ function renderRotator(result) {
     formatNumber(result.target_elevation_deg, 2, ' deg');
   const manualEnabled = Boolean(result.manual_controls_enabled);
   setRotatorManualControlState(manualEnabled);
-  if (manualEnabled) {
-    syncRotatorManualInputs(result);
-  }
   logErrorState('rotator', result.error || '');
 }
 
@@ -1386,17 +2149,6 @@ function setRotatorManualControlState(enabled) {
   document.getElementById('rotator-manual-el').disabled = !enabled;
   document.getElementById('rotator-home-button').disabled = !enabled;
   document.getElementById('rotator-send-button').disabled = !enabled;
-}
-
-function syncRotatorManualInputs(result) {
-  const azInput = document.getElementById('rotator-manual-az');
-  const elInput = document.getElementById('rotator-manual-el');
-  if (Number.isFinite(Number(result.current_azimuth_deg))) {
-    azInput.value = Math.round(Number(result.current_azimuth_deg));
-  }
-  if (Number.isFinite(Number(result.current_elevation_deg))) {
-    elInput.value = Math.round(Number(result.current_elevation_deg));
-  }
 }
 
 async function sendManualRotatorPosition() {
@@ -1456,8 +2208,54 @@ async function loadSettings() {
     hamlibRotatorModels = rotatorModels;
     serialDevices = devices;
     automationScripts = scripts;
+    currentSettingsState = result.settings || {};
+    catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : [];
     form.replaceChildren();
-    Object.entries(result.schema).forEach(([section, keys]) => {
+    const panelHost = document.createElement('div');
+    panelHost.className = 'settings-panels';
+    const panels = new Map(SETTINGS_NAV.map(({ id }) => {
+      const panel = document.createElement('section');
+      panel.className = 'settings-panel';
+      panel.dataset.settingsPanel = id;
+      panel.setAttribute('role', 'tabpanel');
+      panel.setAttribute('aria-labelledby', `settings-nav-${id}`);
+      panelHost.appendChild(panel);
+      return [id, panel];
+    }));
+    form.appendChild(panelHost);
+    const settingsPanelBySource = {
+      server: 'application',
+      station: 'application',
+      tle: 'application',
+      profiles: 'application',
+      device_roles: 'devices',
+      rotator: 'devices',
+      automation: 'application',
+      aprs: 'other',
+      sstv: 'other',
+      safety: 'other',
+    };
+    const appendToSettingsPanel = (source, element) => {
+      panels.get(settingsPanelBySource[source] || 'other').appendChild(element);
+    };
+    const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'aprs', 'sstv', 'safety'];
+    orderedSections.forEach((section) => {
+      if (section === 'device_roles') {
+        appendToSettingsPanel(section,
+          buildMyDevicesSection(
+            result.schema?.icom || [],
+            result.settings?.icom || {},
+            result.settings?.rx || {},
+            result.settings?.tx || {},
+            catDevicesCache,
+          )
+        );
+        return;
+      }
+      const keys = result.schema?.[section];
+      if (!keys || section === 'my_satellites' || ['rx', 'tx'].includes(section)) {
+        return;
+      }
       if (section === 'my_satellites') {
         return;
       }
@@ -1471,18 +2269,333 @@ async function loadSettings() {
         ? buildAdvancedSettingsSection(visibleKeys, result.settings[section] || {})
         : buildSettingsSection(section, visibleKeys, result.settings[section] || {});
 
-      if (['rx', 'tx', 'rotator'].includes(section)) {
+      if (section === 'rotator') {
         fieldset.appendChild(buildDeviceTestControls(section));
       }
 
-      form.appendChild(fieldset);
+      appendToSettingsPanel(section, fieldset);
     });
+    setActiveSettingsSection(activeSettingsSection);
+    applyCatDeviceConnectivityState();
     applyConnectivityState();
-    bindConnectivityState();
+    updateRoleTestButtons();
+    document
+      .querySelector('[name="rotator.connectivity"]')
+      ?.addEventListener('change', applyConnectivityState);
     status.textContent = '';
   } catch (error) {
     status.textContent = 'Settings load failed.';
   }
+}
+
+function buildMyDevicesSection(icomKeys, icomSettings, rxSettings, txSettings, catDevices) {
+  const section = document.createElement('section');
+  section.className = 'my-devices-settings';
+
+  const heading = document.createElement('h2');
+  heading.textContent = 'My Devices';
+  section.appendChild(heading);
+
+  const nativeKeys = icomKeys.filter((key) => !hiddenSettingsKeys.icom?.has(key));
+  const native = buildSettingsSection('icom', nativeKeys, icomSettings);
+  native.classList.add('native-icom-settings');
+  native.querySelector('legend').textContent = 'Icom IC-9700';
+  const nativeNote = document.createElement('div');
+  nativeNote.className = 'automation-settings-note settings-row-wide';
+  nativeNote.textContent = 'First-class Pi-Sat network control for Radio, spectrum, audio and satellite tracking through one shared native CI-V core.';
+  native.insertBefore(nativeNote, native.children[1] || null);
+  section.appendChild(native);
+
+  section.appendChild(buildDeviceRolesSection(rxSettings, txSettings));
+
+  const otherDevices = document.createElement('details');
+  otherDevices.className = 'other-devices-settings';
+  const summary = document.createElement('summary');
+  summary.textContent = 'Other Devices';
+  otherDevices.append(summary, buildCatDevicesSection(catDevices));
+  section.appendChild(otherDevices);
+  return section;
+}
+
+function buildCatDevicesSection(catDevices) {
+  const fieldset = document.createElement('fieldset');
+  fieldset.className = 'cat-devices-settings';
+
+  const legend = document.createElement('legend');
+  legend.textContent = 'Generic Hamlib / SDR Devices';
+  fieldset.appendChild(legend);
+
+  const note = document.createElement('div');
+  note.className = 'automation-settings-note';
+  note.textContent = 'Add local USB radios, network Hamlib endpoints or SDR devices here, then assign them to RX or TX above. A generic IC-9700 is supported here for Hamlib tracking.';
+  fieldset.appendChild(note);
+
+  const list = document.createElement('div');
+  list.className = 'cat-device-list';
+  list.id = 'cat-device-list';
+  if (!catDevices.length) {
+    list.appendChild(buildCatDeviceCard(createEmptyCatDevice()));
+  } else {
+    catDevices.forEach((device) => list.appendChild(buildCatDeviceCard({ ...device, _saved: true })));
+  }
+  fieldset.appendChild(list);
+
+  const actions = document.createElement('div');
+  actions.className = 'settings-section-actions';
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn btn-outline-primary btn-sm';
+  button.textContent = 'Add Device';
+  button.addEventListener('click', () => {
+    document.getElementById('cat-device-list')?.appendChild(
+      buildCatDeviceCard(createEmptyCatDevice()),
+    );
+    applyCatDeviceConnectivityState();
+  });
+
+  actions.appendChild(button);
+  fieldset.appendChild(actions);
+  return fieldset;
+}
+
+function buildCatDeviceCard(device) {
+  const card = document.createElement('section');
+  card.className = 'cat-device-card';
+  card.dataset.deviceId = String(device.device_id || '');
+  card.dataset.saved = device._saved ? 'true' : 'false';
+  card.dataset.savedDeviceId = device._saved ? String(device.device_id || '') : '';
+  applyCatDeviceCapabilitiesToCard(card, device);
+
+  const header = document.createElement('div');
+  header.className = 'cat-device-card-header';
+
+  const title = document.createElement('div');
+  title.className = 'cat-device-card-title';
+  title.textContent = device.name || 'New Device';
+  header.appendChild(title);
+  card.appendChild(header);
+
+  const body = document.createElement('div');
+  body.className = 'cat-device-body';
+
+  const config = document.createElement('div');
+  config.className = 'cat-device-config';
+
+  const topGrid = document.createElement('div');
+  topGrid.className = 'cat-device-top-grid';
+  topGrid.append(
+    buildCatDeviceField('Name', 'name', device.name || '', { inputClass: 'compact-input' }),
+    buildCatDeviceField('Device ID', 'device_id', device.device_id || '', { inputClass: 'compact-input' }),
+    buildCatDeviceField('Connectivity', 'connectivity', device.connectivity || '', { type: 'connectivity' }),
+    buildCatDeviceField('Timeout (s)', 'timeout_s', device.timeout_s || '2.0', { inputMode: 'decimal', compactClass: 'settings-row-compact-sm' }),
+    buildCatDeviceField('Radio State Updates', 'state_updates', device.state_updates || 'automatic', { type: 'state_updates' }),
+  );
+  config.appendChild(topGrid);
+
+  const detailGrid = document.createElement('div');
+  detailGrid.className = 'cat-device-detail-grid';
+  detailGrid.append(
+    buildCatDeviceField('Host', 'host', device.host || ''),
+    buildCatDeviceField('Port', 'port', device.port || '', { inputMode: 'numeric', compactClass: 'settings-row-compact-md' }),
+    buildCatDeviceField('Serial Port', 'serial_port', device.serial_port || '', { type: 'serial_port' }),
+    buildCatDeviceField('Baud', 'baud', device.baud || '', { inputMode: 'numeric', compactClass: 'settings-row-compact-md' }),
+    buildCatDeviceField('Model ID', 'model_id', device.model_id || '', { type: 'hamlib_model' }),
+  );
+  config.appendChild(detailGrid);
+  body.appendChild(config);
+
+  const capabilityChart = document.createElement('div');
+  capabilityChart.className = 'device-capability-chart';
+  capabilityChart.dataset.capabilityChart = 'true';
+  body.appendChild(capabilityChart);
+
+  const actions = document.createElement('div');
+  actions.className = 'cat-device-actions-column';
+
+  const buttons = document.createElement('div');
+  buttons.className = 'cat-device-action-buttons';
+
+  const saveButton = document.createElement('button');
+  saveButton.type = 'button';
+  saveButton.className = 'btn btn-outline-primary btn-sm';
+  saveButton.textContent = 'Save';
+  saveButton.addEventListener('click', () => saveCatDevice(card));
+
+  const testButton = document.createElement('button');
+  testButton.type = 'button';
+  testButton.className = 'btn btn-outline-primary btn-sm';
+  testButton.textContent = 'Test Radio';
+  testButton.addEventListener('click', () => testCatDevice(card));
+
+  const removeButton = document.createElement('button');
+  removeButton.type = 'button';
+  removeButton.className = 'btn btn-outline-danger btn-sm';
+  removeButton.textContent = 'Remove';
+  removeButton.addEventListener('click', () => removeCatDevice(card));
+
+  buttons.append(saveButton, testButton, removeButton);
+  actions.appendChild(buttons);
+
+  const status = document.createElement('div');
+  status.className = 'settings-section-status';
+  status.dataset.catDeviceStatus = 'true';
+  actions.appendChild(status);
+
+  body.appendChild(actions);
+  card.appendChild(body);
+
+  renderCatDeviceCapabilityChart(card);
+  attachCatDeviceFieldHandlers(card);
+  return card;
+}
+
+function buildCatDeviceField(label, key, value, options = {}) {
+  const row = document.createElement('label');
+  row.className = 'settings-row';
+  row.dataset.catDeviceKey = key;
+  if (options.compactClass) {
+    row.classList.add(options.compactClass);
+  }
+
+  const labelText = document.createElement('span');
+  labelText.className = 'form-label mb-0';
+  labelText.textContent = label;
+  row.appendChild(labelText);
+
+  let control;
+  if (options.type === 'connectivity') {
+    control = document.createElement('select');
+    control.className = 'form-select';
+    [
+      ['', 'Select connectivity'],
+      ['network', 'network'],
+      ['local', 'local'],
+    ].forEach(([optionValue, optionLabel]) => {
+      const option = document.createElement('option');
+      option.value = optionValue;
+      option.textContent = optionLabel;
+      control.appendChild(option);
+    });
+    control.value = value || '';
+  } else if (options.type === 'state_updates') {
+    control = document.createElement('select');
+    control.className = 'form-select';
+    [
+      ['automatic', 'Automatic (recommended)'],
+      ['polling', 'Polling only'],
+    ].forEach(([optionValue, optionLabel]) => {
+      const option = document.createElement('option');
+      option.value = optionValue;
+      option.textContent = optionLabel;
+      control.appendChild(option);
+    });
+    control.value = value === 'polling' ? 'polling' : 'automatic';
+  } else if (options.type === 'serial_port') {
+    control = buildSerialPortSelect(value);
+  } else if (options.type === 'hamlib_model') {
+    control = buildHamlibModelSelect(value);
+  } else {
+    control = document.createElement('input');
+    control.className = `form-control ${options.inputClass || ''}`.trim();
+    control.value = value;
+    if (options.inputMode) {
+      control.inputMode = options.inputMode;
+    }
+  }
+
+  control.dataset.catDeviceField = key;
+  row.appendChild(control);
+  if (options.type === 'serial_port' && control.dataset.deviceMissing === 'true') {
+    const warning = document.createElement('span');
+    warning.className = 'settings-inline-warning';
+    warning.textContent = 'Selected device not connected.';
+    row.appendChild(warning);
+  }
+  return row;
+}
+
+function attachCatDeviceFieldHandlers(card) {
+  const nameInput = card.querySelector('[data-cat-device-field="name"]');
+  const idInput = card.querySelector('[data-cat-device-field="device_id"]');
+  const title = card.querySelector('.cat-device-card-title');
+  const connectivity = card.querySelector('[data-cat-device-field="connectivity"]');
+  card.querySelectorAll('[data-cat-device-field]').forEach((element) => {
+    element.addEventListener('change', () => {
+      markCatDeviceDirty(card);
+    });
+    if (element.tagName === 'INPUT') {
+      element.addEventListener('input', () => {
+        markCatDeviceDirty(card);
+      });
+    }
+  });
+  nameInput?.addEventListener('input', () => {
+    title.textContent = nameInput.value.trim() || 'New Device';
+  });
+  idInput?.addEventListener('input', () => {
+    idInput.value = idInput.value.toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+    card.dataset.deviceId = idInput.value.trim();
+  });
+  connectivity?.addEventListener('change', () => {
+    applyCatDeviceConnectivityState();
+  });
+}
+
+function markCatDeviceDirty(card) {
+  if (!card) {
+    return;
+  }
+  const status = card.querySelector('[data-cat-device-status]');
+  if (card.dataset.saved === 'true' && status && !status.textContent.trim()) {
+    status.textContent = 'Unsaved changes.';
+    status.classList.remove('is-error');
+  }
+}
+
+function buildRoleAssignmentSection(section, sectionSettings) {
+  const fieldset = document.createElement('fieldset');
+  const legend = document.createElement('legend');
+  legend.textContent = formatSectionLegend(section);
+  fieldset.appendChild(legend);
+
+  fieldset.appendChild(
+    buildSettingControl(section, 'device_id', sectionSettings.device_id ?? ''),
+  );
+  fieldset.appendChild(
+    buildSettingControl(section, 'target_vfo', sectionSettings.target_vfo ?? 'current'),
+  );
+  return fieldset;
+}
+
+function buildDeviceRolesSection(rxSettings, txSettings) {
+  const fieldset = document.createElement('fieldset');
+  fieldset.className = 'device-roles-settings';
+
+  const legend = document.createElement('legend');
+  legend.textContent = 'Device Roles';
+  fieldset.appendChild(legend);
+
+  const layout = document.createElement('div');
+  layout.className = 'device-roles-layout';
+
+  const rxColumn = document.createElement('div');
+  rxColumn.className = 'device-role-column';
+  rxColumn.append(
+    buildRoleAssignmentSection('rx', rxSettings),
+    buildDeviceTestControls('rx'),
+  );
+
+  const txColumn = document.createElement('div');
+  txColumn.className = 'device-role-column';
+  txColumn.append(
+    buildRoleAssignmentSection('tx', txSettings),
+    buildDeviceTestControls('tx'),
+  );
+
+  layout.append(rxColumn, txColumn);
+  fieldset.appendChild(layout);
+  return fieldset;
 }
 
 function buildSettingsSection(section, visibleKeys, sectionSettings) {
@@ -1597,14 +2710,6 @@ function buildAutomationScriptSelect(value) {
 }
 
 function buildAdvancedSettingsSection(visibleKeys, sectionSettings) {
-  const details = document.createElement('details');
-  details.className = 'advanced-settings';
-
-  const summary = document.createElement('summary');
-  summary.className = 'advanced-settings-summary';
-  summary.textContent = 'Advanced Settings';
-  details.appendChild(summary);
-
   const content = document.createElement('div');
   content.className = 'advanced-settings-content';
 
@@ -1623,8 +2728,7 @@ function buildAdvancedSettingsSection(visibleKeys, sectionSettings) {
     content.appendChild(item);
   });
 
-  details.appendChild(content);
-  return details;
+  return content;
 }
 
 async function loadHamlibRadioModels() {
@@ -1671,12 +2775,14 @@ function renderManagedSatelliteList() {
 
   managedSatellitesCache.forEach((satellite) => {
     const profiles = managedSatelliteProfilesByNorad.get(Number(satellite.norad_id)) || [];
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'list-group-item list-group-item-action d-flex justify-content-between align-items-start gap-3';
+    const item = document.createElement('div');
+    item.className = 'list-group-item my-satellite-row d-flex justify-content-between align-items-start gap-3';
     if (Number(satellite.norad_id) === Number(selectedManagedSatelliteNorad)) {
-      button.classList.add('active');
+      item.classList.add('active');
     }
+    const selectButton = document.createElement('button');
+    selectButton.type = 'button';
+    selectButton.className = 'my-satellite-select btn btn-link text-decoration-none text-start p-0';
     const label = document.createElement('div');
     label.className = 'text-start';
     const title = document.createElement('div');
@@ -1689,14 +2795,53 @@ function renderManagedSatelliteList() {
     const badge = document.createElement('span');
     badge.className = 'badge text-bg-secondary align-self-center';
     badge.textContent = `${profiles.length} profile${profiles.length === 1 ? '' : 's'}`;
-    button.append(label, badge);
-    button.addEventListener('click', () => {
+    selectButton.append(label, badge);
+    selectButton.addEventListener('click', () => {
       selectedManagedSatelliteNorad = Number(satellite.norad_id);
       renderManagedSatelliteList();
       renderManagedSatelliteDetail();
     });
-    list.appendChild(button);
+    const trackButton = document.createElement('button');
+    trackButton.type = 'button';
+    trackButton.className = 'btn btn-success btn-sm flex-shrink-0 my-satellite-track-now';
+    trackButton.textContent = 'Track Now';
+    trackButton.addEventListener('click', async () => {
+      selectedManagedSatelliteNorad = Number(satellite.norad_id);
+      renderManagedSatelliteList();
+      renderManagedSatelliteDetail();
+      await trackManagedSatelliteNow(satellite.norad_id);
+    });
+    item.append(selectButton, trackButton);
+    list.appendChild(item);
   });
+}
+
+async function trackManagedSatelliteNow(noradId) {
+  const satellite = satellitesCache.find((item) => {
+    return Number(item.norad_id) === Number(noradId);
+  });
+  if (!satellite) {
+    addLog(`Track Now unavailable for NORAD ${noradId}.`);
+    return;
+  }
+  const autotrackDisabled = await setAutotrackEnabled(false, {
+    persist: true,
+    logOnDisable: true,
+  });
+  if (!autotrackDisabled) {
+    return;
+  }
+  addLog(`Tracking ${satellite.name} now...`);
+  const trackingResult = await selectSatelliteByNorad(satellite.norad_id);
+  if (!trackingResult) {
+    addLog(`Unable to start tracking ${satellite.name}.`);
+    return;
+  }
+  await loadTracking(true);
+  if (pageFromHash() !== 'home') {
+    window.location.hash = 'home';
+    showPage('home');
+  }
 }
 
 function renderManagedSatelliteDetail() {
@@ -1774,6 +2919,10 @@ async function loadMySatellites() {
       ])
     );
     managedSatellitesCache = result.satellites || [];
+    trackedSatelliteNorads = new Set(
+      (result.autotrack_norad_ids || []).map((noradId) => Number(noradId))
+    );
+    trackFilterLoaded = true;
     managedSatelliteProfilesByNorad = profilesByNorad;
     managedSatellitePassesByNorad = passesByNorad;
     document.getElementById('min-pass-elevation').value =
@@ -1787,6 +2936,7 @@ async function loadMySatellites() {
       passMinLabel.textContent = `(min el ${Number(result.min_pass_elevation_deg).toFixed(1)} deg)`;
     }
     ensureManagedSatelliteSelection();
+    renderTrackFilter();
     renderManagedSatelliteList();
     renderManagedSatelliteDetail();
     status.textContent = '';
@@ -1809,6 +2959,8 @@ async function loadMonitor() {
       String(result.settings?.tx?.cat_debug_logging || '').toLowerCase() === 'true';
     document.getElementById('monitor-rotator-cat-debug').checked =
       String(result.settings?.rotator?.cat_debug_logging || '').toLowerCase() === 'true';
+    document.getElementById('monitor-icom-debug').checked =
+      String(result.settings?.icom?.debug_logging || '').toLowerCase() === 'true';
     renderLogs();
     status.textContent = '';
   } catch (error) {
@@ -1833,6 +2985,9 @@ async function updateMonitorDebug() {
           },
           rotator: {
             cat_debug_logging: document.getElementById('monitor-rotator-cat-debug').checked ? 'true' : 'false',
+          },
+          icom: {
+            debug_logging: document.getElementById('monitor-icom-debug').checked ? 'true' : 'false',
           },
         },
       }),
@@ -1969,8 +3124,11 @@ function buildDeviceTestControls(section) {
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'btn btn-outline-primary btn-sm';
-  button.textContent = `Test ${formatSectionLabel(section)}`;
+  button.textContent = `Test ${formatSectionLabel(section)} Device`;
   button.addEventListener('click', () => testDevice(section));
+  if (section === 'rx' || section === 'tx') {
+    button.dataset.roleTestButton = section;
+  }
 
   const status = document.createElement('span');
   status.className = 'settings-section-status';
@@ -1994,6 +3152,102 @@ function collectSectionSettings(section) {
     settings[key] = element.value;
   });
   return settings;
+}
+
+function createEmptyCatDevice() {
+  const nextNumber = document.querySelectorAll('.cat-device-card').length + 1;
+  return {
+    device_id: `device-${nextNumber}`,
+    name: `Device ${nextNumber}`,
+    connectivity: '',
+    host: '',
+    port: '4532',
+    serial_port: '',
+    baud: '',
+    model_id: '',
+    timeout_s: '2.0',
+    state_updates: 'automatic',
+  };
+}
+
+function refreshRoleDeviceSelectors() {
+  ['rx', 'tx'].forEach((section) => {
+    const select = document.querySelector(`select[name="${section}.device_id"]`);
+    if (!select) {
+      return;
+    }
+    const currentValue = select.value;
+    const otherSection = section === 'rx' ? 'tx' : 'rx';
+    const otherSelectedDeviceId = document.querySelector(`select[name="${otherSection}.device_id"]`)?.value || '';
+    const replacement = buildCatDeviceSelect(currentValue, {
+      allowNetwork: section !== 'tx',
+      role: section,
+      otherSelectedDeviceId,
+    });
+    replacement.name = select.name;
+    replacement.addEventListener('change', () => {
+      if (!currentSettingsState[section]) {
+        currentSettingsState[section] = {};
+      }
+      currentSettingsState[section].device_id = replacement.value;
+      refreshRoleDeviceSelectors();
+    });
+    select.replaceWith(replacement);
+  });
+  refreshRoleTargetSelectors();
+  updateRoleTestButtons();
+}
+
+function refreshRoleTargetSelectors() {
+  ['rx', 'tx'].forEach((section) => {
+    const select = document.querySelector(`select[name="${section}.target_vfo"]`);
+    if (!select) {
+      return;
+    }
+    const currentValue = select.value;
+    const deviceId = document.querySelector(`select[name="${section}.device_id"]`)?.value
+      || currentSettingsState?.[section]?.device_id
+      || '';
+    const replacement = buildVfoSelect(currentValue, deviceId, section);
+    replacement.name = select.name;
+    replacement.addEventListener('change', () => {
+      if (!currentSettingsState[section]) {
+        currentSettingsState[section] = {};
+      }
+      currentSettingsState[section].target_vfo = replacement.value;
+    });
+    select.replaceWith(replacement);
+  });
+}
+
+function applyCatDeviceConnectivityState() {
+  document.querySelectorAll('.cat-device-card').forEach((card) => {
+    const connectivity = card.querySelector('[data-cat-device-field="connectivity"]');
+    if (!connectivity) {
+      return;
+    }
+    const connectivityValue = String(connectivity.value || '').trim().toLowerCase();
+    const isLocal = connectivityValue === 'local';
+    const isNetwork = connectivityValue === 'network';
+    toggleCatDeviceField(card, 'host', !isNetwork, !isNetwork);
+    toggleCatDeviceField(card, 'port', !isNetwork, !isNetwork);
+    toggleCatDeviceField(card, 'serial_port', !isLocal, !isLocal);
+    toggleCatDeviceField(card, 'baud', !isLocal, !isLocal);
+    toggleCatDeviceField(card, 'model_id', !isLocal, !isLocal);
+  });
+}
+
+function toggleCatDeviceField(card, key, disabled, hidden = disabled) {
+  const element = card.querySelector(`[data-cat-device-field="${key}"]`);
+  if (!element) {
+    return;
+  }
+  element.disabled = disabled;
+  const row = element.closest('.settings-row');
+  if (row) {
+    row.classList.toggle('control-disabled', disabled);
+    row.hidden = hidden;
+  }
 }
 
 function setDeviceTestStatus(section, message, isError = false) {
@@ -2038,6 +3292,8 @@ async function testDevice(section) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         settings: collectSectionSettings(section),
+        icom_settings: collectSectionSettings('icom'),
+        cat_devices: catDevicesCache,
       }),
     });
     const result = await response.json();
@@ -2051,6 +3307,292 @@ async function testDevice(section) {
     setDeviceTestStatus(section, message, true);
     addLog(message);
   }
+}
+
+function updateRoleTestButtons() {
+  ['rx', 'tx'].forEach((section) => {
+    const button = document.querySelector(`[data-role-test-button="${section}"]`);
+    const status = document.getElementById(`test-status-${section}`);
+    if (!button) {
+      return;
+    }
+    const selectedDeviceId = document.querySelector(`select[name="${section}.device_id"]`)?.value || '';
+    if (selectedDeviceId === NATIVE_ICOM_DEVICE_ID) {
+      button.disabled = false;
+      button.title = `Test native IC-9700 ${section === 'rx' ? 'SUB/RX' : 'MAIN/TX'} control and audio without transmitting.`;
+      return;
+    }
+    const selectedDevice = catDevicesCache.find((device) => String(device.device_id) === String(selectedDeviceId));
+    const deviceTestAvailable = section === 'rx'
+      ? Boolean(selectedDevice)
+      : selectedDevice?.connectivity === 'local';
+    button.disabled = !deviceTestAvailable;
+    if (!deviceTestAvailable) {
+      button.title = section === 'tx'
+        ? 'TX device test is only available for local devices.'
+        : 'Select an RX device to test.';
+      if (status) {
+        status.textContent = section === 'tx'
+          ? 'Select a local device. Network devices are RX-only.'
+          : 'Select an RX device to test.';
+        status.classList.remove('is-error');
+      }
+      return;
+    }
+    button.title = '';
+    if (status && status.textContent.includes('Select an RX device')) {
+      status.textContent = '';
+    }
+    if (status && status.textContent.includes('TX device test is only available')) {
+      status.textContent = '';
+    }
+    if (status && status.textContent.includes('Network devices are RX-only')) {
+      status.textContent = '';
+    }
+  });
+}
+
+function collectCatDeviceFromCard(card) {
+  const values = {};
+  card.querySelectorAll('[data-cat-device-field]').forEach((element) => {
+    values[element.dataset.catDeviceField] = element.value;
+  });
+  return {
+    device_id: String(values.device_id || '').trim(),
+    name: String(values.name || '').trim(),
+    connectivity: String(values.connectivity || '').trim(),
+    host: String(values.host || '').trim(),
+    port: String(values.port || '').trim(),
+    serial_port: String(values.serial_port || '').trim(),
+    baud: String(values.baud || '').trim(),
+    model_id: String(values.model_id || '').trim(),
+    timeout_s: String(values.timeout_s || '').trim() || '2.0',
+    state_updates: values.state_updates === 'polling' ? 'polling' : 'automatic',
+  };
+}
+
+async function testCatDevice(card) {
+  const status = card.querySelector('[data-cat-device-status]');
+  const device = collectCatDeviceFromCard(card);
+  if (status) {
+    status.textContent = 'Testing radio and state updates...';
+    status.classList.remove('is-error');
+  }
+  try {
+    const response = await fetch('/api/cat-devices/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) {
+      const message = result.detail || result.message || 'Radio test failed.';
+      if (status) {
+        status.textContent = message;
+        status.classList.add('is-error');
+      }
+      addLog(message);
+      return;
+    }
+    const testedDevice = { ...device, ...(result.details || {}) };
+    applyCatDeviceCapabilitiesToCard(card, testedDevice);
+    renderCatDeviceCapabilityChart(card);
+    const asyncMessage = String(result.details?.capability_async_notes || '').trim();
+    const message = `${result.message || 'Radio connected successfully.'}${asyncMessage ? ` ${asyncMessage}` : ''}`;
+    if (status) {
+      status.textContent = message;
+      status.classList.remove('is-error');
+    }
+    addLog(message);
+  } catch (error) {
+    if (status) {
+      status.textContent = 'Radio test failed.';
+      status.classList.add('is-error');
+    }
+    addLog('Radio test failed.');
+  }
+}
+
+async function saveCatDevice(card) {
+  const status = card.querySelector('[data-cat-device-status]');
+  const device = collectCatDeviceFromCard(card);
+  if (!device.name || !device.device_id || !device.connectivity) {
+    if (status) {
+      status.textContent = 'Name, Device ID, and Connectivity are required.';
+      status.classList.add('is-error');
+    }
+    return;
+  }
+  if (device.connectivity === 'network' && (!device.host || !device.port)) {
+    if (status) {
+      status.textContent = 'Host and Port are required for network devices.';
+      status.classList.add('is-error');
+    }
+    return;
+  }
+  if (device.connectivity === 'local' && (!device.serial_port || !device.model_id)) {
+    if (status) {
+      status.textContent = 'Serial Port and Model ID are required for local devices.';
+      status.classList.add('is-error');
+    }
+    return;
+  }
+
+  if (status) {
+    status.textContent = 'Saving device...';
+    status.classList.remove('is-error');
+  }
+  try {
+    const response = await fetch('/api/cat-devices', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        original_device_id: card.dataset.savedDeviceId || '',
+        device,
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      if (status) {
+        status.textContent = result.detail || 'Device save failed.';
+        status.classList.add('is-error');
+      }
+      addLog(result.detail || 'Device save failed.');
+      return;
+    }
+    catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : catDevicesCache;
+    addLog(result.message || 'Device saved.');
+    const savedDevice = result.device || device;
+    card.dataset.savedDeviceId = String(savedDevice.device_id || device.device_id);
+    card.dataset.deviceId = card.dataset.savedDeviceId;
+    card.querySelectorAll('[data-cat-device-field]').forEach((element) => {
+      const key = element.dataset.catDeviceField;
+      if (Object.hasOwn(savedDevice, key)) {
+        element.value = String(savedDevice[key] ?? '');
+      }
+    });
+    applyCatDeviceCapabilitiesToCard(card, savedDevice);
+    renderCatDeviceCapabilityChart(card);
+    refreshRoleDeviceSelectors();
+    if (status) {
+      status.textContent = result.message || 'Device saved.';
+      status.classList.remove('is-error');
+    }
+  } catch (error) {
+    if (status) {
+      status.textContent = 'Device save failed.';
+      status.classList.add('is-error');
+    }
+    addLog('Device save failed.');
+  }
+}
+
+async function removeCatDevice(card) {
+  const savedDeviceId = String(card.dataset.savedDeviceId || '').trim();
+  if (!savedDeviceId) {
+    card.remove();
+    return;
+  }
+  const status = card.querySelector('[data-cat-device-status]');
+  if (status) {
+    status.textContent = 'Removing device...';
+    status.classList.remove('is-error');
+  }
+  try {
+    const response = await fetch(`/api/cat-devices/${encodeURIComponent(savedDeviceId)}`, {
+      method: 'DELETE',
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      if (status) {
+        status.textContent = result.detail || 'Device removal failed.';
+        status.classList.add('is-error');
+      }
+      addLog(result.detail || 'Device removal failed.');
+      return;
+    }
+    catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : catDevicesCache;
+    addLog(result.message || 'Device removed.');
+    card.remove();
+    refreshRoleDeviceSelectors();
+  } catch (error) {
+    if (status) {
+      status.textContent = 'Device removal failed.';
+      status.classList.add('is-error');
+    }
+    addLog('Device removal failed.');
+  }
+}
+
+function applyCatDeviceCapabilitiesToCard(card, device) {
+  card.dataset.capabilityComm = normalizeCapabilityValue(device.capability_comm);
+  card.dataset.capabilityPtt = normalizeCapabilityValue(device.capability_ptt);
+  card.dataset.capabilityVfo = normalizeCapabilityValue(device.capability_vfo);
+  card.dataset.capabilityShared = normalizeCapabilityValue(device.capability_shared);
+  card.dataset.capabilityTargets = String(device.capability_targets || '').trim();
+  card.dataset.capabilityLastTestUtc = String(device.capability_last_test_utc || '').trim();
+  card.dataset.capabilityNotes = String(device.capability_notes || '').trim();
+  card.dataset.capabilityAsync = String(device.capability_async || '').trim().toLowerCase();
+  card.dataset.capabilityAsyncVersion = String(device.capability_async_version || '').trim();
+  card.dataset.capabilityAsyncProperties = String(device.capability_async_properties || '').trim();
+  card.dataset.capabilityAsyncNotes = String(device.capability_async_notes || '').trim();
+}
+
+function normalizeCapabilityValue(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'true' || normalized === 'false') {
+    return normalized;
+  }
+  return '';
+}
+
+function renderCatDeviceCapabilityChart(card) {
+  const container = card.querySelector('[data-capability-chart="true"]');
+  if (!container) {
+    return;
+  }
+  container.replaceChildren();
+  const items = [
+    ['Rig CTL', card.dataset.capabilityComm],
+    ['PTT', card.dataset.capabilityPtt],
+    ['VFO', card.dataset.capabilityVfo],
+    ['Shared RX/TX', card.dataset.capabilityShared],
+  ];
+  items.forEach(([label, value]) => {
+    const item = document.createElement('div');
+    item.className = 'device-capability-item';
+    const icon = document.createElement('span');
+    icon.className = `device-capability-icon capability-${value || 'unknown'}`;
+    icon.textContent = value === 'true' ? '✓' : value === 'false' ? '✕' : '?';
+    const text = document.createElement('span');
+    text.className = 'device-capability-label';
+    text.textContent = label;
+    item.append(icon, text);
+    container.appendChild(item);
+  });
+  const asyncState = card.dataset.capabilityAsync || '';
+  const asyncItem = document.createElement('div');
+  asyncItem.className = 'device-capability-item';
+  const asyncIcon = document.createElement('span');
+  asyncIcon.className = `device-capability-icon capability-${asyncState || 'unknown'}`;
+  asyncIcon.textContent = asyncState === 'verified' ? '✓' : asyncState === 'available' ? '◐' : asyncState === 'unsupported' ? '✕' : '?';
+  const asyncLabel = document.createElement('span');
+  asyncLabel.className = 'device-capability-label';
+  asyncLabel.textContent = asyncState === 'verified'
+    ? 'Real-time updates active'
+    : asyncState === 'available'
+      ? 'Async available; awaiting verification'
+      : asyncState === 'unsupported'
+        ? 'Polling state updates'
+        : 'State updates not tested';
+  asyncItem.append(asyncIcon, asyncLabel);
+  container.appendChild(asyncItem);
+  const notes = document.createElement('div');
+  notes.className = 'device-capability-notes';
+  notes.textContent = [card.dataset.capabilityNotes, card.dataset.capabilityAsyncNotes]
+    .filter(Boolean)
+    .join(' ') || 'Save or test the device to populate device support when reachable.';
+  container.appendChild(notes);
 }
 
 function buildSatellitePassList(passes) {
@@ -2207,7 +3749,9 @@ function buildSettingControl(section, key, value) {
 
   const labelText = document.createElement('span');
   labelText.className = 'form-label mb-0';
-  labelText.textContent = formatSettingLabel(key);
+  labelText.textContent = section === 'icom' && key === 'serial_port'
+    ? 'Icom CI-V UDP Port'
+    : formatSettingLabel(key);
 
   const fieldName = `${section}.${key}`;
   let control;
@@ -2234,7 +3778,24 @@ function buildSettingControl(section, key, value) {
     return row;
   }
 
-  if (key === 'connectivity') {
+  if (key === 'device_id' && (section === 'rx' || section === 'tx')) {
+    const otherSection = section === 'rx' ? 'tx' : 'rx';
+    const otherSelectedDeviceId = document.querySelector(`select[name="${otherSection}.device_id"]`)?.value
+      || currentSettingsState?.[otherSection]?.device_id
+      || '';
+    control = buildCatDeviceSelect(value, {
+      allowNetwork: section !== 'tx',
+      role: section,
+      otherSelectedDeviceId,
+    });
+    control.addEventListener('change', () => {
+      if (!currentSettingsState[section]) {
+        currentSettingsState[section] = {};
+      }
+      currentSettingsState[section].device_id = control.value;
+      refreshRoleDeviceSelectors();
+    });
+  } else if (key === 'connectivity') {
     control = document.createElement('select');
     control.className = 'form-select';
     ['network', 'local'].forEach((optionValue) => {
@@ -2244,14 +3805,29 @@ function buildSettingControl(section, key, value) {
       control.appendChild(option);
     });
     control.value = value || 'network';
-  } else if (key === 'serial_port' && (section === 'rx' || section === 'tx' || section === 'rotator')) {
+  } else if (section === 'aprs' && key === 'channel') {
+    control = document.createElement('select');
+    control.className = 'form-select';
+    [['main', 'Main (left)'], ['right', 'Right'], ['both', 'Both (mono sum)']].forEach(([optionValue, label]) => {
+      const option = document.createElement('option');
+      option.value = optionValue;
+      option.textContent = label;
+      control.appendChild(option);
+    });
+    control.value = value || 'main';
+  } else if (key === 'serial_port' && section === 'rotator') {
     control = buildSerialPortSelect(value);
-  } else if (key === 'model_id' && (section === 'rx' || section === 'tx')) {
-    control = buildHamlibModelSelect(value);
   } else if (key === 'model_id' && section === 'rotator') {
     control = buildHamlibRotatorModelSelect(value);
   } else if (key === 'target_vfo' && (section === 'rx' || section === 'tx')) {
-    control = buildVfoSelect(value);
+    const deviceId = currentSettingsState?.[section]?.device_id || '';
+    control = buildVfoSelect(value, deviceId, section);
+    control.addEventListener('change', () => {
+      if (!currentSettingsState[section]) {
+        currentSettingsState[section] = {};
+      }
+      currentSettingsState[section].target_vfo = control.value;
+    });
   } else if (section === 'station' && key === 'grid_locator') {
     control = document.createElement('input');
     control.className = 'form-control compact-input';
@@ -2275,6 +3851,10 @@ function buildSettingControl(section, key, value) {
       control = document.createElement('input');
       control.className = 'form-control';
       control.value = value;
+      if (section === 'icom' && key === 'password') {
+        control.type = 'password';
+        control.autocomplete = 'off';
+      }
       if (isNumericSetting(key)) {
         control.inputMode = 'decimal';
         control.classList.add('compact-input');
@@ -2288,8 +3868,7 @@ function buildSettingControl(section, key, value) {
   control.name = fieldName;
   row.append(labelText, control);
   if (
-    key === 'serial_port'
-    && (section === 'rx' || section === 'tx' || section === 'rotator')
+    (key === 'serial_port' && section === 'rotator')
     && control.dataset.deviceMissing === 'true'
   ) {
     const warning = document.createElement('span');
@@ -2314,6 +3893,15 @@ function buildFailureThresholdSelect(value) {
   return control;
 }
 
+function serialDeviceLabel(device) {
+  const raw = String(device.label || device.name || device.path || '');
+  if (!/IC[- ]?9700/i.test(raw)) return raw;
+  const endpoint = raw.match(/(?:^|[ _-])([AB])(?:-if\d+-port\d+)?$/i)?.[1]?.toUpperCase();
+  if (endpoint === 'A') return `IC-9700 USB A — CI-V control — ${raw}`;
+  if (endpoint === 'B') return `IC-9700 USB B — data (not native CI-V control) — ${raw}`;
+  return `IC-9700 serial — ${raw}`;
+}
+
 function buildSerialPortSelect(value) {
   const control = document.createElement('select');
   control.className = 'form-select';
@@ -2335,13 +3923,17 @@ function buildSerialPortSelect(value) {
   serialDevices.forEach((device) => {
     const option = document.createElement('option');
     option.value = device.path;
-    option.textContent = device.label || device.name || device.path;
+    option.textContent = serialDeviceLabel(device);
+    option.title = device.path;
     control.appendChild(option);
   });
   if (selectedValue && !known) {
     control.dataset.deviceMissing = 'true';
   }
   control.value = selectedValue;
+  const updateTitle = () => { control.title = control.value || 'Select a persistent /dev/serial/by-id device'; };
+  control.addEventListener('change', updateTitle);
+  updateTitle();
   return control;
 }
 
@@ -2369,7 +3961,62 @@ function buildHamlibModelSelect(value) {
   hamlibRadioModels.forEach((model) => {
     const option = document.createElement('option');
     option.value = String(model.model_id);
-    option.textContent = `${model.model_id} - ${model.label}`;
+    option.textContent = model.label;
+    control.appendChild(option);
+  });
+  control.value = selectedValue;
+  return control;
+}
+
+function buildCatDeviceSelect(value, options = {}) {
+  const control = document.createElement('select');
+  control.className = 'form-select';
+  const allowNetwork = options.allowNetwork !== false;
+  const role = String(options.role || '').toLowerCase();
+  const otherSelectedDeviceId = String(options.otherSelectedDeviceId || '');
+
+  const blank = document.createElement('option');
+  blank.value = '';
+  blank.textContent = 'Select device';
+  control.appendChild(blank);
+
+  const selectedValue = String(value || '');
+  const nativeOption = document.createElement('option');
+  nativeOption.value = NATIVE_ICOM_DEVICE_ID;
+  const nativeEnabled = String(currentSettingsState?.icom?.enabled || '').toLowerCase() === 'true';
+  nativeOption.textContent = nativeEnabled
+    ? 'Icom IC-9700 (Native Pi-Sat)'
+    : 'Icom IC-9700 (Native Pi-Sat - enable above)';
+  control.appendChild(nativeOption);
+  const selectableDevices = catDevicesCache.filter((device) => {
+    const connectivity = String(device.connectivity || '').toLowerCase();
+    if (!allowNetwork && connectivity !== 'local') {
+      return false;
+    }
+    const deviceId = String(device.device_id || '');
+    if (
+      otherSelectedDeviceId
+      && deviceId === otherSelectedDeviceId
+      && role
+      && String(device.capability_shared || '').toLowerCase() !== 'true'
+    ) {
+      return deviceId === selectedValue;
+    }
+    return true;
+  });
+  const hasSelectedValue = selectedValue === NATIVE_ICOM_DEVICE_ID
+    || selectableDevices.some((device) => String(device.device_id) === selectedValue);
+  if (selectedValue && !hasSelectedValue) {
+    const current = document.createElement('option');
+    current.value = selectedValue;
+    current.textContent = `${selectedValue} (not available)`;
+    control.appendChild(current);
+  }
+
+  selectableDevices.forEach((device) => {
+    const option = document.createElement('option');
+    option.value = String(device.device_id);
+    option.textContent = `${device.name} [${device.device_id}]`;
     control.appendChild(option);
   });
   control.value = selectedValue;
@@ -2420,28 +4067,144 @@ function buildHamlibRotatorModelSelect(value) {
   hamlibRotatorModels.forEach((model) => {
     const option = document.createElement('option');
     option.value = String(model.model_id);
-    option.textContent = `${model.model_id} - ${model.label}`;
+    option.textContent = model.label;
     control.appendChild(option);
   });
   control.value = selectedValue;
   return control;
 }
 
-function buildVfoSelect(value) {
+function getCatDeviceById(deviceId) {
+  return catDevicesCache.find((device) => String(device.device_id || '') === String(deviceId || ''));
+}
+
+function getDeviceTargetOptions(deviceId, requireExplicit = false) {
+  if (deviceId === NATIVE_ICOM_DEVICE_ID) {
+    return [];
+  }
+  const device = getCatDeviceById(deviceId);
+  const options = requireExplicit
+    ? [['', 'Select explicit target']]
+    : [['current', 'Current VFO']];
+  const rawTargets = String(device?.capability_targets || '')
+    .split(',')
+    .map((target) => canonicalizeDeviceTargetValue(target))
+    .filter(Boolean);
+  const uniqueTargets = rawTargets.filter(
+    (target, index) => rawTargets.findIndex(
+      (candidate) => candidate.toUpperCase() === target.toUpperCase(),
+    ) === index,
+  );
+  uniqueTargets.forEach((target) => {
+    options.push([target, formatHamlibTargetLabel(target)]);
+  });
+  return options;
+}
+
+function buildVfoSelect(value, deviceId = '', section = '') {
   const control = document.createElement('select');
   control.className = 'form-select';
-  [
-    ['current', 'Current VFO'],
-    ['A', 'VFO A'],
-    ['B', 'VFO B'],
-  ].forEach(([optionValue, optionLabel]) => {
+  if (deviceId === NATIVE_ICOM_DEVICE_ID) {
+    const fixedSide = section === 'tx' ? 'MAIN' : 'SUB';
+    const option = document.createElement('option');
+    option.value = fixedSide;
+    option.textContent = `${fixedSide} (fixed physical for native IC-9700 ${section.toUpperCase()})`;
+    control.appendChild(option);
+    control.value = fixedSide;
+    return control;
+  }
+  const selectedValue = canonicalizeDeviceTargetValue(value);
+  const otherSection = section === 'rx' ? 'tx' : section === 'tx' ? 'rx' : '';
+  const otherDeviceId = otherSection
+    ? (
+      document.querySelector(`select[name="${otherSection}.device_id"]`)?.value
+      || currentSettingsState?.[otherSection]?.device_id
+      || ''
+    )
+    : '';
+  const requireExplicit = Boolean(deviceId && otherDeviceId === deviceId);
+  const options = getDeviceTargetOptions(deviceId, requireExplicit);
+  options.forEach(([optionValue, optionLabel]) => {
     const option = document.createElement('option');
     option.value = optionValue;
     option.textContent = optionLabel;
     control.appendChild(option);
   });
-  control.value = String(value || 'current');
+  const validValues = new Set(options.map(([optionValue]) => optionValue));
+  if (selectedValue && !validValues.has(selectedValue)) {
+    const current = document.createElement('option');
+    current.value = selectedValue;
+    current.textContent = formatHamlibTargetLabel(selectedValue);
+    control.appendChild(current);
+  }
+  control.value = validValues.has(selectedValue) ? selectedValue : selectedValue || 'current';
   return control;
+}
+
+function canonicalizeDeviceTargetValue(value) {
+  const normalized = String(value || 'current').trim().toUpperCase();
+  if (!normalized || normalized === 'CURRENT') {
+    return 'current';
+  }
+  if (normalized === 'A') {
+    return 'VFOA';
+  }
+  if (normalized === 'B') {
+    return 'VFOB';
+  }
+  const compoundTargets = {
+    MAINA: 'MainA',
+    MAINB: 'MainB',
+    MAINC: 'MainC',
+    SUBA: 'SubA',
+    SUBB: 'SubB',
+    SUBC: 'SubC',
+  };
+  if (compoundTargets[normalized]) {
+    return compoundTargets[normalized];
+  }
+  return normalized;
+}
+
+function formatHamlibTargetLabel(target) {
+  const normalized = String(target || '').trim().toUpperCase();
+  if (!normalized || normalized === 'CURRENT') {
+    return 'Current VFO';
+  }
+  if (normalized === 'VFOA') {
+    return 'VFO A';
+  }
+  if (normalized === 'VFOB') {
+    return 'VFO B';
+  }
+  if (normalized === 'VFOC') {
+    return 'VFO C';
+  }
+  if (normalized === 'MAIN') {
+    return 'Main';
+  }
+  if (normalized === 'SUB') {
+    return 'Sub';
+  }
+  if (normalized === 'MAINA') {
+    return 'Main A';
+  }
+  if (normalized === 'MAINB') {
+    return 'Main B';
+  }
+  if (normalized === 'MAINC') {
+    return 'Main C';
+  }
+  if (normalized === 'SUBA') {
+    return 'Sub A';
+  }
+  if (normalized === 'SUBB') {
+    return 'Sub B';
+  }
+  if (normalized === 'SUBC') {
+    return 'Sub C';
+  }
+  return normalized;
 }
 
 async function saveSettings(event) {
@@ -2476,45 +4239,81 @@ async function saveSettings(event) {
       status.textContent = result.detail || 'Settings save failed.';
       return;
     }
-    status.textContent = 'Settings saved and connections reloaded.';
+    catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : catDevicesCache;
+    const runtimeWarnings = Array.isArray(result.runtime_warnings)
+      ? result.runtime_warnings.filter(Boolean)
+      : [];
+    status.textContent = runtimeWarnings.length
+      ? `Settings saved, with connection warnings: ${runtimeWarnings.join(' ')}`
+      : 'Settings saved and connections reloaded.';
     loadStatus();
     await loadSettings();
     loadRotator();
-    syncTrackingForSelection();
   } catch (error) {
     status.textContent = 'Settings save failed.';
   }
 }
 
 async function updateDeviceControl(event) {
-  addLog('Updating device control...');
-  const toggleId = event.currentTarget.id;
+  const toggle = event.currentTarget;
+  const requestedEnabled = toggle.checked;
+  toggle.blur();
+  const control = toggle.dataset.deviceControl;
+  const payloadKey = DEVICE_CONTROL_SETTINGS_KEYS[control];
+  if (!payloadKey) {
+    return;
+  }
+  // Mirror the change onto the other page headers before the status poll lands.
+  setDeviceControlChecked(control, requestedEnabled);
+  pendingDeviceControlValues[payloadKey] = requestedEnabled;
+  deviceControlUpdatesPending = 1;
+  if (deviceControlFlushTimer !== null) {
+    window.clearTimeout(deviceControlFlushTimer);
+  }
+  deviceControlFlushTimer = window.setTimeout(() => {
+    deviceControlFlushTimer = null;
+    if (!deviceControlFlushActive) {
+      void flushDeviceControlUpdates();
+    }
+  }, 150);
+}
+
+async function flushDeviceControlUpdates() {
+  const payload = { ...pendingDeviceControlValues };
+  Object.keys(payload).forEach((key) => {
+    delete pendingDeviceControlValues[key];
+  });
+  if (!Object.keys(payload).length) {
+    deviceControlUpdatesPending = 0;
+    return;
+  }
+
+  deviceControlFlushActive = true;
+  addLog('Updating device controls...');
   try {
     const response = await fetch('/api/device-controls', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        rx_enabled: document.getElementById('rx-control-toggle').checked,
-        tx_enabled: document.getElementById('tx-control-toggle').checked,
-        rotator_enabled: document.getElementById('rotator-control-toggle').checked,
-      }),
+      body: JSON.stringify(payload),
     });
     const result = await response.json();
     if (!response.ok) {
       addLog(result.detail || 'Device control update failed.');
-      event.currentTarget.checked = !event.currentTarget.checked;
       return;
     }
-    addLog('Device control updated.');
-    loadStatus();
-    rotatorControlEnabled = document.getElementById('rotator-control-toggle').checked;
+    addLog('Device controls updated.');
+    rotatorControlEnabled = deviceControlChecked('rotator');
     loadRotator();
-    if (toggleId !== 'rotator-control-toggle') {
-      syncTrackingForSelection();
-    }
   } catch (error) {
     addLog('Device control update failed.');
-    event.currentTarget.checked = !event.currentTarget.checked;
+  } finally {
+    deviceControlFlushActive = false;
+    if (Object.keys(pendingDeviceControlValues).length) {
+      void flushDeviceControlUpdates();
+    } else {
+      deviceControlUpdatesPending = 0;
+      loadStatus();
+    }
   }
 }
 
@@ -2541,9 +4340,12 @@ async function refreshTleData() {
 
 function isBooleanSetting(key) {
   return key === 'enabled'
-    || key === 'write_enabled'
+    || key === 'debug_logging'
     || key === 'cat_debug_logging'
     || key === 'return_home_after_pass'
+    || key === 'manual_offset_readback_active_pass_only'
+    || key === 'full_duplex'
+    || key === 'scope_enabled'
     || key.startsWith('tx_inhibit');
 }
 
@@ -2558,7 +4360,18 @@ function isNumericSetting(key) {
     || key === 'cat_rate_limit_hz'
     || key === 'tracking_update_interval_ms'
     || key === 'device_offline_failure_threshold'
-    || key === 'min_elevation_deg';
+    || key === 'min_elevation_deg'
+    || key === 'control_port'
+    || key === 'serial_port'
+    || key === 'audio_port'
+    || key === 'civ_address'
+    || key === 'controller_address'
+    || key === 'sample_rate'
+    || key === 'tx_delay_ms'
+    || key === 'tx_tail_ms'
+    || key === 'amplitude'
+    || key === 'min_interval_s'
+    || key === 'rx_gain_db';
 }
 
 function isWideSetting(key) {
@@ -2586,8 +4399,8 @@ function formatSettingLabel(key) {
     port: 'Port',
     baud: 'Baud',
     model_id: 'Model ID',
+    device_id: 'Assigned Device',
     serial_port: 'Serial Port',
-    write_enabled: 'Write Enabled',
     timeout_s: 'Timeout (s)',
     grid_locator: 'Grid Locator',
     latitude_deg: 'Latitude (deg)',
@@ -2604,12 +4417,30 @@ function formatSettingLabel(key) {
     target_vfo: 'Target VFO',
     tracking_update_interval_ms: 'Tracking Update Interval (ms)',
     device_offline_failure_threshold: 'Number of Failures Before Device Is Marked Offline',
-    tx_inhibit_below_horizon: 'TX Inhibit Below Horizon',
-    tx_inhibit_on_cat_loss: 'TX Inhibit On CAT Loss',
-    tx_inhibit_without_valid_pass: 'TX Inhibit Without Valid Pass',
     frequency_deadband_hz: 'Frequency Deadband (Hz)',
     cat_rate_limit_hz: 'CAT Rate Limit (Hz)',
+    mycall: 'APRS Callsign',
+    channel: 'APRS Decoder Channel',
+    destination: 'APRS Destination',
+    path: 'APRS Digipeater Path',
+    symbol: 'APRS Symbol (table + code)',
+    comment: 'APRS Comment',
+    tx_delay_ms: 'APRS TX Delay (ms)',
+    tx_tail_ms: 'APRS TX Tail (ms)',
+    amplitude: 'APRS TX Amplitude (%)',
+    min_interval_s: 'APRS Minimum Interval (s)',
+    rx_gain_db: 'Decoder Input Level (dB)',
+    manual_offset_readback_active_pass_only: 'Monitor Manual Offset Only During Live Pass',
     gui_resources_caching: 'GUI Resources Caching',
+    civ_address: 'Radio CI-V Address',
+    controller_address: 'Controller CI-V Address',
+    control_port: 'Icom Control UDP Port',
+    audio_port: 'Icom Audio UDP Port',
+    sample_rate: 'Audio Sample Rate',
+    rx_codec: 'RX Codec',
+    tx_codec: 'TX Codec',
+    full_duplex: 'Full Duplex Audio',
+    scope_enabled: 'Enable Spectrum Scope',
     name: 'Name',
     connectivity: 'Connectivity',
     enabled: 'Enabled',
@@ -2634,6 +4465,9 @@ function renderTracking(result) {
     return;
   }
   latestTracking = result;
+  if (sharedTrackingSelectionDiffers(result)) {
+    restoreSelectionFromTracking();
+  }
   const updateAtMs = Date.parse(result?.last_update_at_utc || '') || 0;
   if (
     Number(result.norad_id) === Number(selectedSatelliteNorad)
@@ -2643,23 +4477,41 @@ function renderTracking(result) {
   }
   const syncToggle = document.getElementById('sync-rx-tx-toggle');
   if (
+    typeof result.manual_offsets_enabled === 'boolean'
+    && !manualOffsetsToggleUpdatePending
+  ) {
+    manualOffsetsEnabled = result.manual_offsets_enabled;
+    updateManualOffsetControlState();
+  }
+  if (
     syncToggle
     && typeof result.sync_offsets === 'boolean'
     && !syncToggleUpdatePending
   ) {
-    syncRxTx = result.sync_offsets;
-    syncToggle.checked = result.sync_offsets;
+    const profileSupportsSync = !isRxOnlyProfile(getSelectedFrequencyProfile());
+    if (profileSupportsSync) {
+      syncRxTx = result.sync_offsets;
+    }
+    syncToggle.checked = profileSupportsSync ? syncRxTx : false;
+  }
+  const autotrackToggle = document.getElementById('auto-track-toggle');
+  if (autotrackToggle && typeof result.autotrack_next_pass === 'boolean') {
+    autotrackToggle.checked = result.autotrack_next_pass;
   }
   document.getElementById('selected-satellite-azimuth').textContent =
     `Az ${formatNumber(result.azimuth_deg, 2, ' deg')}`;
   document.getElementById('selected-satellite-elevation').textContent =
     `El ${formatNumber(result.elevation_deg, 2, ' deg')}`;
+  document.getElementById('tracking-pass-state').textContent =
+    result.pass_active ? 'Active' : 'Inactive';
   document.getElementById('tracking-rx-center').textContent =
     formatHz(result.downlink_center_hz);
   document.getElementById('tracking-rx-doppler').textContent =
     formatSignedHz(result.downlink_doppler_hz);
   document.getElementById('tracking-rx-offset').textContent =
     formatSignedHz(result.user_downlink_offset_hz);
+  document.getElementById('tracking-virtual-rit').textContent =
+    formatSignedHz(result.virtual_rit_hz);
   document.getElementById('tracking-target-rx').textContent =
     formatHz(result.target_rx_hz);
   document.getElementById('tracking-tx-center').textContent =
@@ -2673,6 +4525,32 @@ function renderTracking(result) {
   renderTxReadoutsForSelectedProfile();
   logErrorState('tracking', result.error || '');
   drawMap();
+}
+
+function sharedTrackingSelectionDiffers(result) {
+  const sharedNorad = Number(result?.norad_id);
+  if (!Number.isFinite(sharedNorad)) {
+    return false;
+  }
+  if (sharedNorad !== Number(selectedSatelliteNorad)) {
+    return true;
+  }
+
+  const sharedProfileIndex = Number(result.frequency_profile_index);
+  if (
+    result.frequency_profile_index !== null
+    && result.frequency_profile_index !== undefined
+    && Number.isInteger(sharedProfileIndex)
+  ) {
+    return sharedProfileIndex !== selectedFrequencyProfileIndex;
+  }
+
+  const selectedProfile = getSelectedFrequencyProfile();
+  return Boolean(
+    result.transponder_name
+    && selectedProfile
+    && result.transponder_name !== selectedProfile.name
+  );
 }
 
 function renderTxReadoutsForSelectedProfile() {
@@ -2757,6 +4635,7 @@ function beginMapRefresh(noradId, satelliteName) {
   mapRefreshRequestedAtMs = Date.now();
   latestTracking = {
     active: true,
+    pass_active: false,
     norad_id: noradId,
     satellite_name: satelliteName,
     latitude_deg: null,
@@ -3063,9 +4942,16 @@ function drawMapLegend(ctx, width, height) {
     || ''
   ).trim();
   const showActiveLabel = activeLabel && activeLabel !== 'None';
-  const legendWidth = showActiveLabel ? 248 : 174;
+  const legendX = 10;
+  const legendY = height - 22;
+  const activeLabelText = activeLabel.toUpperCase();
+  ctx.font = '10px Arial';
+  const legendContentWidth = showActiveLabel
+    ? 202 + ctx.measureText(activeLabelText).width - legendX + 8
+    : 174;
+  const legendWidth = Math.max(0, Math.min(width - (legendX * 2), Math.ceil(legendContentWidth)));
   ctx.fillStyle = 'rgba(4, 12, 19, 0.84)';
-  ctx.fillRect(10, height - 20, legendWidth, 12);
+  ctx.fillRect(legendX, legendY, legendWidth, 16);
   ctx.strokeStyle = '#2bb7ff';
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -3073,7 +4959,6 @@ function drawMapLegend(ctx, width, height) {
   ctx.lineTo(40, height - 14);
   ctx.stroke();
   ctx.fillStyle = '#d5e4f1';
-  ctx.font = '10px Arial';
   ctx.fillText('GROUND TRACK', 44, height - 11);
   ctx.fillStyle = '#59d66f';
   ctx.beginPath();
@@ -3093,7 +4978,7 @@ function drawMapLegend(ctx, width, height) {
     ctx.fill();
     ctx.stroke();
     ctx.fillStyle = '#d5e4f1';
-    ctx.fillText(activeLabel.toUpperCase(), 202, height - 11);
+    ctx.fillText(activeLabelText, 202, height - 11);
   }
 }
 
@@ -3378,17 +5263,8 @@ function formatDuration(totalSeconds) {
   return `${remainder}s`;
 }
 
-function bindConnectivityState() {
-  ['rx', 'tx', 'rotator'].forEach((section) => {
-    const connectivity = document.querySelector(`[name="${section}.connectivity"]`);
-    if (connectivity) {
-      connectivity.addEventListener('change', applyConnectivityState);
-    }
-  });
-}
-
 function applyConnectivityState() {
-  ['rx', 'tx', 'rotator'].forEach((section) => {
+  ['rotator'].forEach((section) => {
     const connectivity = document.querySelector(`[name="${section}.connectivity"]`);
     if (!connectivity) {
       return;
@@ -3399,9 +5275,6 @@ function applyConnectivityState() {
     setSettingDisabled(section, 'serial_port', !isLocal);
     setSettingDisabled(section, 'baud', !isLocal);
     setSettingDisabled(section, 'model_id', !isLocal);
-    if (section === 'rx' || section === 'tx') {
-      setSettingDisabled(section, 'target_vfo', !isLocal);
-    }
   });
 }
 
@@ -3447,11 +5320,10 @@ function escapeHtml(value) {
 
 updateDashboardMode();
 loadStatus();
+document.getElementById('manual-offsets-toggle').checked = manualOffsetsEnabled;
 document.getElementById('sync-rx-tx-toggle').checked = syncRxTx;
 loadSdrFrequency();
 loadRotator();
-loadSettings();
-loadMySatellites();
 initializePassControls();
 drawMap();
 worldMapImage.addEventListener('load', () => {
@@ -3470,35 +5342,60 @@ document.addEventListener('visibilitychange', () => {
 });
 document.querySelectorAll('[data-page]').forEach((button) => {
   button.addEventListener('click', () => {
-    window.location.hash = button.dataset.page;
+    if (button.dataset.page === 'modules') {
+      window.location.hash = `modules/${activeModuleName}`;
+    } else if (button.dataset.page === 'settings') {
+      window.location.hash = `settings/${activeSettingsSection}`;
+    } else {
+      window.location.hash = button.dataset.page;
+    }
+  });
+});
+document.querySelectorAll('[data-module]').forEach((button) => {
+  button.addEventListener('click', () => {
+    window.location.hash = `modules/${button.dataset.module}`;
+  });
+});
+document.querySelectorAll('[data-settings-section]').forEach((button) => {
+  button.addEventListener('click', () => {
+    window.location.hash = `settings/${button.dataset.settingsSection}`;
+    setActiveSettingsSection(button.dataset.settingsSection);
   });
 });
 document
   .getElementById('rx-frequency-form')
   .addEventListener('submit', (event) => event.preventDefault());
+bindDeviceControlToggles(document);
 document
-  .getElementById('rx-control-toggle')
-  .addEventListener('change', updateDeviceControl);
-document
-  .getElementById('tx-control-toggle')
-  .addEventListener('change', updateDeviceControl);
-document
-  .getElementById('rotator-control-toggle')
-  .addEventListener('change', updateDeviceControl);
+  .getElementById('manual-offsets-toggle')
+  .addEventListener('change', updateManualOffsetsMode);
 document
   .getElementById('sync-rx-tx-toggle')
   .addEventListener('change', updateSyncMode);
 document
-  .querySelectorAll('[data-rx-step-khz]')
+  .querySelectorAll('[data-rx-step-hz]')
   .forEach((button) => button.addEventListener('click', stepSdrFrequency));
 document
-  .querySelectorAll('[data-tx-step-khz]')
+  .querySelectorAll('[data-tx-step-hz]')
   .forEach((button) => button.addEventListener('click', stepTxFrequency));
+document
+  .querySelectorAll('[data-virtual-rit-step-hz]')
+  .forEach((button) => button.addEventListener('click', stepVirtualRit));
 document
   .getElementById('reset-rx-offset')
   .addEventListener('click', () =>
     postTrackingAction('/api/tracking/rx/reset-offset', 'Resetting RX offset...')
   );
+document
+  .getElementById('reset-virtual-rit')
+  .addEventListener('click', () => {
+    if (nativeIcomRxActive) return;
+    return postTrackingAction(
+      '/api/tracking/rx/virtual-rit/reset',
+      'Resetting Virtual RIT...',
+      { includeTrackingSelection: true }
+    );
+  });
 document
   .getElementById('settings-form')
   .addEventListener('submit', saveSettings);
@@ -3536,6 +5433,9 @@ document
   .getElementById('monitor-rotator-cat-debug')
   .addEventListener('change', updateMonitorDebug);
 document
+  .getElementById('monitor-icom-debug')
+  .addEventListener('change', updateMonitorDebug);
+document
   .getElementById('rotator-send-button')
   .addEventListener('click', sendManualRotatorPosition);
 document
@@ -3543,9 +5443,9 @@ document
   .addEventListener('click', sendRotatorHome);
 setInterval(loadSdrFrequency, 1000);
 setInterval(loadTracking, 1000);
+setInterval(loadStatus, 2000);
 setInterval(loadRotator, 2000);
 setInterval(loadPasses, 60000);
-setInterval(checkAutotrackNextPass, 1000);
 setInterval(() => {
   if (isDocumentVisible() && pageFromHash() === 'home') {
     drawMap();
@@ -3564,10 +5464,11 @@ setInterval(() => {
 
 async function initializePassControls() {
   await loadTracking();
+  await loadMySatellites();
   await loadSatellites();
   await loadPasses();
   await loadTrackedSatelliteLocations();
-  rotatorControlEnabled = document.getElementById('rotator-control-toggle').checked;
+  rotatorControlEnabled = deviceControlChecked('rotator');
 }
 
 

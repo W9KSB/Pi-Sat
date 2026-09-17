@@ -35,13 +35,40 @@ echo "Updating Pi-Sat Controller in: ${REPO_ROOT}"
 
 cd "${REPO_ROOT}"
 
-sudo systemctl stop "${SERVICE_NAME}"
+service_stopped=0
+restore_service_on_failure() {
+  status=$?
+  if [ "${status}" -ne 0 ] && [ "${service_stopped}" -eq 1 ]; then
+    echo "Update failed after stopping ${SERVICE_NAME}; attempting to restart it."
+    sudo systemctl start "${SERVICE_NAME}" || true
+  fi
+  trap - EXIT
+  exit "${status}"
+}
+trap restore_service_on_failure EXIT
+
 git fetch --all --prune
+sudo systemctl stop "${SERVICE_NAME}"
+service_stopped=1
 git reset --hard origin/main
+sudo usermod -aG dialout "$(id -un)"
 . .venv/bin/activate
 python -m pip install -r requirements.txt
+if [ ! -f sstv_decoder/Cargo.toml ]; then
+  echo "SSTV decoder manifest is missing."
+  exit 1
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "Cargo is required to update the SSTV decoder; rerun install/install_pi.sh."
+  exit 1
+fi
+cargo build --locked --release --manifest-path sstv_decoder/Cargo.toml
+mkdir -p bin
+install -m 0755 sstv_decoder/target/release/pi-sat-sstv-decoder bin/pi-sat-sstv-decoder
 sudo systemctl daemon-reload
 sudo systemctl start "${SERVICE_NAME}"
+service_stopped=0
+trap - EXIT
 
 echo ""
 echo "Update complete."

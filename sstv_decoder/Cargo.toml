@@ -1,0 +1,21 @@
+[package]
+name = "pi-sat-sstv-decoder"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Persistent slowrx.rs worker for Pi-Sat Controller"
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+slowrx = "=0.5.3"
+
+[dev-dependencies]
+slowrx = { version = "=0.5.3", features = ["test-support"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+

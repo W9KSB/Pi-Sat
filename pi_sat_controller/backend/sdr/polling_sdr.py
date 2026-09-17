@@ -8,6 +8,7 @@ from typing import Any
 
 from pi_sat_controller.backend.radio.rigctld_client import PersistentRigctldClient
 from pi_sat_controller.backend.radio.radio_manager import RadioManager
+from pi_sat_controller.backend.radio.radio_state import RadioFrequencyObservation
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_FAILURE_THRESHOLD = 3
@@ -109,6 +110,16 @@ class PollingSdrManager:
         except Exception:
             return self.snapshot()
 
+    def read_frequency_once(self) -> SdrDeviceSnapshot:
+        with self._client_lock:
+            try:
+                frequency_hz = self.client.get_frequency()
+            except Exception as exc:
+                self._mark_immediate_read_failure(exc)
+                raise
+
+        return self._store_read_frequency(frequency_hz)
+
     def _run(self) -> None:
         while not self._stop.is_set():
             self.poll_once()
@@ -117,23 +128,15 @@ class PollingSdrManager:
                 delay = max(self.poll_interval_s, min(15.0, self.poll_interval_s * 5))
             self._stop.wait(delay)
 
-    def poll_once(self) -> None:
+    def poll_once(self) -> SdrDeviceSnapshot:
         with self._client_lock:
             try:
                 frequency_hz = self.client.get_frequency()
             except Exception as exc:
                 self._record_error(exc)
-                return
+                return self.snapshot()
 
-        with self._state_lock:
-            was_connected = self._connected
-            self._connected = True
-            self._frequency_hz = frequency_hz
-            self._last_read_at_utc = _utc_now()
-            self._error = None
-            self._consecutive_failures = 0
-        if not was_connected:
-            LOGGER.info("RX polling connection restored")
+        return self._store_read_frequency(frequency_hz)
 
     def _record_error(self, exc: Exception) -> None:
         with self._state_lock:
@@ -146,6 +149,27 @@ class PollingSdrManager:
         if previous_error != str(exc):
             LOGGER.warning("RX polling failed: %s", exc)
 
+    def _mark_immediate_read_failure(self, exc: Exception) -> None:
+        with self._state_lock:
+            previous_error = self._error
+            self._connected = False
+            self._error = str(exc)
+            self._consecutive_failures = max(self._consecutive_failures + 1, self._failure_threshold)
+        if previous_error != str(exc):
+            LOGGER.warning("RX read failed: %s", exc)
+
+    def _store_read_frequency(self, frequency_hz: int) -> SdrDeviceSnapshot:
+        with self._state_lock:
+            was_connected = self._connected
+            self._connected = True
+            self._frequency_hz = frequency_hz
+            self._last_read_at_utc = _utc_now()
+            self._error = None
+            self._consecutive_failures = 0
+        if not was_connected:
+            LOGGER.info("RX polling connection restored")
+        return self.snapshot()
+
 
 class PollingRadioFrequencyManager:
     def __init__(
@@ -156,6 +180,8 @@ class PollingRadioFrequencyManager:
         self.radio_manager = radio_manager
         self.poll_interval_s = poll_interval_s
         self._stop = Event()
+        self._background_polling_enabled = Event()
+        self._background_polling_enabled.set()
         self._thread: Thread | None = None
 
     def start(self) -> None:
@@ -172,6 +198,12 @@ class PollingRadioFrequencyManager:
         if hasattr(self.radio_manager.client, "close"):
             self.radio_manager.client.close()
 
+    def set_background_polling_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._background_polling_enabled.set()
+        else:
+            self._background_polling_enabled.clear()
+
     def snapshot(self) -> SdrDeviceSnapshot:
         state = self.radio_manager.snapshot()
         return SdrDeviceSnapshot(
@@ -182,6 +214,12 @@ class PollingRadioFrequencyManager:
             last_write_at_utc=state.last_write_at_utc,
             error=state.error,
         )
+
+    def read_frequency_for_reconciliation(self) -> RadioFrequencyObservation:
+        return self.radio_manager.get_frequency_for_reconciliation()
+
+    def async_status(self) -> dict[str, object]:
+        return self.radio_manager.async_status()
 
     def set_frequency(self, frequency_hz: int) -> SdrDeviceSnapshot:
         state = self.radio_manager.set_frequency(
@@ -211,8 +249,31 @@ class PollingRadioFrequencyManager:
             error=state.error,
         )
 
-    def set_mode(self, mode: str, source: str = "") -> SdrDeviceSnapshot:
-        state = self.radio_manager.set_mode(mode, source=source)
+    def read_frequency_once(self) -> SdrDeviceSnapshot:
+        frequency_hz = self.radio_manager.get_frequency()
+        state = self.radio_manager.snapshot()
+        return SdrDeviceSnapshot(
+            enabled=state.enabled,
+            connected=state.connected,
+            frequency_hz=frequency_hz,
+            last_read_at_utc=state.last_read_at_utc,
+            last_write_at_utc=state.last_write_at_utc,
+            error=state.error,
+        )
+
+    def set_mode(
+        self,
+        mode: str,
+        source: str = "",
+        force: bool = False,
+        passband_hz: int = 0,
+    ) -> SdrDeviceSnapshot:
+        state = self.radio_manager.set_mode(
+            mode,
+            passband_hz=passband_hz,
+            source=source,
+            force=force,
+        )
         return SdrDeviceSnapshot(
             enabled=state.enabled,
             connected=state.connected,
@@ -222,8 +283,19 @@ class PollingRadioFrequencyManager:
             error=state.error,
         )
 
-    def try_set_mode(self, mode: str, source: str = "") -> SdrDeviceSnapshot:
-        state = self.radio_manager.try_set_mode(mode, source=source)
+    def try_set_mode(
+        self,
+        mode: str,
+        source: str = "",
+        force: bool = False,
+        passband_hz: int = 0,
+    ) -> SdrDeviceSnapshot:
+        state = self.radio_manager.try_set_mode(
+            mode,
+            passband_hz=passband_hz,
+            source=source,
+            force=force,
+        )
         return SdrDeviceSnapshot(
             enabled=state.enabled,
             connected=state.connected,
@@ -257,6 +329,9 @@ class PollingRadioFrequencyManager:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            if not self._background_polling_enabled.is_set():
+                self._stop.wait(0.1)
+                continue
             self.poll_once()
             delay = self.poll_interval_s
             snapshot = self.snapshot()

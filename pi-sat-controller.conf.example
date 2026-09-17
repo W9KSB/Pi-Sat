@@ -1,6 +1,17 @@
 [server]
 host = 0.0.0.0
+# Used only when https_enabled = false (for example, behind a TLS reverse proxy).
 port = 80
+# Restart Pi-Sat after changing these config-file-only HTTPS settings.
+https_enabled = true
+https_port = 443
+# Missing pair is generated on startup using OpenSSL; existing pairs are reused.
+# Relative paths are resolved against the project directory.
+tls_certfile = data/tls/server.crt
+tls_keyfile = data/tls/server.key
+# Optional comma-separated DNS names / IP addresses for generated certificates.
+# Local hostname, resolved local addresses and loopback are included automatically.
+tls_names =
 # Enable browser caching for GUI static resources.
 gui_resources_caching = false
 
@@ -25,43 +36,30 @@ satellite_25544 = ISS
 satellite_27607 = SO-50
 satellite_44909 = RS-44
 
+# CAT device sections are created from Settings > My Devices. Local radio
+# sections default to: state_updates = automatic
+# Select state_updates = polling to disable pushed updates for that radio.
+
 [rx]
 enabled = false
-# Set below to local for USB/serial connected devices and network for rigctld/Hamlib devices.
-connectivity = network
-# If connectivity is set to network, these values below are used.
-host = 127.0.0.1
-port = 4532
-# If connectivity is set to local, these values below are used.
-serial_port = 
-baud = 
-model_id = 
-# Select which VFO Hamlib should control for RX: current, A, or B.
+# Assign a configured CAT device from the My CAT Devices inventory.
+device_id = 
+# Select a Hamlib-reported RX target, such as current, VFOA, VFOB, MAIN, or SUB.
 target_vfo = current
 # Enable verbose CAT/Hamlib command logging for this role.
 cat_debug_logging = false
-# Enable frequency writes for this role.
-write_enabled = false
-timeout_s = 2.0
 
 [tx]
 enabled = false
-# Set below to local for USB/serial connected devices and network for rigctld/Hamlib devices.
-connectivity = local
-# If connectivity is set to network, these values below are used.
-host = 127.0.0.1
-port = 4533
-# If connectivity is set to local, these values below are used.
-serial_port = 
-baud = 
-model_id = 
-# Select which VFO Hamlib should control for TX: current, A, or B.
+# Assign a configured CAT device from the My CAT Devices inventory.
+device_id = 
+# Select a Hamlib-reported TX target, such as current, VFOA, VFOB, MAIN, or SUB.
 target_vfo = current
+# For one local radio serving both RX and TX, enable Hamlib split operation.
+# This remains a config-file-only compatibility option.
+shared_local_split_mode = false
 # Enable verbose CAT/Hamlib command logging for this role.
 cat_debug_logging = false
-# Enable frequency writes for this role.
-write_enabled = false
-timeout_s = 2.0
 
 [rotator]
 enabled = false
@@ -76,8 +74,6 @@ baud =
 model_id = 
 # Enable verbose rotator/Hamlib command logging for this role.
 cat_debug_logging = 
-# Enable rotator position writes. Keep false until hardware is ready.
-write_enabled = false
 timeout_s = 2.0
 min_elevation_deg = 0.0
 home_azimuth_deg = 0.0
@@ -89,10 +85,58 @@ aos_script =
 los_script =
 
 [safety]
-tx_inhibit_below_horizon = true
-tx_inhibit_on_cat_loss = true
-tx_inhibit_without_valid_pass = true
 frequency_deadband_hz = 10
 cat_rate_limit_hz = 4
 tracking_update_interval_ms = 1000
 device_offline_failure_threshold = 3
+manual_offset_readback_active_pass_only = false
+
+[icom]
+# Native IC-9700 control/audio. Pi-Sat is the sole process connecting to the radio.
+enabled = false
+# Only the LAN network transport is supported.
+connectivity = network
+# LAN transport settings.
+host =
+username =
+password =
+control_port = 50001
+serial_port = 50002
+audio_port = 50003
+civ_address = 0xA2
+controller_address = 0xE0
+sample_rate = 16000
+rx_codec = lpcm16_stereo
+tx_codec = lpcm16_mono
+full_duplex = true
+scope_enabled = true
+debug_logging = false
+
+[aprs]
+# APRS transmit. Dire Wolf's gen_packets modulates each frame and Pi-Sat sends
+# it through the native radio. Transmit stays disabled while mycall is empty.
+mycall =
+# Which receiver the decoder listens to: main (left stereo side), right, or both.
+channel = main
+destination = APDW16
+path = WIDE1-1,WIDE2-1
+symbol = />
+comment = Pi-Sat
+# Radio key-up and release margins around each burst, in milliseconds.
+tx_delay_ms = 300
+tx_tail_ms = 200
+# Modulator amplitude in percent (Dire Wolf -a, range 0-200).
+amplitude = 100
+# Minimum seconds between transmissions.
+min_interval_s = 30
+# Level trim in dB applied only to the copy of the receive audio handed to the
+# APRS decoder. It never changes the radio, the browser audio, or the other
+# modules. Dire Wolf suggests keeping most stations near half scale.
+rx_gain_db = -6
+
+
+[sstv]
+# Level trim in dB applied only to the copy of the receive audio handed to the
+# SSTV decoder. It never changes the radio, the browser audio, or the other
+# modules.
+rx_gain_db = -6
