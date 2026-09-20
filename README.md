@@ -47,6 +47,7 @@ compatibility problems or hardware-specific behavior in
 - Rust 1.85 or newer and Cargo (the installer uses the OS packages and verifies the version)
 - Dire Wolf for the optional APRS receiver and `gen_packets` transmit modulator
   (installed by the installer, or built from source)
+- coturn for the local STUN service used to establish direct WebRTC audio paths
 - Hamlib utilities through `libhamlib-utils`
   - `rigctl`
   - `rigctld`
@@ -73,6 +74,7 @@ curl -fsSL https://raw.githubusercontent.com/W9KSB/Pi-Sat/main/install/install_p
 - grants the service user serial-device access for local USB/serial radios and rotators
 - builds the persistent `slowrx.rs` SSTV decoder worker
 - installs Dire Wolf for the optional APRS receiver
+- installs and enables the Pi-Sat STUN-only service on UDP port 3478
 - installs the `pi-sat` systemd service
 - starts the service
 
@@ -90,12 +92,26 @@ custom ports, and the explicit HTTP option for reverse proxies.
 sudo systemctl status pi-sat
 sudo systemctl restart pi-sat
 journalctl -u pi-sat -f
+sudo systemctl status pi-sat-stun
+journalctl -u pi-sat-stun -f
 ```
 
 ## Manual Installation and Updates
 
 See the [Pi-Sat Controller Wiki](https://github.com/W9KSB/Pi-Sat/wiki) for
 manual installation, update, and customization guidance.
+
+The installer creates an ignored local `update_pi.sh` from the tracked
+`updater.template`. Newer updater versions refresh that local copy after a
+repository update and re-enter the update automatically. On a Pi whose local
+updater predates this refresh behavior, run the old updater once, then run:
+
+```sh
+cd ~/pi-sat
+cp updater.template update_pi.sh
+chmod +x update_pi.sh
+./update_pi.sh
+```
 
 
 ## Credits

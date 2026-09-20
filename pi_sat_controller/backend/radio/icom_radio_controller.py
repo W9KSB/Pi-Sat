@@ -848,8 +848,8 @@ class IcomRadioController:
             return self._state.to_dict()
 
     def set_sub_rit(self, offset_hz: int | None = None, enabled: bool | None = None) -> dict[str, Any]:
-        if offset_hz is not None and (type(offset_hz) is not int or abs(offset_hz) > 9990 or offset_hz % 10):
-            raise ValueError("SUB RIT must be -9990 to 9990 Hz in 10 Hz steps")
+        if offset_hz is not None and (type(offset_hz) is not int or abs(offset_hz) > 9900 or offset_hz % 100):
+            raise ValueError("SUB RIT must be -9900 to 9900 Hz in 100 Hz steps")
         if enabled is not None and type(enabled) is not bool:
             raise ValueError("RIT enabled must be a boolean")
         with self._operator_operation():

@@ -8,6 +8,10 @@ from typing import Any
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from pi_sat_controller.backend.radio.audio_websocket import stream_audio, stream_microphone
+from pi_sat_controller.backend.radio.audio_webrtc import (
+    WebrtcAudioTransport,
+    WebrtcUnavailable,
+)
 from pi_sat_controller.backend.radio.state_websocket import stream_radio_state
 
 LOGGER = logging.getLogger(__name__)
@@ -21,6 +25,7 @@ def register_radio_api(
     # Count microphone uplinks so closing an RX listener cannot unkey a
     # transmission another session is feeding.
     microphone_sessions = 0
+    webrtc_audio = WebrtcAudioTransport(get_controller=get_controller)
 
     @app.get("/api/radio")
     def get_radio() -> dict[str, object]:
@@ -211,6 +216,18 @@ def register_radio_api(
             # Log RX socket failures so operators can diagnose lost listening audio.
             LOGGER.warning("RX audio session ended: %s", exc)
             await websocket.close(code=1011)
+
+    @app.post("/api/radio/audio/webrtc/offer")
+    async def radio_audio_webrtc_offer(payload: dict[str, Any] = Body(...)) -> dict[str, str]:
+        try:
+            return await webrtc_audio.handle_offer(payload)
+        except WebrtcUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            LOGGER.warning("WebRTC audio negotiation failed: %s", exc)
+            raise HTTPException(status_code=502, detail="WebRTC audio negotiation failed.") from exc
 
     @app.websocket("/api/radio/mic")
     async def radio_mic(websocket: WebSocket) -> None:

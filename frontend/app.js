@@ -66,6 +66,11 @@ let currentDashboardMode = '';
 let radioAudioSocket = null;
 let radioAudioContext = null;
 let radioAudioNextTime = 0;
+let radioAudioTransport = '';
+let radioAudioPeer = null;
+let radioAudioPeerStream = null;
+let radioWebrtcGraph = null;
+let radioWebrtcTimer = 0;
 let radioMicStream = null;
 let radioMicProcessor = null;
 let radioMicSource = null;
@@ -472,6 +477,7 @@ async function prepareRadioAudio() {
 
 function stopRadioAudio() {
   radioAudioGeneration += 1;
+  if (typeof stopRadioWebrtc === 'function') stopRadioWebrtc();
   if (radioAudioSocket) {
     radioAudioSocket.onclose = radioAudioSocket.onmessage = radioAudioSocket.onerror = null;
     radioAudioSocket.close();
@@ -492,6 +498,38 @@ function stopRadioAudio() {
   radioAudioContext = null;
   radioAudioNextTime = 0;
   document.getElementById('radio-audio-status').textContent = 'Audio off';
+  radioAudioTransport = '';
+}
+
+function updateRadioWebrtcStatus() {
+  if (!radioWebrtcGraph || !radioAudioContext) return;
+  const listen = window.RadioConsole?.listen || 'BOTH';
+  const volume = Number.isFinite(window.RadioConsole?.volume) ? Math.max(0, Math.min(1, window.RadioConsole.volume)) : 1;
+  radioWebrtcGraph.left.gain.value = listen === 'SUB' ? 0 : 1;
+  radioWebrtcGraph.right.gain.value = listen === 'MAIN' ? 0 : 1;
+  radioWebrtcGraph.master.gain.value = volume;
+  document.getElementById('radio-audio-status').textContent = `RX ${listen} · WebRTC · ${Math.round(volume * 100)}% volume`;
+}
+
+function handleRadioWebrtcTrack(event) {
+  const stream = event.streams?.[0];
+  if (!stream || !radioAudioContext) return;
+  radioAudioPeerStream = stream;
+  const source = radioAudioContext.createMediaStreamSource(stream);
+  const splitter = radioAudioContext.createChannelSplitter(2);
+  const merger = radioAudioContext.createChannelMerger(2);
+  const left = radioAudioContext.createGain();
+  const right = radioAudioContext.createGain();
+  const master = radioAudioContext.createGain();
+  source.connect(splitter);
+  splitter.connect(left, 0);
+  splitter.connect(right, 1);
+  left.connect(merger, 0, 0);
+  right.connect(merger, 0, 1);
+  merger.connect(master);
+  master.connect(radioAudioContext.destination);
+  radioWebrtcGraph = { source, splitter, merger, left, right, master };
+  updateRadioWebrtcStatus();
 }
 
 function handleRadioAudioPacket(data) {
@@ -544,6 +582,101 @@ function handleRadioAudioPacket(data) {
   document.getElementById('radio-audio-status').textContent = `RX audio · ${listen || (radioRxChannels > 1 ? 'BOTH' : 'MAIN')} · PCM ${peak ? `${Math.round(20 * Math.log10(peak))} dBFS` : 'silent'}`;
 }
 
+function stopRadioWebrtc() {
+  if (radioWebrtcTimer) {
+    window.clearInterval(radioWebrtcTimer);
+    radioWebrtcTimer = 0;
+  }
+  if (radioWebrtcGraph) {
+    for (const node of Object.values(radioWebrtcGraph)) node?.disconnect?.();
+    radioWebrtcGraph = null;
+  }
+  if (radioAudioPeerStream) {
+    for (const track of radioAudioPeerStream.getTracks?.() || []) track.stop?.();
+    radioAudioPeerStream = null;
+  }
+  if (radioAudioPeer) {
+    radioAudioPeer.ontrack = null;
+    radioAudioPeer.onconnectionstatechange = null;
+    radioAudioPeer.close?.();
+    radioAudioPeer = null;
+  }
+  if (radioAudioTransport === 'webrtc') radioAudioTransport = '';
+}
+
+async function startRadioWebrtc() {
+  if (typeof window.RTCPeerConnection !== 'function') return false;
+  const host = window.location.hostname || '';
+  const stunHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  const peer = new window.RTCPeerConnection({
+    iceServers: stunHost ? [{ urls: `stun:${stunHost}:3478` }] : [],
+  });
+  radioAudioPeer = peer;
+  peer.addTransceiver('audio', { direction: 'recvonly' });
+  peer.ontrack = handleRadioWebrtcTrack;
+  peer.onconnectionstatechange = () => {
+    if (radioAudioPeer !== peer || !['failed', 'disconnected', 'closed'].includes(peer.connectionState)) return;
+    void fallbackToPcm();
+  };
+  const offer = await peer.createOffer();
+  await peer.setLocalDescription(offer);
+  if (peer.iceGatheringState && peer.iceGatheringState !== 'complete') {
+    await new Promise(resolve => {
+      const timeout = window.setTimeout(resolve, 5000);
+      peer.onicegatheringstatechange = () => {
+        if (peer.iceGatheringState === 'complete') {
+          window.clearTimeout(timeout);
+          resolve();
+        }
+      };
+    });
+  }
+  const response = await fetch('/api/radio/audio/webrtc/offer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: peer.localDescription.type, sdp: peer.localDescription.sdp }),
+  });
+  if (!response.ok) throw new Error('WebRTC offer was refused.');
+  const answer = await response.json();
+  await peer.setRemoteDescription(answer);
+  radioAudioTransport = 'webrtc';
+  radioWebrtcTimer = window.setInterval(updateRadioWebrtcStatus, 500);
+  document.getElementById('radio-audio-status').textContent = 'RX audio · WebRTC connected; waiting for audio.';
+  return true;
+}
+
+async function fallbackToPcm() {
+  if (radioAudioTransport === 'pcm' || radioAudioSocket) return true;
+  stopRadioWebrtc();
+  return startRadioPcm();
+}
+
+async function startRadioPcm() {
+  if (radioAudioSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(radioAudioSocket.readyState)) return true;
+  if (radioAudioTransport === 'starting') return true;
+  radioAudioTransport = 'starting';
+  const generation = radioAudioGeneration;
+  await initializeRadioAudioWorklet();
+  if (generation !== radioAudioGeneration || !radioAudioContext) {
+    radioAudioTransport = '';
+    return false;
+  }
+  radioAudioNextTime = radioAudioContext.currentTime;
+  const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  radioAudioSocket = new WebSocket(`${scheme}://${window.location.host}/api/radio/audio`);
+  radioAudioTransport = 'pcm';
+  radioAudioSocket.binaryType = 'arraybuffer';
+  radioAudioSocket.onopen = () => { document.getElementById('radio-audio-status').textContent = 'Audio socket connected; waiting for RX packets.'; };
+  radioAudioSocket.onmessage = (event) => handleRadioAudioPacket(event.data);
+  radioAudioSocket.onerror = () => { document.getElementById('radio-audio-status').textContent = 'Audio stream error.'; };
+  radioAudioSocket.onclose = () => {
+    radioAudioWorklet?.port.postMessage({ type: 'reset' });
+    document.getElementById('radio-audio-status').textContent = 'Audio stream disconnected.';
+    radioAudioSocket = null;
+  };
+  return true;
+}
+
 async function startRadioAudio() {
   const generation = radioAudioGeneration;
   try {
@@ -557,23 +690,15 @@ async function startRadioAudio() {
     if (radioAudioSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(radioAudioSocket.readyState)) return true;
     await loadRadioState();
     if (generation !== radioAudioGeneration || !radioAudioContext) return false;
-    await initializeRadioAudioWorklet();
+    if (radioAudioPeer || radioAudioSocket || radioAudioTransport === 'starting') return true;
+    try {
+      if (await startRadioWebrtc()) return true;
+    } catch (error) {
+      stopRadioWebrtc();
+      document.getElementById('radio-audio-status').textContent = `WebRTC unavailable; using PCM fallback (${error.message || error}).`;
+    }
     if (generation !== radioAudioGeneration || !radioAudioContext) return false;
-    // Another click may have opened the socket while the settings were loading.
-    if (radioAudioSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(radioAudioSocket.readyState)) return true;
-    radioAudioNextTime = radioAudioContext.currentTime;
-    const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    radioAudioSocket = new WebSocket(`${scheme}://${window.location.host}/api/radio/audio`);
-    radioAudioSocket.binaryType = 'arraybuffer';
-    radioAudioSocket.onopen = () => { document.getElementById('radio-audio-status').textContent = 'Audio socket connected; waiting for RX packets.'; };
-    radioAudioSocket.onmessage = (event) => handleRadioAudioPacket(event.data);
-    radioAudioSocket.onerror = () => { document.getElementById('radio-audio-status').textContent = 'Audio stream error.'; };
-    radioAudioSocket.onclose = () => {
-      radioAudioWorklet?.port.postMessage({ type: 'reset' });
-      document.getElementById('radio-audio-status').textContent = 'Audio stream disconnected.';
-      radioAudioSocket = null;
-    };
-    return true;
+    return startRadioPcm();
   } catch (error) {
     if (generation !== radioAudioGeneration) return false;
     document.getElementById('radio-audio-status').textContent = `Audio startup failed: ${error.message || error}`;
@@ -864,7 +989,8 @@ async function refreshRadioMicrophones() {
 async function selectRadioMicrophone(deviceId) {
   radioMicDeviceId = deviceId || '';
   if (radioMicStarting) return;
-  const listening = Boolean(radioAudioSocket) && radioAudioSocket.readyState === WebSocket.OPEN;
+  const listening = (Boolean(radioAudioSocket) && radioAudioSocket.readyState === WebSocket.OPEN)
+    || Boolean(radioAudioPeer);
   if (!listening || !window.isSecureContext || !navigator.mediaDevices?.getUserMedia) return;
   stopRadioMicrophone();
   await startRadioMicrophone();

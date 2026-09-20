@@ -38,7 +38,7 @@
       <div class="rc-secondary-controls">${[['af_gain', 'RADIO AF'], ['rf_gain', 'RF GAIN'], ['squelch', 'SQUELCH']].map(([control, label]) => `<label class="rc-level-control">${label}
         <input type="range" min="0" max="255" step="1" value="0" id="rc-${side}-${control}" data-level="${control}" data-side="${side}" data-radio aria-label="${side} ${label}">
         <output id="rc-${side}-${control}-value">—</output></label>`).join('')}
-      ${side === 'SUB' ? `<form id="rc-rit-form" class="rc-rit-controls"><label>SUB RIT (Hz)<input id="rc-rit-offset" type="number" min="-9990" max="9990" step="10" value="0" required data-radio title="Adjust with arrows or mouse wheel in 10 Hz steps"></label>
+      ${side === 'SUB' ? `<form id="rc-rit-form" class="rc-rit-controls"><label>SUB RIT (Hz)<input id="rc-rit-offset" type="number" min="-9900" max="9900" step="100" value="0" required data-radio title="Adjust with arrows or mouse wheel in 100 Hz steps"></label>
         <output id="rc-rit-toggle" aria-live="polite">RIT —</output>${button('Reset', 'rit-reset', 'data-radio')}
         <output id="rc-rit-readback" class="visually-hidden">No RIT readback</output></form>` : ''}</div>
       <small id="rc-${side}-sql-state" class="rc-control-note">Squelch state unknown</small>
@@ -57,12 +57,12 @@
         <span id="rc-scope-source" class="rc-scope-source">Spectrum follows listening · SUB</span>
         <span id="rc-scope-range">Center — · Span —</span>
         <label class="rc-span-label">WIDTH <select id="rc-span" data-radio title="Full visible spectrum width; selects centered scope mode"><option value="">Radio span</option>${[5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000].map(width => `<option value="${width}">${width / 1000} kHz</option>`).join('')}</select></label>
-        <label class="rc-span-label">STEP <select id="rc-step" title="Spectrum mouse-wheel and drag tuning step"><option value="10">10 Hz</option><option value="100" selected>100 Hz</option><option value="1000">1 kHz</option><option value="10000">10 kHz</option></select></label>
+        <label class="rc-span-label">STEP <select id="rc-step" title="Spectrum double-click, mouse-wheel and drag tuning step"><option value="10">10 Hz</option><option value="100" selected>100 Hz</option><option value="1000">1 kHz</option><option value="10000">10 kHz</option></select></label>
         <label class="rc-lock"><input id="rc-lock" type="checkbox"> Lock</label>
         <span id="rc-passband-label">Passband —</span>
         <div class="rc-scope-tools">${button('Max hold', 'hold', 'aria-pressed="false"')}${button('Fill', 'fill', 'aria-pressed="true"')}${button('Grid', 'grid', 'aria-pressed="true"')}${button('Smooth', 'smooth', 'aria-pressed="true" title="Glide the waterfall between sweeps and soften the trace; display only, no radio writes"')}</div></div>
       <div class="rc-scope-display">
-        <div class="rc-scope-plot"><canvas id="rc-spectrum" width="1400" height="220" aria-label="Live spectrum, relative amplitude"></canvas>
+        <div class="rc-scope-plot"><canvas id="rc-spectrum" width="1400" height="220" aria-label="Live spectrum, relative amplitude" title="Double-click a signal to tune to it; drag inside the passband or scroll to nudge"></canvas>
           <span class="rc-scope-unit">DISPLAY dB</span><div id="rc-scope-message" class="rc-scope-message">Connect to receive spectrum</div></div>
         <div id="rc-scope-axis" class="rc-scope-axis"><span>—</span><span>—</span><span>—</span><span>—</span><span>— MHz</span></div>
         <canvas id="rc-waterfall" width="475" height="110" aria-label="Live scrolling waterfall"></canvas>
@@ -359,11 +359,13 @@
       if (!draftInputs.has('rc-rit-offset') && Number.isFinite(rit?.offset_hz)) $('rc-rit-offset').value = rit.offset_hz;
       // Only a genuinely ended session tears capture down. Keep audio resources
       // alive across transient connection-health changes.
-      if (!connected && !state.connecting && (radioAudioSocket || radioMicStream || radioAudioContext)) stopRadioAudio();
+      if (!connected && !state.connecting && (radioAudioSocket || (typeof radioAudioPeer !== 'undefined' && radioAudioPeer) || radioMicStream || radioAudioContext)) stopRadioAudio();
       if (connected && !audioAvailable) {
         $('radio-audio-status').textContent = state.audio?.last_error || 'Radio audio unavailable; retrying automatically.';
       }
-      if (connected && audioAvailable && wantAudio && !audioStarting && (!radioAudioSocket || radioAudioContext?.state !== 'running') && Date.now() >= audioRetryAfter) {
+      if (connected && audioAvailable && wantAudio && !audioStarting
+          && (!(radioAudioSocket || (typeof radioAudioPeer !== 'undefined' && radioAudioPeer)) || radioAudioContext?.state !== 'running')
+          && Date.now() >= audioRetryAfter) {
         audioStarting = true;
         audioRetryAfter = Date.now() + 3000;
         void startRadioAudio().finally(() => { audioStarting = false; });
@@ -390,7 +392,7 @@
         $('radio-audio-status').textContent = `Browser audio could not resume: ${error.message || error}`;
       });
     }
-    if (!audioStarting && (!radioAudioSocket || radioAudioContext?.state !== 'running')) {
+    if (!audioStarting && (!(radioAudioSocket || (typeof radioAudioPeer !== 'undefined' && radioAudioPeer)) || radioAudioContext?.state !== 'running')) {
       audioRetryAfter = 0;
       consoleApi.render({});
     }
@@ -596,7 +598,7 @@
   for (const edge of ['min', 'max']) {
     $(`rc-level-${edge}`).addEventListener('input', event => updateLevelRange(edge, event.target.value));
   }
-  const queueRit = bindAdjustment($('rc-rit-offset'), 'sub-rit', offset_hz => ({ offset_hz, enabled: offset_hz !== 0 }), -9990, 9990, 10);
+  const queueRit = bindAdjustment($('rc-rit-offset'), 'sub-rit', offset_hz => ({ offset_hz, enabled: offset_hz !== 0 }), -9900, 9900, 100);
   $('rc-rit-form').addEventListener('submit', event => {
     event.preventDefault();
     queueRit();
@@ -676,6 +678,24 @@
     const pending = wheelTune; wheelTune = null;
     if (pending.delta && pending.side === listeningScopeSide()) await command('tune', { physical_side: pending.side, delta_hz: pending.delta });
   }
+
+  // Double-click jumps the listening path straight to the clicked frequency, so
+  // an operator can land on a peak instead of nudging the dial across the span.
+  spectrumCanvas.addEventListener('dblclick', async event => {
+    if (event.button !== 0 || !spectrumReady() || busy || scopeSyncRunning) return;
+    event.preventDefault();
+    const side = listeningScopeSide(), data = state[side.toLowerCase()];
+    const dial = data?.frequency_hz, step = Number($('rc-step').value);
+    if (!Number.isFinite(dial) || !Number.isFinite(step) || step <= 0) return;
+    // SUB RIT moves the received frequency off the dial, so convert the click
+    // to a dial delta through the same offset the passband shading uses.
+    const rit = side === 'SUB' ? state.sub_rit : null;
+    const ritOffset = rit?.enabled === true && Number.isFinite(rit.offset_hz) ? rit.offset_hz : 0;
+    const delta = Math.round(pointerHz(event) / step) * step - (dial + ritOffset);
+    if (!delta) return;
+    wheelTune = null;
+    await command('tune', { physical_side: side, delta_hz: delta, expected_frequency_hz: dial });
+  });
 
   function readoutReady(side) {
     return ['MAIN', 'SUB'].includes(side) && state.connected && streamHealthy && !$('rc-lock').checked

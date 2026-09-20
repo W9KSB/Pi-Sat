@@ -32,10 +32,12 @@ SUB and Both require stereo receive audio. Dualwatch controls whether the SUB
 receiver is active. The local monitor-volume slider changes browser playback
 only.
 
-Frequency entry, tuning buttons, keyboard input, passband dragging, and the
-mouse wheel use the selected tuning step. Tuning lock, disconnect, stale scope
-data, pointer cancellation, or a listening-side change cancels a pending drag
-or wheel update.
+Frequency entry, tuning buttons, keyboard input, passband dragging, the mouse
+wheel, and double-clicking the spectrum use the selected tuning step. A
+double-click tunes the listening path straight to the clicked position, so a
+signal can be selected from the display instead of nudged into place. Tuning
+lock, disconnect, stale scope data, pointer cancellation, or a listening-side
+change cancels a pending drag or wheel update.
 
 ## Spectrum and waterfall
 

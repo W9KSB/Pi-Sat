@@ -4,6 +4,9 @@ set -eu
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
 SERVICE_NAME="pi-sat"
+STUN_SERVICE_NAME="pi-sat-stun"
+LOCAL_UPDATER="${REPO_ROOT}/update_pi.sh"
+UPDATER_TEMPLATE="${REPO_ROOT}/updater.template"
 
 if [ "$(id -u)" -eq 0 ]; then
   echo "Run this updater as the normal Pi user, not with sudo."
@@ -35,6 +38,18 @@ echo "Updating Pi-Sat Controller in: ${REPO_ROOT}"
 
 cd "${REPO_ROOT}"
 
+if ! command -v turnserver >/dev/null 2>&1; then
+  echo "Installing coturn for the local STUN service."
+  sudo apt update
+  sudo apt install -y coturn
+fi
+
+TURN_BIN="$(command -v turnserver || true)"
+if [ -z "${TURN_BIN}" ]; then
+  echo "coturn installed but turnserver was not found on PATH."
+  exit 1
+fi
+
 service_stopped=0
 restore_service_on_failure() {
   status=$?
@@ -48,9 +63,22 @@ restore_service_on_failure() {
 trap restore_service_on_failure EXIT
 
 git fetch --all --prune
+git reset --hard origin/main
+
+# update_pi.sh is an ignored, locally generated copy of updater.template. If
+# the repository changed the updater itself, refresh that copy and re-enter the
+# update once so the new migration logic handles the rest of this run.
+if [ "${PI_SAT_UPDATER_REEXEC:-0}" -eq 0 ] \
+    && [ -f "${UPDATER_TEMPLATE}" ] \
+    && ! cmp -s "${UPDATER_TEMPLATE}" "${LOCAL_UPDATER}"; then
+  cp "${UPDATER_TEMPLATE}" "${LOCAL_UPDATER}"
+  chmod +x "${LOCAL_UPDATER}"
+  export PI_SAT_UPDATER_REEXEC=1
+  exec "${LOCAL_UPDATER}"
+fi
+
 sudo systemctl stop "${SERVICE_NAME}"
 service_stopped=1
-git reset --hard origin/main
 sudo usermod -aG dialout "$(id -un)"
 . .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -65,7 +93,32 @@ fi
 cargo build --locked --release --manifest-path sstv_decoder/Cargo.toml
 mkdir -p bin
 install -m 0755 sstv_decoder/target/release/pi-sat-sstv-decoder bin/pi-sat-sstv-decoder
+
+STUN_SERVICE_FILE="/etc/systemd/system/${STUN_SERVICE_NAME}.service"
+TMP_STUN_SERVICE="$(mktemp)"
+cat > "${TMP_STUN_SERVICE}" <<EOF
+[Unit]
+Description=Pi-Sat local STUN service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${TURN_BIN} -c ${REPO_ROOT}/install/pi-sat-stun.conf
+Restart=on-failure
+RestartSec=5
+User=turnserver
+Group=turnserver
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo install -m 0644 "${TMP_STUN_SERVICE}" "${STUN_SERVICE_FILE}"
+rm -f "${TMP_STUN_SERVICE}"
 sudo systemctl daemon-reload
+sudo systemctl enable "${STUN_SERVICE_NAME}"
+sudo systemctl restart "${STUN_SERVICE_NAME}"
 sudo systemctl start "${SERVICE_NAME}"
 service_stopped=0
 trap - EXIT
@@ -74,3 +127,5 @@ echo ""
 echo "Update complete."
 echo "Service: sudo systemctl status ${SERVICE_NAME}"
 echo "Logs:    journalctl -u ${SERVICE_NAME} -f"
+echo "STUN:    sudo systemctl status ${STUN_SERVICE_NAME}"
+echo "STUN logs: journalctl -u ${STUN_SERVICE_NAME} -f"
