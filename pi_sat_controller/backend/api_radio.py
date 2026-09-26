@@ -122,6 +122,32 @@ def register_radio_api(
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    @app.post("/api/radio/scope-sweep")
+    def set_scope_sweep(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        controller = get_controller()
+        if controller is None:
+            raise HTTPException(status_code=409, detail="Advanced Icom control is disabled.")
+        try:
+            return {"ok": True, **controller.set_scope_sweep_speed(
+                payload["speed"], payload.get("physical_side"))}
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/api/radio/scope-reference")
+    def set_scope_reference(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        controller = get_controller()
+        if controller is None:
+            raise HTTPException(status_code=409, detail="Advanced Icom control is disabled.")
+        try:
+            return {"ok": True, **controller.set_scope_reference_level(
+                payload["level_db"], payload.get("physical_side"))}
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @app.post("/api/radio/level")
     def set_level(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
         controller = get_controller()
@@ -155,6 +181,16 @@ def register_radio_api(
             return {"ok": True, **controller.equalize_vfos(payload["physical_side"])}
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/api/radio/swap-main-sub")
+    def swap_main_sub() -> dict[str, object]:
+        controller = get_controller()
+        if controller is None:
+            raise HTTPException(status_code=409, detail="Advanced Icom control is disabled.")
+        try:
+            return {"ok": True, **controller.swap_main_sub()}
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -194,6 +230,22 @@ def register_radio_api(
             raise HTTPException(status_code=409, detail="Advanced Icom control is disabled.")
         try:
             return {"ok": True, **controller.set_dualwatch(payload["enabled"])}
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/api/radio/preamp")
+    def set_preamp(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        controller = get_controller()
+        if controller is None:
+            raise HTTPException(status_code=409, detail="Advanced Icom control is disabled.")
+        try:
+            return {"ok": True, **controller.set_preamp(
+                payload["physical_side"],
+                payload.get("preamp_int"),
+                payload.get("preamp_ext"),
+            )}
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:

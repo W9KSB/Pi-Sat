@@ -33,7 +33,6 @@ compatibility problems or hardware-specific behavior in
 - Multi-source TLE loading and merge handling
 - Satellite profile management
 - Monitor page with backend event logging
-- Optional live SSTV decoding from the existing native IC-9700 SUB/RX audio stream
 - Optional APRS decoding from a selectable side of the native IC-9700 RX audio
   stream, plus manual APRS transmit of a beacon, status line, or message
 - Systemd-based Pi service install and update flow
@@ -44,10 +43,8 @@ compatibility problems or hardware-specific behavior in
 - Raspberry Pi 3B or newer
 - Python 3 with `venv`
 - `git`
-- Rust 1.85 or newer and Cargo (the installer uses the OS packages and verifies the version)
 - Dire Wolf for the optional APRS receiver and `gen_packets` transmit modulator
   (installed by the installer, or built from source)
-- coturn for the local STUN service used to establish direct WebRTC audio paths
 - Hamlib utilities through `libhamlib-utils`
   - `rigctl`
   - `rigctld`
@@ -72,9 +69,7 @@ curl -fsSL https://raw.githubusercontent.com/W9KSB/Pi-Sat/main/install/install_p
 - creates `.venv`
 - installs Python dependencies from `requirements.txt`
 - grants the service user serial-device access for local USB/serial radios and rotators
-- builds the persistent `slowrx.rs` SSTV decoder worker
 - installs Dire Wolf for the optional APRS receiver
-- installs and enables the Pi-Sat STUN-only service on UDP port 3478
 - installs the `pi-sat` systemd service
 - starts the service
 
@@ -92,8 +87,6 @@ custom ports, and the explicit HTTP option for reverse proxies.
 sudo systemctl status pi-sat
 sudo systemctl restart pi-sat
 journalctl -u pi-sat -f
-sudo systemctl status pi-sat-stun
-journalctl -u pi-sat-stun -f
 ```
 
 ## Manual Installation and Updates
@@ -120,10 +113,9 @@ chmod +x update_pi.sh
 
 - [Hamlib](https://hamlib.github.io/) for radio and rotator control interfaces
 - [Skyfield](https://rhodesmill.org/skyfield/) for orbital calculations and pass prediction
-- [slowrx.rs](https://github.com/jasonherald/slowrx.rs), based on slowrx by Oona Räisänen (OH2EIQ), for SSTV decoding
 - [Dire Wolf](https://github.com/wb2osz/direwolf) by John Langner (WB2OSZ) for APRS and AX.25 decoding
 
-Full third-party notices for the SSTV decoder and the APRS receiver are preserved in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+Full third-party notices for the APRS receiver are preserved in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 
 ### Data Sources

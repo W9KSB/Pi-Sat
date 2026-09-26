@@ -88,6 +88,17 @@ class IcomRadioState:
     data_off_mod: int | None = None
     data_mod: int | None = None
     dualwatch: bool | None = None
+    # P.AMP and EXT-P.AMP are per-band settings on the IC-9700, so each
+    # physical side keeps its own pair.
+    main_preamp_int: bool | None = None
+    main_preamp_ext: bool | None = None
+    sub_preamp_int: bool | None = None
+    sub_preamp_ext: bool | None = None
+    # Scope display settings the radio owns, read back per side.
+    main_scope_sweep_speed: str | None = None
+    sub_scope_sweep_speed: str | None = None
+    main_scope_reference_db: float | None = None
+    sub_scope_reference_db: float | None = None
     main_updated: float | None = None
     sub_updated: float | None = None
     main_a_hz: int | None = None
@@ -121,7 +132,9 @@ class IcomRadioState:
                       "frequency_hz": getattr(self, f"{side}_frequency_hz"), "vfo": getattr(self, f"{side}_vfo"),
                       "mode": getattr(self, f"{side}_mode"), "filter": getattr(self, f"{side}_filter"),
                       **{key: getattr(self, f"{side}_{key}") for key in
-                         ("bandwidth_hz", "af_gain", "rf_gain", "squelch", "s_meter", "squelch_open")},
+                         ("bandwidth_hz", "af_gain", "rf_gain", "squelch", "s_meter", "squelch_open",
+                          "preamp_int", "preamp_ext",
+                          "scope_sweep_speed", "scope_reference_db")},
                       "updated_monotonic": getattr(self, f"{side}_updated")}
                for side in ("main", "sub")},
             "sub_rit": {"offset_hz": self.sub_rit_hz, "enabled": self.sub_rit_enabled},
@@ -154,6 +167,9 @@ class IcomRadioController:
     _PTT_RELEASE_SETTLE_S = 0.2
     # Attempts used by the best-effort unkey that runs before a teardown.
     _PTT_PANIC_ATTEMPTS = 2
+    # The native adapter maps the TX tracking role to MAIN. An operator write to
+    # that side while keyed would move the carrier mid-burst.
+    _TRANSMIT_SIDE = "MAIN"
     # Keying is confirmed with a bounded retry: a readback taken immediately
     # after the key command can still report receiving while the radio switches.
     _PTT_KEY_CONFIRM_S = 0.6
@@ -167,8 +183,17 @@ class IcomRadioController:
     # Slow telemetry inventory cadence (levels, RIT, microphone settings).
     # Frequency/mode changes never shorten this; they use a targeted read.
     _RECONCILE_INTERVAL_S = 2.0
+    # The S-meter is read against the spectrum and the audio, both of which are
+    # continuous, so sample it at the scope's cadence instead of once per slow
+    # inventory pass. One CI-V read per interval, skipped while keyed.
+    _RX_METER_INTERVAL_S = 0.2
     # How often the side the radio is not parked on gets a full read.
     _INACTIVE_SIDE_INTERVAL_S = 10.0
+    # The radio can stop emitting scope lines mid-session. Re-send the last
+    # spectrum configuration once the display has been silent this long, and
+    # never more often than the interval below.
+    _SCOPE_STALL_S = 3.0
+    _SCOPE_REASSERT_INTERVAL_S = 5.0
 
     def __init__(self, config: IcomRadioConfig, connectivity: IcomConnectivity,
                  stop_event: Event | None = None) -> None:
@@ -192,6 +217,15 @@ class IcomRadioController:
         self._civ_response: bytes | None = None
         self._serial_buffer = bytearray()
         self._last_reconcile = 0.0
+        self._connected_at: float | None = None
+        self._first_audio_logged = False
+        self._first_audio_chunks = 0
+        self._last_audio_chunk_at: float | None = None
+        self._scope_request: tuple[str, bool, int | None] | None = None
+        self._last_scope_line_at: float | None = None
+        self._scope_reassert_due = 0.0
+        self._scope_stall_reported = False
+        self._scope_side_mismatch_logged = False
         self._latest_scope: bytes | None = None
         self._audio_subscribers: list[AudioBuffer] = []
         self._operator_waiters = 0
@@ -227,6 +261,7 @@ class IcomRadioController:
         self._external_refresh_due: float | None = None
         self._external_refresh_properties: set[str] = set()
         self._tx_meter_due = 0.0
+        self._rx_meter_due = 0.0
         # Per-side scope delivery counters. The radio may send one CI-V frame
         # per sweep or split a sweep into many "division" frames; the two look
         # wildly different on screen, so count them before blaming the wire.
@@ -361,7 +396,16 @@ class IcomRadioController:
                     self._stage = "connecting"
                     self.connectivity.connect()
                     self._state.connected = True
-                    self._state.tx_unconfirmed = False
+                    self._connected_at = monotonic()
+                    self._first_audio_logged = False
+                    self._first_audio_chunks = 0
+                    self._last_audio_chunk_at = None
+                    self._scope_request = None
+                    self._last_scope_line_at = None
+                    self._scope_reassert_due = 0.0
+                    self._scope_stall_reported = False
+                    self._scope_side_mismatch_logged = False
+                    self._rx_meter_due = 0.0
                     self._state.authenticated = bool(
                         self.connectivity.snapshot().get("transport_authenticated", True)
                     )
@@ -374,12 +418,48 @@ class IcomRadioController:
                     except Exception as exc:
                         LOGGER.info("Icom %s connected; initial frequency read failed: %s",
                                     self.connectivity.kind, exc)
+                    self._recover_unconfirmed_transmit_locked()
                     self._activate_transport_microphone_locked()
             except Exception:
                 self.connectivity.disconnect()
                 self._clear_disconnected_state_locked()
                 raise
             return self._state.to_dict()
+
+    def _recover_unconfirmed_transmit_locked(self) -> None:
+        """Clear a key Pi-Sat may have left asserted when the link dropped.
+
+        ``connect()`` used to forget the unconfirmed-key warning, and the release
+        path only acts on a key it still believes it commanded, so a carrier that
+        outlived its session could never be cleared. Pi-Sat is the sole owner of
+        the radio, so a readback that still says transmitting is enough reason to
+        command an unkey here. The warning is only dropped once the radio itself
+        reads idle.
+        """
+        if not self._state.tx_unconfirmed:
+            return
+        if self._state.ptt is None:
+            # The priming read is skipped whenever an operator command is waiting
+            # and swallowed when it fails, so it cannot be relied on to have filled
+            # this in. Ask directly: an unconfirmed key is the one state that can
+            # leave the radio transmitting with nobody listening.
+            try:
+                self._read_ptt_state_locked()
+            except IcomError:
+                return
+        if self._state.ptt is not True:
+            if self._state.ptt is False:
+                self._state.tx_unconfirmed = False
+            return
+        LOGGER.warning("Radio still reports transmitting after reconnect; commanding an unkey")
+        if not self._best_effort_unkey_command("reconnect"):
+            return
+        self._state.ptt = None
+        try:
+            if self._read_ptt_state_locked() is False:
+                self._state.tx_unconfirmed = False
+        except IcomError:
+            return
 
     def disconnect(self) -> None:
         restore_error: Exception | None = None
@@ -427,6 +507,7 @@ class IcomRadioController:
             raise ValueError("frequency_hz must be a positive integer in the five-byte CI-V range")
         with self._operator_operation():
             self._ensure_connected_locked()
+            self._guard_transmit_side_move(physical_side)
             self._read_side_locked()
             previous_side, previous_vfo = self._state.physical_side, self._state.vfo
             try:
@@ -458,6 +539,7 @@ class IcomRadioController:
             raise ValueError(f"Unsupported IC-9700 mode: {mode}")
         with self._operator_operation():
             self._ensure_connected_locked()
+            self._guard_transmit_side_move(physical_side)
             self._read_side_locked()
             previous_side, previous_vfo = self._state.physical_side, self._state.vfo
             try:
@@ -492,6 +574,7 @@ class IcomRadioController:
             raise ValueError("Filter must be FIL1, FIL2 or FIL3")
         with self._operator_operation():
             self._ensure_connected_locked()
+            self._guard_transmit_side_move(side)
             previous_side = self._read_side_locked()
             try:
                 self._select_locked(side, None)
@@ -511,15 +594,30 @@ class IcomRadioController:
             raise ValueError("PTT enabled must be a boolean")
         with self._operator_operation():
             self._ensure_connected_locked()
+            if enabled:
+                # Claim the transmit band before the key reaches the radio: the
+                # retune guard reads this flag, and the radio is keyed the moment
+                # the command is accepted.
+                self._ptt_commanded = True
             self._write_ptt_locked(enabled)
             if enabled:
-                # Transmit audio is gated on the commanded key, not on the
-                # radio's readback, which can flicker while transmitting.
-                self._ptt_commanded = True
                 self._confirm_ptt_key_locked()
             else:
                 self._begin_ptt_release_locked()
             return self._state.to_dict()
+
+    @property
+    def transmit_active(self) -> bool:
+        """Whether Pi-Sat currently has a key asserted on the radio.
+
+        Read without the controller lock on purpose: it is a single attribute
+        assignment, and the tracker polls it every cycle to decide whether the
+        transmitting band may be moved.
+
+        The cached readback is included because a link drop clears the commanded
+        key while the radio may still be transmitting.
+        """
+        return self._ptt_commanded or self._state.ptt is True
 
     def _write_ptt_locked(self, enabled: bool) -> None:
         # IC-9700 PTT/status command is kept in the model table rather than
@@ -721,6 +819,121 @@ class IcomRadioController:
             raise IcomRadioError("Invalid Dualwatch readback")
         self._state.dualwatch = bool(response[6])
 
+    def set_preamp(self, physical_side: str, preamp_int: bool | None = None,
+                   preamp_ext: bool | None = None) -> dict[str, Any]:
+        """Toggle the internal and/or external preamp of one band.
+
+        The IC-9700 packs both preamps into one band-scoped byte
+        (``0x16 0x02``): bit 0 is P.AMP, bit 1 is EXT-P.AMP. An omitted
+        argument keeps that preamp's current readback, so a single button can
+        change one preamp without disturbing the other.
+        """
+
+        side = self._normalize_side(physical_side)
+        for name, value in (("preamp_int", preamp_int), ("preamp_ext", preamp_ext)):
+            if value is not None and type(value) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+        if preamp_int is None and preamp_ext is None:
+            raise ValueError("Provide preamp_int, preamp_ext, or both")
+        with self._operator_operation():
+            self._ensure_connected_locked()
+            previous_side = self._read_side_locked()
+            try:
+                self._select_locked(side, None)
+                self._read_preamp_locked()
+                prefix = side.lower()
+                target_int = getattr(self._state, f"{prefix}_preamp_int") if preamp_int is None else preamp_int
+                target_ext = getattr(self._state, f"{prefix}_preamp_ext") if preamp_ext is None else preamp_ext
+                value = (0x01 if target_int else 0x00) | (0x02 if target_ext else 0x00)
+                self._civ_transaction_locked(self._frame(0x16, bytes([0x02, value])))
+                self._read_preamp_locked()
+                if (getattr(self._state, f"{prefix}_preamp_int") != target_int
+                        or getattr(self._state, f"{prefix}_preamp_ext") != target_ext):
+                    raise IcomRadioError("Preamp readback did not match the request")
+            finally:
+                self._select_locked(previous_side, None)
+            return self._state.to_dict()
+
+    def _read_preamp_locked(self) -> None:
+        response = self._civ_transaction_locked(self._frame(0x16, b"\x02"))
+        if len(response) != 8 or response[6] not in (0, 1, 2, 3):
+            raise IcomRadioError("Invalid preamp readback")
+        value = response[6]
+        prefix = self._state.physical_side.lower()
+        setattr(self._state, f"{prefix}_preamp_int", bool(value & 0x01))
+        setattr(self._state, f"{prefix}_preamp_ext", bool(value & 0x02))
+
+    # Scope sweep speed (CI-V 27 1A): 00=FAST, 01=MID, 02=SLOW, carried after
+    # the scope selector byte.
+    _SCOPE_SWEEP_SPEEDS = {"fast": 0x00, "mid": 0x01, "slow": 0x02}
+
+    def _scope_side(self) -> str:
+        """The side the spectrum is following, falling back to the selected band."""
+        request = self._scope_request
+        if request is not None and request[0] in ("MAIN", "SUB"):
+            return request[0]
+        return self._state.physical_side if self._state.physical_side in ("MAIN", "SUB") else "MAIN"
+
+    @staticmethod
+    def _scope_side_code(side: str) -> int:
+        return 0 if side == "MAIN" else 1
+
+    def set_scope_sweep_speed(self, speed: str,
+                              physical_side: str | None = None) -> dict[str, Any]:
+        """Set the radio's scope sweep speed.
+
+        The console follows one scope at a time, so the caller names the side
+        rather than Pi-Sat keeping a selector of its own.
+        """
+        normalized = str(speed).strip().lower()
+        code = self._SCOPE_SWEEP_SPEEDS.get(normalized)
+        if code is None:
+            raise ValueError("Scope sweep speed must be FAST, MID or SLOW")
+        with self._operator_operation():
+            self._ensure_connected_locked()
+            side = self._normalize_side(physical_side) if physical_side is not None else self._scope_side()
+            side_code = self._scope_side_code(side)
+            # Write only, checking the acknowledgement. This radio does not
+            # answer a read of these two commands on our link, and a failed
+            # readback costs the full transaction deadline while holding the
+            # CI-V lock, so verification by readback is a losing trade here.
+            self._civ_transaction_locked(self._frame(0x27, bytes([0x1A, side_code, code])))
+            setattr(self._state, f"{side.lower()}_scope_sweep_speed", normalized)
+            return self._state.to_dict()
+
+    # Scope reference level (CI-V 27 19): -20.0 to +20.0 dB in 0.5 dB steps.
+    _SCOPE_REFERENCE_LIMIT_DB = 20.0
+
+    def set_scope_reference_level(self, level_db: float,
+                                  physical_side: str | None = None) -> dict[str, Any]:
+        """Set the radio's scope reference level, the height of the noise floor.
+
+        The guide calls this a common setting for the Main and Sub scopes and
+        still carries a scope selector, so the active scope is named rather than
+        Pi-Sat deciding which reading of that note is correct.
+        """
+        if isinstance(level_db, bool) or not isinstance(level_db, (int, float)):
+            raise ValueError("Scope reference level must be a number of dB")
+        level = float(level_db)
+        if not -self._SCOPE_REFERENCE_LIMIT_DB <= level <= self._SCOPE_REFERENCE_LIMIT_DB:
+            raise ValueError("Scope reference level must be -20.0 to +20.0 dB")
+        tenths = round(abs(level) * 10)
+        if tenths % 5:
+            raise ValueError("Scope reference level must be a multiple of 0.5 dB")
+        # Two BCD bytes carry 10/1 dB then 0.1/0.01 dB, then the sign byte.
+        magnitude = bytes([((tenths // 100) << 4) | ((tenths // 10) % 10),
+                           (tenths % 10) << 4])
+        sign = 0x01 if level < 0 else 0x00
+        with self._operator_operation():
+            self._ensure_connected_locked()
+            side = self._normalize_side(physical_side) if physical_side is not None else self._scope_side()
+            side_code = self._scope_side_code(side)
+            self._civ_transaction_locked(
+                self._frame(0x27, bytes([0x19, side_code]) + magnitude + bytes([sign]))
+            )
+            setattr(self._state, f"{side.lower()}_scope_reference_db", round(level, 1))
+            return self._state.to_dict()
+
     def configure_microphone(self, use_lan: bool = False, lan_mod_level: int | None = None,
                              use_transport: bool = False,
                              source: str | int | None = None) -> dict[str, Any]:
@@ -751,6 +964,12 @@ class IcomRadioController:
         )
         level_change = lan_mod_level is not None and self._state.lan_mod_level != lan_mod_level
         if source_change:
+            # Switching the radio's audio routing can restart its LAN audio
+            # stream, so record when Pi-Sat asks for it.
+            LOGGER.debug(
+                "Changing IC-9700 audio routing: data_off_mod/data_mod %s/%s -> %s",
+                self._state.data_off_mod, self._state.data_mod, source,
+            )
             for setting in (0x15, 0x16):
                 self._civ_transaction_locked(self._frame(0x1A, bytes([5, 1, setting, source])))
         if level_change:
@@ -808,6 +1027,7 @@ class IcomRadioController:
             raise ValueError("Tuning delta must be an integer number of Hz")
         with self._operator_operation():
             self._ensure_connected_locked()
+            self._guard_transmit_side_move(side)
             previous_side = self._read_side_locked()
             try:
                 self._select_locked(side, None)
@@ -834,6 +1054,7 @@ class IcomRadioController:
         side = self._normalize_side(physical_side)
         with self._operator_operation():
             self._ensure_connected_locked()
+            self._guard_transmit_side_move(side)
             previous_side = self._read_side_locked()
             try:
                 self._select_locked(side, None)
@@ -846,6 +1067,35 @@ class IcomRadioController:
             finally:
                 self._select_locked(previous_side, None)
             return self._state.to_dict()
+
+    def swap_main_sub(self) -> dict[str, Any]:
+        """Exchange the two bands between the MAIN and SUB receivers.
+
+        The radio performs the exchange itself, which is the only way to move a
+        band to the other side: writing a frequency to a side whose band the
+        other side already occupies is refused by the radio. Every per-side
+        cached value is invalid afterwards, so both sides are re-read before
+        returning rather than letting the console show the old bands.
+        """
+        with self._operator_operation():
+            self._ensure_connected_locked()
+            if self._ptt_commanded or self._read_ptt_state_locked() is True:
+                raise IcomRadioError("Release PTT before exchanging MAIN and SUB bands")
+            self._civ_transaction_locked(self._frame(0x07, b"\xb0"))
+            for side in ("main", "sub"):
+                for field in ("frequency_hz", "mode", "filter", "bandwidth_hz",
+                              "af_gain", "rf_gain", "squelch", "s_meter",
+                              "squelch_open", "a_hz", "b_hz", "updated"):
+                    setattr(self._state, f"{side}_{field}", None)
+        # The telemetry readers deliberately yield to queued operator work, so
+        # run the refresh outside the batch where they are free to read.
+        try:
+            with self._lock:
+                self._inactive_side_due = 0.0
+                self._prime_frequency_state_locked()
+        except IcomRadioError as exc:
+            self._debug("Post-swap readback incomplete: %s", exc)
+        return self._state.to_dict()
 
     def set_sub_rit(self, offset_hz: int | None = None, enabled: bool | None = None) -> dict[str, Any]:
         if offset_hz is not None and (type(offset_hz) is not int or abs(offset_hz) > 9900 or offset_hz % 100):
@@ -1058,6 +1308,9 @@ class IcomRadioController:
         with self._operator_operation():
             self._ensure_connected_locked()
             self._scope_configure_locked(physical_side, enabled, span_hz)
+            # Remember the applied request so a mid-session stall can be
+            # repaired without the browser having to reload the page.
+            self._scope_request = (self._normalize_side(physical_side), enabled, span_hz)
             return self._state.to_dict()
 
     def _scope_configure_locked(self, physical_side: str, enabled: bool, span_hz: int | None) -> None:
@@ -1098,6 +1351,7 @@ class IcomRadioController:
                     self._service_once(0.02)
                     now = monotonic()
                     with self._lock:
+                        self._service_scope_recovery_locked(now)
                         self._service_ptt_confirmation_locked(now)
                         if self._transmit_silence_due_locked(now):
                             self._feed_transmit_silence(now)
@@ -1110,6 +1364,10 @@ class IcomRadioController:
                             self._refresh_external_change_locked(now)
                         elif transmit_active and now >= self._tx_meter_due:
                             self._read_tx_meters_locked(now)
+                        if (not transmit_active
+                                and self._state.ptt_pending is None
+                                and now >= self._rx_meter_due):
+                            self._service_rx_meter_locked(now)
                         # Low-priority telemetry: never while keyed, during a PTT
                         # release, or ahead of a queued operator command.
                         inventory_due = (
@@ -1184,6 +1442,33 @@ class IcomRadioController:
             incoming = self.connectivity.poll(timeout_s)
             for chunk in incoming.control_chunks:
                 self._receive_civ_locked(chunk)
+            if incoming.audio_chunks:
+                # The radio can emit a short burst and then pause while it
+                # finishes bringing its LAN audio stream up; that pause is
+                # listening silence, so it is worth seeing in the log.
+                arrived_at = monotonic()
+                if (self._last_audio_chunk_at is not None
+                        and arrived_at - self._last_audio_chunk_at >= 1.0):
+                    LOGGER.info(
+                        "Native Icom RX audio resumed after a %.2fs gap",
+                        arrived_at - self._last_audio_chunk_at,
+                    )
+                self._last_audio_chunk_at = arrived_at
+            if incoming.audio_chunks and not self._first_audio_logged:
+                # A single initial chunk means the radio started streaming when
+                # it was ready. A large first batch means this poll loop was
+                # blocked and only drained the audio backlog afterwards.
+                self._first_audio_logged = True
+                self._first_audio_chunks = len(incoming.audio_chunks)
+                elapsed = (
+                    None if self._connected_at is None
+                    else monotonic() - self._connected_at
+                )
+                LOGGER.debug(
+                    "Native Icom RX audio arrived: %d chunk(s) %s after the radio reported connected",
+                    self._first_audio_chunks,
+                    "an unknown time" if elapsed is None else f"{elapsed:.2f}s",
+                )
             for pcm in incoming.audio_chunks:
                 packet = self._browser_audio_packet(pcm)
                 with self._audio_lock:
@@ -1239,6 +1524,15 @@ class IcomRadioController:
         ptt = self._civ_transaction_locked(self._frame(0x1C, b"\x00"))
         if len(ptt) == 8 and ptt[6] in (0, 1):
             self._state.ptt = bool(ptt[6])
+        try:
+            self._read_preamp_locked()
+        except IcomRadioError:
+            # The preamp byte is operator convenience, not telemetry the rest
+            # of the console depends on. Leave both buttons unknown instead of
+            # failing the whole refresh cycle.
+            prefix = side.lower()
+            setattr(self._state, f"{prefix}_preamp_int", None)
+            setattr(self._state, f"{prefix}_preamp_ext", None)
 
     def _read_frequency_state_locked(self, side: str) -> int:
         """Verify only frequency after an interactive frequency write."""
@@ -1328,6 +1622,45 @@ class IcomRadioController:
             except IcomRadioError as exc:
                 self._debug("Inactive side restore skipped: %s", exc)
 
+    def _service_scope_recovery_locked(self, now: float) -> None:
+        """Re-send the spectrum configuration when the radio stops scoping.
+
+        Only an explicit browser request configures the scope, so a radio that
+        stops emitting scope lines mid-session left the operator with a frozen
+        waterfall until the page was reloaded. Re-assert the last request here
+        instead, and report the first repair of each stall.
+        """
+        if not self._state.connected or self._scope_request is None:
+            return
+        side, enabled, span_hz = self._scope_request
+        if not enabled or now < self._scope_reassert_due:
+            return
+        if side == "SUB" and self._state.dualwatch is False:
+            # A SUB sweep with dualwatch off is legitimately empty; retrying it
+            # would only add CI-V traffic the radio cannot satisfy.
+            return
+        if self._last_scope_line_at is None:
+            # Nothing has arrived since the request yet; start the clock rather
+            # than treating the radio's normal startup delay as a stall.
+            self._last_scope_line_at = now
+            return
+        stall_s = now - self._last_scope_line_at
+        if stall_s < self._SCOPE_STALL_S:
+            return
+        self._scope_reassert_due = now + self._SCOPE_REASSERT_INTERVAL_S
+        try:
+            self._scope_configure_locked(side, enabled, span_hz)
+        except IcomRadioError as exc:
+            self._debug("Spectrum re-assert skipped: %s", exc)
+            return
+        if not self._scope_stall_reported:
+            self._scope_stall_reported = True
+            LOGGER.info(
+                "Spectrum was silent for %.1fs; re-sent the %s scope configuration",
+                stall_s, side,
+            )
+        self._last_scope_line_at = monotonic()
+
     def _prime_operating_state_locked(self) -> None:
         """Read only state needed to make the console operational at startup."""
 
@@ -1374,6 +1707,29 @@ class IcomRadioController:
             raise IcomRadioError("Radio level readback outside 0..255")
         return value
 
+    def _service_rx_meter_locked(self, now: float) -> None:
+        """Track the receive S-meter at the spectrum's cadence.
+
+        The slow inventory samples the meter once every couple of seconds, which
+        left it jumping seconds away from the spectrum and audio it is read
+        against. This is one CI-V read per interval, it yields to queued operator
+        commands, and it never runs while the radio is keyed or releasing.
+        """
+        self._rx_meter_due = now + self._RX_METER_INTERVAL_S
+        if self._operator_is_waiting():
+            return
+        side = self._state.physical_side
+        if side not in ("MAIN", "SUB"):
+            return
+        try:
+            value = self._decode_level(
+                self._civ_transaction_locked(self._frame(0x15, b"\x02"))
+            )
+        except IcomRadioError as exc:
+            self._debug("S-meter poll skipped: %s", exc)
+            return
+        setattr(self._state, f"{side.lower()}_s_meter", value)
+
     def _read_levels_locked(self) -> None:
         side = self._read_side_locked()
         values = {}
@@ -1412,13 +1768,28 @@ class IcomRadioController:
                         self._latest_scope = scope_line
                         self._scope_queue.append(scope_line)
                         self._state.scope_lines += 1
+                    self._last_scope_line_at = monotonic()
+                    self._scope_stall_reported = False
+                    requested = self._scope_request[0] if self._scope_request else None
+                    reported = "SUB" if scope_line[6] else "MAIN"
+                    if requested is None or reported == requested:
+                        self._scope_side_mismatch_logged = False
+                    elif not self._scope_side_mismatch_logged:
+                        # The browser discards scope lines for any side other
+                        # than the one it is following, so name the drift here
+                        # rather than leaving it to look like a dead spectrum.
+                        self._scope_side_mismatch_logged = True
+                        LOGGER.info(
+                            "Radio is sending %s scope lines while %s was requested",
+                            reported, requested,
+                        )
                 continue
             request = self._pending_civ
             if request is not None and frame[2] == self.config.controller_address:
                 query = request[4] in (0x03, 0x04) or request[4:-1] in (
                     b"\x07\xd2", b"\x1c\x00", b"\x1a\x03", b"\x14\x01", b"\x14\x02",
                     b"\x14\x03", b"\x15\x01", b"\x15\x02", b"\x15\x11", b"\x15\x12", b"\x15\x14",
-                    b"\x21\x00", b"\x21\x01")
+                    b"\x21\x00", b"\x21\x01", b"\x16\x02")
                 query = query or request[4:-1] in (b"\x16\x59", b"\x1a\x05\x01\x14", b"\x1a\x05\x01\x15", b"\x1a\x05\x01\x16")
                 query = query or (request[4:6] == b"\x27\x15" and len(request) == 8)
                 matched = (frame[4] == request[4] and
@@ -1529,7 +1900,11 @@ class IcomRadioController:
                 # poll() already waits for transport input. A short yield keeps
                 # this loop from spinning when the transport returns early.
                 sleep(0.001)
-            self._debug("CI-V timeout bytes=%d command=%02x", len(frame), frame[4] if len(frame) > 4 else 0)
+            # Include the data bytes: without the sub-command a timeout on 0x27
+            # cannot be told apart from any other scope command.
+            self._debug("CI-V timeout bytes=%d command=%02x data=%s", len(frame),
+                        frame[4] if len(frame) > 4 else 0,
+                        " ".join(f"{byte:02x}" for byte in frame[5:-1]))
             raise IcomRadioError("Timed out waiting for IC-9700 CI-V response")
         finally:
             self._pending_civ = None
@@ -1725,6 +2100,20 @@ class IcomRadioController:
             for index in range(8, -1, -2)
         )
 
+    def _guard_transmit_side_move(self, physical_side: str) -> None:
+        """Refuse to move the band Pi-Sat is currently transmitting on.
+
+        The tracker skips the transmit side while keyed, but an operator gesture
+        (spectrum click, frequency editor) reaches the same write. Moving the
+        carrier mid-burst corrupts the frame and splatters outside the channel.
+        """
+        if physical_side != self._TRANSMIT_SIDE:
+            return
+        # The cached readback matters as well as the commanded key: a link drop
+        # clears the command while the radio may still be transmitting.
+        if self._ptt_commanded or self._state.ptt is True:
+            raise IcomRadioError("Release PTT before retuning the transmitting band")
+
     @staticmethod
     def _normalize_side(value: str) -> str:
         normalized = str(value).strip().upper()
@@ -1787,6 +2176,11 @@ class IcomRadioController:
         with self._scope_lock:
             self._scope_queue.clear()
             self._latest_scope = None
+        self._scope_request = None
+        self._last_scope_line_at = None
+        self._scope_reassert_due = 0.0
+        self._scope_stall_reported = False
+        self._scope_side_mismatch_logged = False
         self._scope_divisions.clear()
         self._browser_audio_seq = 0
         self._state.ptt = None

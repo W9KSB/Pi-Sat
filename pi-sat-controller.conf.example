@@ -133,10 +133,3 @@ min_interval_s = 30
 # APRS decoder. It never changes the radio, the browser audio, or the other
 # modules. Dire Wolf suggests keeping most stations near half scale.
 rx_gain_db = -6
-
-
-[sstv]
-# Level trim in dB applied only to the copy of the receive audio handed to the
-# SSTV decoder. It never changes the radio, the browser audio, or the other
-# modules.
-rx_gain_db = -6

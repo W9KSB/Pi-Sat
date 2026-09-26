@@ -86,7 +86,6 @@ from pi_sat_controller.backend.radio.icom_lan_controller import (
 from pi_sat_controller.backend.radio.icom_radio_controller import IcomRadioController
 from pi_sat_controller.backend.radio.native_icom_tracking import NativeIcomTrackingRole
 from pi_sat_controller.backend.api_radio import register_radio_api
-from pi_sat_controller.backend.api_sstv import register_sstv_api
 from pi_sat_controller.backend.api_aprs import register_aprs_api
 from pi_sat_controller.backend.runtime_fallbacks import (
     DisabledTrackingSdrManager,
@@ -108,7 +107,6 @@ from pi_sat_controller.backend.sdr.polling_sdr import (
 )
 from pi_sat_controller.backend.aprs.manager import AprsManager
 from pi_sat_controller.backend.aprs.transmit import AprsTransmitter
-from pi_sat_controller.backend.sstv.manager import SstvManager
 from pi_sat_controller.backend.models import (SatellitePass, SatelliteProfile)
 
 logging.basicConfig(
@@ -189,35 +187,6 @@ hamlib_rotator_models_cache: list[dict[str, object]] = []
 hamlib_rotator_models_error: str | None = None
 
 
-def _sstv_capture_context() -> dict[str, object]:
-    frequency_hz = None
-    satellite = None
-    controller = icom_controller
-    if controller is not None:
-        try:
-            radio = controller.try_snapshot()
-            if radio is not None:
-                frequency_hz = radio.get("sub", {}).get("frequency_hz")
-        except Exception:
-            pass
-    manager = rx_tracking_manager
-    if manager is not None:
-        try:
-            satellite = manager.snapshot().satellite_name
-        except Exception:
-            pass
-    return {"frequency_hz": frequency_hz, "satellite": satellite}
-
-
-sstv_manager = SstvManager(
-    project_root=PROJECT_ROOT,
-    data_dir=PROJECT_ROOT / "data" / "sstv",
-    get_controller=lambda: icom_controller,
-    get_context=_sstv_capture_context,
-    rx_gain_db=configured_rx_gain_db("sstv"),
-)
-
-
 aprs_manager = AprsManager(
     project_root=PROJECT_ROOT,
     data_dir=PROJECT_ROOT / "data" / "aprs",
@@ -251,7 +220,6 @@ async def lifespan(app: FastAPI):
         _stop_pass_refresh_scheduler()
         _stop_autotrack_scheduler()
         _stop_transponder_refresh_scheduler()
-        sstv_manager.shutdown()
         aprs_manager.shutdown()
         aprs_transmitter.shutdown()
         _shutdown_runtime()
@@ -1648,11 +1616,6 @@ register_settings_api(
 )
 
 register_radio_api(app, get_controller=lambda: icom_controller)
-register_sstv_api(
-    app,
-    get_manager=lambda: sstv_manager,
-    save_rx_gain=lambda value: save_rx_gain_db("sstv", value),
-)
 register_aprs_api(
     app,
     get_manager=lambda: aprs_manager,

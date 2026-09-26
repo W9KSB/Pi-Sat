@@ -13,7 +13,11 @@ from pi_sat_controller.backend.config import (
 MANUAL_ONLY_SETTINGS: dict[str, set[str]] = {
     # Native Icom control uses LAN; keep the internal connectivity key out of
     # browser-editable settings.
-    "icom": {"connectivity"},
+    # The transmit codec is fixed at LPCM16 mono by the LAN audio contract, so
+    # offering it in the browser only invited the belief that it changed
+    # something. It stays a config-file key so it can still be overridden by
+    # hand, and it is preserved across settings saves.
+    "icom": {"connectivity", "tx_codec"},
     "tx": {"shared_local_split_mode"},
 }
 

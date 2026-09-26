@@ -44,7 +44,6 @@ let qsoOpportunities = [];
 let selectedQsoOpportunityIndex = -1;
 const PAGE_NAMES = ['home', 'radio', 'satellites', 'modules', 'monitor', 'settings'];
 const MODULE_NAV = [
-  { id: 'sstv-decoder', label: 'SSTV Decoder' },
   { id: 'qso-finder', label: 'QSO Finder' },
   { id: 'map', label: 'Map' },
   { id: 'aprs', label: 'APRS' },
@@ -71,6 +70,7 @@ let radioAudioPeer = null;
 let radioAudioPeerStream = null;
 let radioWebrtcGraph = null;
 let radioWebrtcTimer = 0;
+let radioWebrtcStats = null;
 let radioMicStream = null;
 let radioMicProcessor = null;
 let radioMicSource = null;
@@ -508,12 +508,17 @@ function updateRadioWebrtcStatus() {
   radioWebrtcGraph.left.gain.value = listen === 'SUB' ? 0 : 1;
   radioWebrtcGraph.right.gain.value = listen === 'MAIN' ? 0 : 1;
   radioWebrtcGraph.master.gain.value = volume;
-  document.getElementById('radio-audio-status').textContent = `RX ${listen} · WebRTC · ${Math.round(volume * 100)}% volume`;
+  const stats = radioWebrtcStats;
+  const latency = stats && Number.isFinite(stats.bufferMs) ? ` · ${Math.round(stats.bufferMs)} ms jitter buffer` : '';
+  const lost = stats && stats.lost ? ` · ${stats.lost} lost` : '';
+  document.getElementById('radio-audio-status').textContent = `RX ${listen} · WebRTC · ${Math.round(volume * 100)}% volume${latency}${lost}`;
 }
 
 function handleRadioWebrtcTrack(event) {
   const stream = event.streams?.[0];
   if (!stream || !radioAudioContext) return;
+  // Re-apply the latency hint in case receivers only appeared with the track.
+  tuneRadioWebrtcReceiver(radioAudioPeer);
   radioAudioPeerStream = stream;
   const source = radioAudioContext.createMediaStreamSource(stream);
   const splitter = radioAudioContext.createChannelSplitter(2);
@@ -601,16 +606,98 @@ function stopRadioWebrtc() {
     radioAudioPeer.close?.();
     radioAudioPeer = null;
   }
+  radioWebrtcStats = null;
   if (radioAudioTransport === 'webrtc') radioAudioTransport = '';
+}
+
+// Firefox 115+ and Chrome 124+ both implement RTCRtpReceiver.jitterBufferTarget.
+// Its automatic default favors smoothness over latency, so ask for a small
+// buffer and let the browser clamp the value to its own allowed range. The
+// measured delay is reported back in the audio status line.
+const RADIO_WEBRTC_JITTER_TARGET_MS = 50;
+
+function tuneRadioWebrtcReceiver(peer) {
+  if (!peer?.getReceivers) return;
+  for (const receiver of peer.getReceivers()) {
+    if (receiver?.track && receiver.track.kind !== 'audio') continue;
+    try {
+      receiver.jitterBufferTarget = RADIO_WEBRTC_JITTER_TARGET_MS;
+    } catch {
+      // Browser rejected the hint; it keeps its own jitter-buffer target.
+    }
+  }
+}
+
+async function measureRadioWebrtcLatency() {
+  const peer = radioAudioPeer;
+  if (!peer || radioAudioTransport !== 'webrtc') return null;
+  let receiver = null;
+  for (const candidate of peer.getReceivers?.() || []) {
+    if (!candidate?.track || candidate.track.kind === 'audio') { receiver = candidate; break; }
+  }
+  if (!receiver?.getStats) return null;
+  let report;
+  try { report = await receiver.getStats(); } catch { return null; }
+  if (radioAudioPeer !== peer) return null;
+  let inbound = null;
+  report.forEach(stat => {
+    if (stat.type !== 'inbound-rtp' || stat.kind === 'video' || stat.mediaType === 'video') return;
+    inbound = stat;
+  });
+  if (!inbound) return null;
+  // jitterBufferDelay accumulates seconds of playout delay; dividing by the
+  // emitted sample count gives the delay actually being applied to audio.
+  const emitted = Number(inbound.jitterBufferEmittedCount || 0);
+  const delayed = Number(inbound.jitterBufferDelay ?? inbound.jitterBufferTargetDelay ?? 0);
+  const jitter = Number(inbound.jitter ?? NaN);
+  return {
+    bufferMs: emitted > 0 && delayed > 0 ? delayed / emitted * 1000 : null,
+    jitterMs: Number.isFinite(jitter) ? jitter * 1000 : null,
+    lost: Number(inbound.packetsLost || 0),
+    received: Number(inbound.packetsReceived || 0),
+  };
+}
+
+async function pollRadioWebrtc() {
+  const stats = await measureRadioWebrtcLatency();
+  if (stats) radioWebrtcStats = stats;
+  updateRadioWebrtcStatus();
+}
+
+// Host candidates are gathered locally and are all a peer on this network
+// needs. Waiting for gathering to finish held the whole offer back, so the
+// offer goes out as soon as a candidate exists, with a bounded wait so a
+// browser that never reports one cannot stall listening audio indefinitely.
+const RADIO_WEBRTC_ICE_WAIT_MS = 1000;
+
+function waitForRadioWebrtcCandidates(peer) {
+  if (!peer.iceGatheringState || peer.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(resolve => {
+    let settled = false;
+    let timer = 0;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      peer.removeEventListener?.('icecandidate', onCandidate);
+      peer.onicegatheringstatechange = null;
+      resolve();
+    };
+    const onCandidate = event => { if (event.candidate) finish(); };
+    timer = window.setTimeout(finish, RADIO_WEBRTC_ICE_WAIT_MS);
+    peer.addEventListener?.('icecandidate', onCandidate);
+    peer.onicegatheringstatechange = () => {
+      if (peer.iceGatheringState === 'complete') finish();
+    };
+  });
 }
 
 async function startRadioWebrtc() {
   if (typeof window.RTCPeerConnection !== 'function') return false;
-  const host = window.location.hostname || '';
-  const stunHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
-  const peer = new window.RTCPeerConnection({
-    iceServers: stunHost ? [{ urls: `stun:${stunHost}:3478` }] : [],
-  });
+  // Pi-Sat only connects on the station's own network, where host candidates
+  // are sufficient. No STUN or TURN server is configured, so gathering has
+  // nothing to contact outside this network.
+  const peer = new window.RTCPeerConnection({ iceServers: [] });
   radioAudioPeer = peer;
   peer.addTransceiver('audio', { direction: 'recvonly' });
   peer.ontrack = handleRadioWebrtcTrack;
@@ -620,17 +707,7 @@ async function startRadioWebrtc() {
   };
   const offer = await peer.createOffer();
   await peer.setLocalDescription(offer);
-  if (peer.iceGatheringState && peer.iceGatheringState !== 'complete') {
-    await new Promise(resolve => {
-      const timeout = window.setTimeout(resolve, 5000);
-      peer.onicegatheringstatechange = () => {
-        if (peer.iceGatheringState === 'complete') {
-          window.clearTimeout(timeout);
-          resolve();
-        }
-      };
-    });
-  }
+  await waitForRadioWebrtcCandidates(peer);
   const response = await fetch('/api/radio/audio/webrtc/offer', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -640,7 +717,8 @@ async function startRadioWebrtc() {
   const answer = await response.json();
   await peer.setRemoteDescription(answer);
   radioAudioTransport = 'webrtc';
-  radioWebrtcTimer = window.setInterval(updateRadioWebrtcStatus, 500);
+  tuneRadioWebrtcReceiver(peer);
+  radioWebrtcTimer = window.setInterval(() => { void pollRadioWebrtc(); }, 500);
   document.getElementById('radio-audio-status').textContent = 'RX audio · WebRTC connected; waiting for audio.';
   return true;
 }
@@ -677,6 +755,28 @@ async function startRadioPcm() {
   return true;
 }
 
+// The console owns the operator's transport choice; PCM is the path an external
+// decoder taps because it never passes through Opus.
+function radioWebrtcDisabled() {
+  return window.RadioConsole?.audioTransport === 'pcm';
+}
+
+// Rebuild only the receive graph. The microphone capture and the session uplink
+// belong to the session, so they survive a transport change untouched.
+async function restartRadioReceiveAudio() {
+  radioAudioGeneration += 1;
+  stopRadioWebrtc();
+  if (radioAudioSocket) {
+    radioAudioSocket.onclose = radioAudioSocket.onmessage = radioAudioSocket.onerror = null;
+    radioAudioSocket.close();
+    radioAudioSocket = null;
+  }
+  radioAudioTransport = '';
+  radioAudioWorklet?.port.postMessage({ type: 'reset' });
+  if (!radioAudioContext) return false;
+  return startRadioAudio();
+}
+
 async function startRadioAudio() {
   const generation = radioAudioGeneration;
   try {
@@ -691,11 +791,15 @@ async function startRadioAudio() {
     await loadRadioState();
     if (generation !== radioAudioGeneration || !radioAudioContext) return false;
     if (radioAudioPeer || radioAudioSocket || radioAudioTransport === 'starting') return true;
-    try {
-      if (await startRadioWebrtc()) return true;
-    } catch (error) {
-      stopRadioWebrtc();
-      document.getElementById('radio-audio-status').textContent = `WebRTC unavailable; using PCM fallback (${error.message || error}).`;
+    // The operator can pin the receive path to PCM from Advanced Settings, which
+    // is what an external decoder tapping the browser output needs.
+    if (!radioWebrtcDisabled()) {
+      try {
+        if (await startRadioWebrtc()) return true;
+      } catch (error) {
+        stopRadioWebrtc();
+        document.getElementById('radio-audio-status').textContent = `WebRTC unavailable; using PCM fallback (${error.message || error}).`;
+      }
     }
     if (generation !== radioAudioGeneration || !radioAudioContext) return false;
     return startRadioPcm();
@@ -748,7 +852,14 @@ async function startRadioMicrophone() {
     if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
       throw new Error('Microphone capture requires HTTPS or localhost. LAN HTTP supports listening, but not your laptop microphone.');
     }
-    if (!await startRadioAudio() || generation !== radioMicGeneration) return false;
+    // Capture needs the audio context and the session's current sample rate,
+    // but not the RX transport: starting that before the radio is connected
+    // fills the receiver's playout buffer with silence, so listening audio
+    // starts once the session actually reports connected.
+    await prepareRadioAudio();
+    if (generation !== radioMicGeneration || !radioAudioContext) return false;
+    await loadRadioState();
+    if (generation !== radioMicGeneration || !radioAudioContext) return false;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: {
       ...(radioMicDeviceId ? { deviceId: { exact: radioMicDeviceId } } : {}),
       channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false,
@@ -2358,13 +2469,12 @@ async function loadSettings() {
       rotator: 'devices',
       automation: 'application',
       aprs: 'other',
-      sstv: 'other',
       safety: 'other',
     };
     const appendToSettingsPanel = (source, element) => {
       panels.get(settingsPanelBySource[source] || 'other').appendChild(element);
     };
-    const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'aprs', 'sstv', 'safety'];
+    const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'aprs', 'safety'];
     orderedSections.forEach((section) => {
       if (section === 'device_roles') {
         appendToSettingsPanel(section,

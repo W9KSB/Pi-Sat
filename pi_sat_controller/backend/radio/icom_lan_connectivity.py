@@ -24,6 +24,14 @@ from pi_sat_controller.backend.radio.icom_connectivity import (
 
 LOGGER = logging.getLogger(__name__)
 
+# The Icom LAN stream request carries the RX codec from configuration, but the
+# transmit side is always LPCM16 mono. That is also how the controller frames
+# transmit PCM, so a configured tx_codec cannot change the wire format. Naming
+# the effective value once keeps the capability log honest about what the radio
+# was actually asked for.
+_TX_CODEC_ID = 0x04
+_TX_CODEC_NAME = "lpcm16_mono"
+
 
 @dataclass(frozen=True)
 class IcomLanConfig:
@@ -313,10 +321,10 @@ class IcomLanConnectivity:
             return
         LOGGER.info(
             "Icom LAN audio capability: interface=%s rx_rates=%d tx_rates=%d civ=0x%02X; "
-            "configured %d Hz %s RX / %s TX",
+            "configured %d Hz %s RX / %s TX (transmit audio is always %s)",
             capability["audio"], capability["rx_rate_count"], capability["tx_rate_count"],
             capability["civ_address"], self.config.sample_rate, self.config.rx_codec,
-            self.config.tx_codec)
+            self.config.tx_codec, _TX_CODEC_NAME)
         if capability["tx_rate_count"] < 2:
             LOGGER.warning(
                 "Icom LAN: the radio advertises %d transmit audio rate(s); transmit audio "
@@ -426,7 +434,12 @@ class IcomLanConnectivity:
             raise IcomConnectivityError("Unsupported Icom RX codec; use lpcm16_mono or lpcm16_stereo")
         if self.config.tx_codec not in ("lpcm16_mono", "lpcm16_stereo"):
             raise IcomConnectivityError("Unsupported Icom TX codec; use lpcm16_mono")
-        conninfo[112:116] = bytes([1, 1, rx_codecs[self.config.rx_codec], 0x04])
+        conninfo[112:116] = bytes([1, 1, rx_codecs[self.config.rx_codec], _TX_CODEC_ID])
+        if self.config.tx_codec != _TX_CODEC_NAME:
+            LOGGER.warning(
+                "Icom LAN: tx_codec=%s is ignored; transmit audio is always %s",
+                self.config.tx_codec, _TX_CODEC_NAME,
+            )
         struct.pack_into(">IIIII", conninfo, 116, self.config.sample_rate, self.config.sample_rate,
                          self._serial.getsockname()[1], self._audio.getsockname()[1], 150)
         conninfo[136] = 1

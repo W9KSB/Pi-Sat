@@ -1,2 +1,0 @@
-"""Live SSTV decoder integration."""
-

@@ -77,11 +77,14 @@
         </div>
       </div>
     </section>
-    <div class="rc-deck">${pathPanel('MAIN', 'TX')}${pathPanel('SUB', 'RX')}</div>
+    <div class="rc-deck">${pathPanel('MAIN', 'TX')}<button type="button" id="rc-swap" class="rc-button rc-swap"
+      data-action="swap-bands" title="Exchange the MAIN and SUB bands, the same operation as the radio's front-panel M&lt;&gt;S button">M&lt;-&gt;S</button>${pathPanel('SUB', 'RX')}</div>
     <footer class="rc-audio rc-panel"><div class="rc-volume"><label for="rc-volume">MONITOR VOLUME</label><input id="rc-volume" type="range" min="0" max="100" value="70"><output id="rc-volume-value">70%</output></div>
       <span id="radio-audio-status" role="status">Audio off · starts with Connect</span>
       <span class="rc-persistent">Audio follows you across tabs</span></footer>
-    <details class="rc-microphone rc-panel" id="rc-microphone-panel"><summary>Microphone &amp; transmit audio configuration</summary>
+    <details class="rc-microphone rc-panel" id="rc-microphone-panel"><summary>Advanced Settings</summary>
+      <div class="rc-advanced-columns">
+        <div class="rc-advanced-column">
       <div class="rc-mic-settings"><label>Laptop / USB microphone<select id="rc-mic-device" title="Microphone used for transmit audio; choosing another one reopens capture on it"><option value="">System default microphone</option></select></label>
         ${button('Refresh microphones', 'mic-refresh')}
         <label>Browser mic gain<input id="rc-mic-gain" type="range" min="0" max="200" value="100"><output id="rc-mic-gain-value">100%</output></label>
@@ -96,6 +99,44 @@
         </div>
         <form id="rc-lan-mod-form"><label>Radio LAN MOD level (0–255)<input id="rc-lan-mod" type="number" min="0" max="255" step="1" required data-radio></label><button type="submit" class="rc-button" data-radio>Apply level</button></form>
       </div><p>DATA OFF MOD and DATA MOD are stored on the radio, and Pi-Sat sets the LAN input each time it connects. The buttons are a manual exception for this session; the LAN MOD level only matters while the LAN input is selected.</p>
+        </div>
+        <div class="rc-advanced-column">
+          <div class="rc-advanced-group">
+            <h3>RX Audio Transport</h3>
+            <div class="rc-transport-group" role="group" aria-label="Receive audio transport">
+              ${button('WebRTC', 'audio-transport', 'data-value="webrtc" aria-pressed="false" title="Receive audio over WebRTC with a browser jitter buffer"')}
+              ${button('PCM', 'audio-transport', 'data-value="pcm" aria-pressed="false" title="Receive plain PCM over the audio socket, which an external decoder can tap"')}
+            </div>
+          </div>
+          <div class="rc-advanced-group">
+            <h3>Preamps</h3>
+            <div class="rc-preamp-grid">
+              <span class="rc-preamp-side">MAIN</span>
+              ${button('INTERNAL', 'preamp', 'id="rc-MAIN-preamp-int" data-side="MAIN" data-value="int" data-radio aria-pressed="false" title="Internal preamp for the band the MAIN receiver is on"')}
+              ${button('EXTERNAL', 'preamp', 'id="rc-MAIN-preamp-ext" data-side="MAIN" data-value="ext" data-radio aria-pressed="false" title="External preamp for the MAIN band; the radio enables it per band in the SET menu"')}
+              <span class="rc-preamp-side">SUB</span>
+              ${button('INTERNAL', 'preamp', 'id="rc-SUB-preamp-int" data-side="SUB" data-value="int" data-radio aria-pressed="false" title="Internal preamp for the band the SUB receiver is on"')}
+              ${button('EXTERNAL', 'preamp', 'id="rc-SUB-preamp-ext" data-side="SUB" data-value="ext" data-radio aria-pressed="false" title="External preamp for the SUB band; the radio enables it per band in the SET menu"')}
+            </div>
+          </div>
+          <div class="rc-advanced-group">
+            <h3>Spectrum Trace</h3>
+            <div class="rc-sweep-group" role="group" aria-label="Scope sweep speed">
+              ${button('Fast', 'scope-sweep', 'data-value="fast" data-radio aria-pressed="false" title="Radio scope sweep speed"')}
+              ${button('Mid', 'scope-sweep', 'data-value="mid" data-radio aria-pressed="false" title="Radio scope sweep speed"')}
+              ${button('Slow', 'scope-sweep', 'data-value="slow" data-radio aria-pressed="false" title="Radio scope sweep speed"')}
+            </div>
+          </div>
+          <div class="rc-advanced-group">
+            <h3>REF</h3>
+            <div class="rc-ref-control">
+              <input id="rc-ref-level" type="range" min="0" max="80" step="1" value="40" data-radio
+                aria-label="Scope reference level, the height of the noise floor" title="Reference level for the radio's scope display: -20.0 to +20.0 dB in 0.5 dB steps">
+              <output id="rc-ref-level-value">+0.0 dB</output>
+            </div>
+          </div>
+        </div>
+      </div>
     </details>
     <div class="rc-notices"><span id="rc-status" role="status">Checking radio configuration…</span><span id="rc-command-status" role="status"></span></div>`;
 
@@ -113,6 +154,8 @@
   let scopeFallbackSequence = 0;
   let lastScopeSequence = null;
   let lastScopeTime = 0;
+  let scopeWaitSince = 0;
+  let scopeRepairAfter = 0;
   let socket;
   let scope = null;
   // Decoded sweeps waiting for the next paint. rAF coalescing must not silently
@@ -163,6 +206,23 @@
   function syncDisplayControls() {
     root.querySelectorAll('[data-action="hold"],[data-action="fill"],[data-action="grid"],[data-action="smooth"]')
       .forEach(node => node.setAttribute('aria-pressed', String(display[node.dataset.action] === true)));
+  }
+  // Receive audio transport is a per-browser choice. WebRTC gives the browser a
+  // jitter buffer; plain PCM is the path an external decoder taps.
+  const AUDIO_TRANSPORT_STORAGE_KEY = 'pi-sat.radio.audio-transport.v1';
+  function loadAudioTransport() {
+    try {
+      return localStorage.getItem(AUDIO_TRANSPORT_STORAGE_KEY) === 'pcm' ? 'pcm' : 'webrtc';
+    } catch { return 'webrtc'; }
+  }
+  let audioTransport = loadAudioTransport();
+  function saveAudioTransport() {
+    try { localStorage.setItem(AUDIO_TRANSPORT_STORAGE_KEY, audioTransport); }
+    catch { /* The choice still applies for this page load. */ }
+  }
+  function syncAudioTransportControls() {
+    root.querySelectorAll('[data-action="audio-transport"]')
+      .forEach(node => node.setAttribute('aria-pressed', String(node.dataset.value === audioTransport)));
   }
   const DISPLAY_DB_LIMITS = { min: -160, max: 0, gap: 10 };
   const LEVEL_STORAGE_KEY = 'pi-sat.radio.scope-levels.v2';
@@ -237,7 +297,7 @@
     scheduleLevelPaint();
   }
   const consoleApi = {
-    listen: 'SUB', volume: 0.7, formatFrequency,
+    listen: 'SUB', volume: 0.7, audioTransport, formatFrequency,
     error(message) { $('rc-command-status').textContent = message; },
     render(update) {
       // High-rate scope frames must not rebuild meters, menus or audio controls.
@@ -253,6 +313,7 @@
         scopeSyncQueued = true;
         lastScopeSequence = null;
         lastScopeTime = 0;
+        scopeWaitSince = Date.now();
       }
       for (const side of ['MAIN', 'SUB']) {
         const data = state[side.toLowerCase()] || {};
@@ -285,6 +346,34 @@
           : data.age_s > 6 ? `LAST READ · ${data.age_s}s` : 'READBACK';
       }
       root.querySelectorAll('[data-radio]').forEach(node => { node.disabled = !state.connected || !streamHealthy; });
+      // The preamp and scope controls live in Advanced Settings. The radio owns
+      // all of them, so they show its own readback rather than a local guess.
+      for (const side of ['MAIN', 'SUB']) {
+        const data = state[side.toLowerCase()] || {};
+        const inactiveSub = side === 'SUB' && state.dualwatch === false;
+        // The element id keeps the short int/ext suffix; only the label is long.
+        for (const [field, suffix, name] of [['preamp_int', 'int', 'INTERNAL'],
+                                            ['preamp_ext', 'ext', 'EXTERNAL']]) {
+          const node = $(`rc-${side}-preamp-${suffix}`);
+          const value = data[field];
+          node.textContent = `${name} ${value == null ? '—' : value ? 'ON' : 'OFF'}`;
+          node.setAttribute('aria-pressed', String(value === true));
+          node.disabled = !state.connected || !streamHealthy || inactiveSub;
+        }
+      }
+      // The scope display controls follow whichever scope is in use.
+      const scopeSide = listeningScopeSide();
+      const scopeData = state[scopeSide.toLowerCase()] || {};
+      for (const node of root.querySelectorAll('[data-action="scope-sweep"]')) {
+        node.setAttribute('aria-pressed', String(scopeData.scope_sweep_speed === node.dataset.value));
+      }
+      syncAudioTransportControls();
+      const refNode = $('rc-ref-level');
+      if (document.activeElement !== refNode && typeof scopeData.scope_reference_db === 'number') {
+        refNode.value = String(Math.round((scopeData.scope_reference_db + 20) * 2));
+      }
+      const refDb = (Number(refNode.value) - 40) * 0.5;
+      $('rc-ref-level-value').textContent = `${refDb >= 0 ? '+' : ''}${refDb.toFixed(1)} dB`;
       $('rc-command-status').setAttribute('aria-busy', String(busy));
       // Unknown radio levels are not displayed as adjustable zeroes.
       root.querySelectorAll('[data-level]').forEach(node => { node.disabled ||= !Number.isFinite(state[node.dataset.side.toLowerCase()]?.[node.dataset.level]); });
@@ -352,6 +441,8 @@
       if (!draftInputs.has('rc-lan-mod') && document.activeElement !== $('rc-lan-mod') && Number.isFinite(micConfig?.lan_mod_level)) $('rc-lan-mod').value = micConfig.lan_mod_level;
       $('rc-dualwatch').textContent = state.dualwatch == null ? 'Dualwatch —' : state.dualwatch ? 'Dualwatch ON' : 'Dualwatch OFF';
       $('rc-dualwatch').disabled ||= state.dualwatch == null;
+      // The radio refuses to exchange bands while keyed, so do not offer it.
+      $('rc-swap').disabled = !connected || !streamHealthy || transmitting;
       $('rc-dualwatch').setAttribute('aria-pressed', String(state.dualwatch === true));
       const rit = state.sub_rit;
       $('rc-rit-toggle').textContent = rit?.enabled == null ? 'RIT —' : rit.enabled ? 'RIT ON' : 'RIT OFF';
@@ -369,6 +460,22 @@
         audioStarting = true;
         audioRetryAfter = Date.now() + 3000;
         void startRadioAudio().finally(() => { audioStarting = false; });
+      }
+      // A stalled spectrum used to need a full page reload: nothing cleared the
+      // local sequence stamp or re-requested the sweep, so the display stayed
+      // frozen even while the radio kept sending. Repair it in place at
+      // operator pace instead, which covers both a wedged client and a radio
+      // that stopped scoping on its own.
+      const scopeSilentFor = Date.now() - Math.max(lastScopeTime, scopeWaitSince);
+      // A SUB spectrum with dualwatch off is legitimately empty, so leave that
+      // state alone rather than re-requesting a sweep the radio cannot produce.
+      const scopeExpected = !(listeningScopeSide() === 'SUB' && state.dualwatch === false);
+      if (connected && streamHealthy && !busy && scopeExpected && scopeSilentFor > 4000
+          && Date.now() >= scopeRepairAfter) {
+        scopeRepairAfter = Date.now() + 8000;
+        lastScopeSequence = null;
+        lastScopeTime = 0;
+        scopeSyncQueued = true;
       }
       if (connected && streamHealthy && !busy && scopeSyncQueued && !scopeSyncRunning) void syncListeningScope();
       if (state.scope) acceptScope(state.scope);
@@ -417,6 +524,20 @@
     }
     consoleApi.render({});
   }
+  function setAudioTransport(value) {
+    if (!['webrtc', 'pcm'].includes(value) || value === audioTransport) return;
+    audioTransport = value;
+    saveAudioTransport();
+    consoleApi.audioTransport = audioTransport;
+    syncAudioTransportControls();
+    // The transport is chosen when the receive graph starts, so rebuild it now.
+    // The microphone capture and the session uplink are left alone.
+    if (state.connected && wantAudio && typeof restartRadioReceiveAudio === 'function') {
+      audioStarting = true;
+      audioRetryAfter = 0;
+      void restartRadioReceiveAudio().finally(() => { audioStarting = false; });
+    }
+  }
   async function syncListeningScope() {
     if (scopeSyncRunning || busy || !state.connected || !streamHealthy) return;
     scopeSyncRunning = true;
@@ -426,7 +547,11 @@
       while (scopeSyncQueued && state.connected && streamHealthy && !busy) {
         scopeSyncQueued = false;
         const result = await radioAction('/api/radio/scope', { physical_side: listeningScopeSide(), enabled: true, ...(requestedSpan ? { span_hz: requestedSpan } : {}) });
-        if (!result) consoleApi.error('Spectrum could not start. See the radio command error in Monitor.');
+        // radioAction already reported the specific reason. Do not replace it
+        // with a vaguer message, which hid the cause of a failing scope start.
+        if (!result && !$('rc-command-status').textContent) {
+          consoleApi.error('Spectrum could not start. See the radio command error in Monitor.');
+        }
       }
     } finally { scopeSyncRunning = false; }
   }
@@ -487,6 +612,15 @@
     }
     if (action === 'rit-reset') { $('rc-rit-offset').value = '0'; queueRit(); }
     if (action === 'dualwatch') await command('dualwatch', { enabled: !state.dualwatch });
+    if (action === 'preamp') {
+      const field = value === 'int' ? 'preamp_int' : 'preamp_ext';
+      await command('preamp', { physical_side: side, [field]: state[side.toLowerCase()]?.[field] !== true });
+    }
+    if (action === 'scope-sweep') {
+      await command('scope-sweep', { physical_side: listeningScopeSide(), speed: value });
+    }
+    if (action === 'audio-transport') setAudioTransport(value);
+    if (action === 'swap-bands') await command('swap-main-sub', {});
     if (action === 'mic-refresh') await refreshRadioMicrophones();
     if (action === 'mic-mode') {
       const result = await command('microphone-config', { source: value });
@@ -615,6 +749,13 @@
   $('rc-mic-gain').addEventListener('input', event => {
     applyRadioMicGain(Number(event.target.value) / 100);
     $('rc-mic-gain-value').textContent = `${event.target.value}%`;
+  });
+  // Applied on release rather than while dragging: this is a CI-V write.
+  $('rc-ref-level').addEventListener('change', async event => {
+    await command('scope-reference', {
+      physical_side: listeningScopeSide(),
+      level_db: (Number(event.target.value) - 40) * 0.5,
+    });
   });
   $('rc-lan-mod-form').addEventListener('submit', async event => {
     event.preventDefault();

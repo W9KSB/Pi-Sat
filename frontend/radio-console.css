@@ -1,7 +1,7 @@
 /* Deliberately scoped: the rest of Pi-Sat retains its existing layout/theme. */
+/* The Radio page lets the console use the whole viewport, so the shared header
+   follows it rather than staying at the normal app-shell width. */
 .app-shell:has(#radio-page:not([hidden])) { max-width: none; }
-/* Keep the shared header at the normal 1760px app-shell width, excluding gutters. */
-#radio-page > .app-header { max-width: calc(1760px - var(--bs-gutter-x, 1.5rem)); margin-inline: auto; }
 .radio-console {
   --rc-bg: #080f17; --rc-panel: #111d28; --rc-edge: #304554; --rc-muted: #95a9bd; --rc-blue: #2589ff;
   color: #eaf3ff; font-size: 13px; display: grid; gap: 12px;
@@ -85,7 +85,11 @@
   font: 8px/14px Consolas, 'SFMono-Regular', monospace; text-align: right; white-space: nowrap;
   pointer-events: none; text-shadow: 0 1px 2px #000;
 }
-.rc-deck { display: grid; grid-template-columns: minmax(0, 1fr) 176px minmax(0, 1fr); gap: 12px; align-items: stretch; }
+.rc-deck { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 10px; align-items: stretch; }
+/* Sized to its label and centred in the row; the deck stretches its children,
+   which made a full-height column out of a three-character button. */
+.rc-swap { align-self: center; min-width: 0; padding: 6px 9px; font-size: 13px; font-weight: 700;
+  letter-spacing: 0; line-height: 1; white-space: nowrap; }
 .rc-path { min-width: 0; padding: 14px 16px 8px; border-top: 3px solid #3c5267; }
 .rc-path.is-target { border-top-color: var(--rc-blue); box-shadow: inset 0 12px 25px -22px #2098ff, 0 4px 14px #0004; }
 .rc-path-heading { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
@@ -125,6 +129,28 @@
 .rc-rit-controls label, .rc-rit-controls output { font-size: 10px; color: #91a9bf; }
 .rc-rit-controls input { width: 85px; display: block; background: #142433; color: #d3e7fa; border: 1px solid #34495b; padding: 4px; }
 .rc-rit-controls .rc-button { font-size: 10px; padding: 5px 8px; }
+.rc-advanced-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.rc-advanced-column { display: grid; gap: 10px; min-width: 0; }
+.rc-advanced-group { display: grid; gap: 6px; min-width: 0; }
+.rc-advanced-group h3 { font-size: 10px; font-weight: 600; letter-spacing: .09em; color: #aac2d8; text-transform: uppercase; }
+/* Compact controls, deliberately not stretched: this panel is meant to take
+   more switches, so each group keeps its own size instead of filling the
+   column. The side label carries MAIN/SUB so the buttons stay short. */
+.rc-preamp-grid { display: grid; grid-template-columns: auto repeat(2, minmax(0, 132px)); align-items: center; justify-content: start; gap: 5px 6px; }
+.rc-preamp-side { font-size: 10px; font-weight: 600; letter-spacing: .08em; color: #a5c0d9; }
+.rc-sweep-group { display: grid; grid-template-columns: repeat(3, minmax(0, 84px)); justify-content: start; gap: 5px; }
+.rc-transport-group { display: grid; grid-template-columns: repeat(2, minmax(0, 104px)); justify-content: start; gap: 5px; }
+.rc-preamp-grid .rc-button, .rc-sweep-group .rc-button, .rc-transport-group .rc-button { padding: 3px 8px; min-height: 24px; font-size: 10px; letter-spacing: .03em; }
+.rc-ref-control { display: grid; grid-template-columns: minmax(0, 240px) auto; align-items: center; justify-content: start; gap: 9px; }
+.rc-ref-control input { width: 100%; height: 18px; accent-color: #2589ff; }
+.rc-ref-control output { min-width: 6ch; text-align: right; font-size: 10px; color: #bbd8ee; font-variant-numeric: tabular-nums; }
+@media (max-width: 760px) { .rc-advanced-columns { grid-template-columns: minmax(0, 1fr); gap: 14px; } }
+@media (max-width: 520px) {
+  .rc-preamp-grid { grid-template-columns: auto repeat(2, minmax(0, 1fr)); }
+  .rc-sweep-group { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .rc-transport-group { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rc-ref-control { grid-template-columns: minmax(0, 1fr) auto; }
+}
 .rc-lock { display: flex; align-items: center; gap: 5px; font-size: 10px; color: #9bb2c9; }
 .rc-lock input { accent-color: #278aff; }
 .rc-transmit { display: grid; gap: 7px; width: 100%; text-align: center; margin-top: auto; }
@@ -180,7 +206,8 @@
 #rc-spectrum { height: clamp(130px, 20vh, 250px); }
 #rc-waterfall { height: clamp(60px, 8vh, 105px); }
 .rc-scope-axis { font-size: clamp(9px, .8vw, 12px); padding: 4px 12px; }
-.rc-deck { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: clamp(7px, .8vw, 13px); }
+.rc-deck { grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: clamp(6px, .7vw, 11px); }
+.rc-swap { padding: 5px 7px; font-size: 12px; }
 .rc-path { container-type: inline-size; padding: clamp(8px, .9vw, 14px); border-top-width: 1px; }
 .rc-path.is-target { border-color: #159aca; box-shadow: inset 0 1px 0 #1ecbff33; }
 .rc-path-heading h2 { font-size: clamp(14px, 1.25vw, 20px); gap: 7px; }

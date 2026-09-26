@@ -9,10 +9,7 @@ venv/
 .ruff_cache/
 data/tle_cache/
 data/tls/
-data/sstv/
 data/aprs/
-sstv_decoder/target/
-bin/pi-sat-sstv-decoder*
 pi-sat-controller.conf
 update_pi.sh
 /tests/

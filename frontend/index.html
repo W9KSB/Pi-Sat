@@ -563,87 +563,6 @@
             </div>
           </section>
 
-          <section class="module-view" id="sstv-decoder-page" data-module-view="sstv-decoder" role="tabpanel" aria-labelledby="modules-nav-sstv-decoder" hidden>
-            <div class="sstv-toolbar card">
-              <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
-                <div>
-                  <div class="d-flex flex-wrap align-items-center gap-2">
-                  <h2 class="h5 mb-0">SSTV Decoder</h2>
-                    <span id="sstv-state" class="sstv-state-badge">Disabled</span>
-                  </div>
-                  <p id="sstv-detail" class="text-body-secondary small mb-0 mt-2">Decoder is off. Radio audio continues normally.</p>
-                </div>
-                <div class="d-flex align-items-center gap-2 flex-shrink-0">
-                  <input type="range" class="form-range module-level-slider" id="sstv-rx-gain" min="-30" max="12" step="1" value="-6"
-                         title="Decoder input level" aria-label="Decoder input level">
-                  <output class="small text-body-secondary module-level-value" id="sstv-rx-gain-value" for="sstv-rx-gain">-6 dB</output>
-                  <button type="button" id="sstv-enable" class="btn btn-primary" aria-pressed="false">Enable</button>
-                </div>
-              </div>
-            </div>
-
-            <div class="row g-3">
-              <section class="col-12 col-xl-8">
-                <div class="card h-100">
-                  <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
-                    <h3 class="h6 mb-0">Live Decode</h3>
-                    <span id="sstv-progress-label" class="small text-body-secondary">0%</span>
-                  </div>
-                  <div class="card-body">
-                    <div id="sstv-active-indicator" class="sstv-active-indicator mb-3" role="status" aria-live="polite" hidden>
-                      <span class="sstv-active-dot" aria-hidden="true"></span>
-                      <strong>Image decoding in progress</strong>
-                      <span id="sstv-active-mode"></span>
-                    </div>
-                    <div class="progress sstv-progress" role="progressbar" aria-label="SSTV decode progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-                      <div id="sstv-progress" class="progress-bar" style="width: 0%"></div>
-                    </div>
-                    <div id="sstv-canvas-wrap" class="sstv-canvas-wrap mt-3">
-                      <canvas id="sstv-canvas" aria-label="Live SSTV image"></canvas>
-                      <p id="sstv-canvas-empty" class="text-body-secondary mb-0">Enable the decoder to listen for an SSTV transmission.</p>
-                    </div>
-                  </div>
-                </div>
-              </section>
-              <section class="col-12 col-xl-4">
-                <div class="card h-100">
-                  <div class="card-header"><h3 class="h6 mb-0">Decoder Status</h3></div>
-                  <div class="card-body">
-                    <dl class="sstv-readouts mb-0">
-                      <div><dt>Mode</dt><dd id="sstv-mode">--</dd></div>
-                      <div><dt>Line</dt><dd id="sstv-line">--</dd></div>
-                      <div><dt>Audio source</dt><dd id="sstv-source">Native IC-9700 SUB/RX PCM</dd></div>
-                      <div><dt>Engine</dt><dd id="sstv-engine">slowrx.rs 0.5.3</dd></div>
-                      <div><dt>Decoder level</dt><dd id="sstv-decoder-level">silent</dd></div>
-                    </dl>
-                    <p class="small text-body-secondary mt-3 mb-0">SSTV decoding powered by slowrx.rs, based on slowrx by Oona Räisänen (OH2EIQ).</p>
-                  </div>
-                </div>
-              </section>
-            </div>
-
-            <section class="card">
-              <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
-                <h3 class="h6 mb-0">Recent Images</h3>
-                <span class="small text-body-secondary">Latest 25 completed decodes</span>
-              </div>
-              <div class="card-body">
-                <div id="sstv-gallery" class="sstv-gallery">
-                  <p class="text-body-secondary mb-0">No completed SSTV images yet.</p>
-                </div>
-              </div>
-            </section>
-
-            <dialog id="sstv-image-dialog" class="sstv-image-dialog">
-              <form method="dialog" class="d-flex justify-content-end"><button class="btn btn-sm btn-outline-light" aria-label="Close image">Close</button></form>
-              <img id="sstv-large-image" alt="Completed SSTV decode">
-              <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3">
-                <p id="sstv-large-meta" class="small text-body-secondary mb-0"></p>
-                <a id="sstv-large-download" class="btn btn-sm btn-outline-info" href="#" download>Download</a>
-              </div>
-            </dialog>
-          </section>
-
           <section class="module-view" id="aprs-page" data-module-view="aprs" role="tabpanel" aria-labelledby="modules-nav-aprs" hidden>
             <div class="aprs-toolbar card">
               <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
@@ -694,7 +613,7 @@
                     <input type="text" class="form-control form-control-sm" id="aprs-tx-addressee" maxlength="9" placeholder="Callsign" aria-label="APRS message addressee" disabled>
                     <input type="text" class="form-control form-control-sm" id="aprs-tx-text" maxlength="67" placeholder="Message" aria-label="APRS message text" disabled>
                   </div>
-                  <dl class="sstv-readouts mt-3 mb-0">
+                  <dl class="module-readouts mt-3 mb-0">
                     <div><dt>Status</dt><dd id="aprs-tx-state">Disarmed</dd></div>
                     <div><dt>Last transmit</dt><dd id="aprs-tx-last">Never</dd></div>
                   </dl>
@@ -705,7 +624,7 @@
 
             <section class="aprs-meta card">
               <div class="card-body">
-                <dl class="sstv-readouts mb-0">
+                <dl class="module-readouts mb-0">
                   <div><dt>Audio source</dt><dd id="aprs-source">Native IC-9700 RX PCM</dd></div>
                   <div><dt>Engine</dt><dd id="aprs-engine">Dire Wolf</dd></div>
                   <div><dt>Packets</dt><dd id="aprs-count">0 received</dd></div>
@@ -761,7 +680,6 @@
     <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
   <script src="/app.js?v=20260916-uplink1"></script>
   <script src="/radio-console.js?v=20260916-uplink1"></script>
-    <script src="/sstv.js?v=20260909-sstv2"></script>
     <script src="/aprs.js?v=20260914-aprs4"></script>
   </body>
 </html>

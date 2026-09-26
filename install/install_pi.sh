@@ -7,7 +7,7 @@ REPO_URL="${REPO_URL:-https://github.com/W9KSB/Pi-Sat.git}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/pi-sat}"
 RUN_USER="$(id -un)"
 STEP=0
-TOTAL_STEPS=8
+TOTAL_STEPS=7
 
 log_step() {
   STEP=$((STEP + 1))
@@ -39,8 +39,8 @@ echo "That is normal."
 log_step "Installing system packages"
 log_info "Running apt update"
 sudo apt update
-log_info "Installing Python, Git, Hamlib, Dire Wolf, coturn, and the Rust build toolchain"
-sudo apt install -y python3-venv python3-pip git libhamlib-utils direwolf coturn cargo build-essential
+log_info "Installing Python, Git, Hamlib, and Dire Wolf"
+sudo apt install -y python3-venv python3-pip git libhamlib-utils direwolf
 log_info "Granting the service user serial-device access"
 sudo usermod -aG dialout "${RUN_USER}"
 
@@ -107,20 +107,6 @@ python -m pip install --upgrade pip
 log_info "Installing Python dependencies from requirements.txt"
 python -m pip install -r requirements.txt
 
-log_step "Building the slowrx.rs SSTV decoder"
-RUST_VERSION="$(rustc --version | awk '{print $2}')"
-RUST_MAJOR="$(printf '%s' "${RUST_VERSION}" | cut -d. -f1)"
-RUST_MINOR="$(printf '%s' "${RUST_VERSION}" | cut -d. -f2)"
-if [ "${RUST_MAJOR}" -lt 1 ] || { [ "${RUST_MAJOR}" -eq 1 ] && [ "${RUST_MINOR}" -lt 85 ]; }; then
-  echo "slowrx.rs requires Rust 1.85 or newer; installed version is ${RUST_VERSION}."
-  echo "Install a current Rust toolchain, then run this installer again."
-  exit 1
-fi
-cargo build --locked --release --manifest-path sstv_decoder/Cargo.toml
-mkdir -p bin
-install -m 0755 sstv_decoder/target/release/pi-sat-sstv-decoder bin/pi-sat-sstv-decoder
-log_info "Installed the persistent decoder worker in ${INSTALL_DIR}/bin"
-
 log_step "Checking Dire Wolf for the APRS module"
 if command -v direwolf >/dev/null 2>&1; then
   log_info "Dire Wolf is available at $(command -v direwolf)"
@@ -129,15 +115,7 @@ else
 fi
 
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-STUN_SERVICE_NAME="pi-sat-stun"
-STUN_SERVICE_FILE="/etc/systemd/system/${STUN_SERVICE_NAME}.service"
-TURN_BIN="$(command -v turnserver || true)"
-if [ -z "${TURN_BIN}" ]; then
-  echo "coturn installed but turnserver was not found on PATH."
-  exit 1
-fi
 TMP_SERVICE="$(mktemp)"
-TMP_STUN_SERVICE="$(mktemp)"
 
 log_step "Installing systemd service"
 log_info "Writing service file to ${SERVICE_FILE}"
@@ -163,29 +141,6 @@ EOF
 sudo install -m 0644 "${TMP_SERVICE}" "${SERVICE_FILE}"
 rm -f "${TMP_SERVICE}"
 
-log_info "Writing local STUN service file to ${STUN_SERVICE_FILE}"
-cat > "${TMP_STUN_SERVICE}" <<EOF
-[Unit]
-Description=Pi-Sat local STUN service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=${TURN_BIN} -c ${INSTALL_DIR}/install/pi-sat-stun.conf
-Restart=on-failure
-RestartSec=5
-User=turnserver
-Group=turnserver
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo install -m 0644 "${TMP_STUN_SERVICE}" "${STUN_SERVICE_FILE}"
-rm -f "${TMP_STUN_SERVICE}"
-
 if sudo systemctl list-unit-files | grep -q '^sat-controller\.service'; then
   log_info "Removing older sat-controller service name"
   sudo systemctl disable --now sat-controller >/dev/null 2>&1 || true
@@ -195,10 +150,19 @@ fi
 log_step "Enabling and starting Pi-Sat"
 log_info "Reloading systemd"
 sudo systemctl daemon-reload
-log_info "Enabling ${STUN_SERVICE_NAME}"
-sudo systemctl enable "${STUN_SERVICE_NAME}"
-log_info "Starting or restarting ${STUN_SERVICE_NAME}"
-sudo systemctl restart "${STUN_SERVICE_NAME}"
+# Pi-Sat no longer runs a local STUN service. Retire the unit an earlier
+# install added, and the coturn package it existed for, so the station stops
+# listening on UDP 3478 and nothing reintroduces it.
+if sudo systemctl list-unit-files | grep -q '^pi-sat-stun\.service'; then
+  log_info "Removing the retired local STUN service"
+  sudo systemctl disable --now pi-sat-stun >/dev/null 2>&1 || true
+  sudo rm -f /etc/systemd/system/pi-sat-stun.service
+  sudo systemctl daemon-reload
+fi
+if dpkg -s coturn >/dev/null 2>&1; then
+  log_info "Removing coturn, which Pi-Sat installed only for that STUN service"
+  sudo apt-get purge -y coturn >/dev/null 2>&1 || log_info "coturn could not be removed automatically"
+fi
 log_info "Enabling ${SERVICE_NAME}"
 sudo systemctl enable "${SERVICE_NAME}"
 log_info "Starting or restarting ${SERVICE_NAME} with the installed code"
@@ -208,8 +172,6 @@ echo ""
 echo "Install complete."
 echo "Service: sudo systemctl status ${SERVICE_NAME}"
 echo "Logs:    journalctl -u ${SERVICE_NAME} -f"
-echo "STUN:    sudo systemctl status ${STUN_SERVICE_NAME}"
-echo "STUN logs: journalctl -u ${STUN_SERVICE_NAME} -f"
 echo "Default URL: https://$(hostname -I | awk '{print $1}')"
 echo "Custom ports / HTTP opt-out: see [server] in pi-sat-controller.conf."
 echo "First HTTPS start generates a self-signed certificate using OpenSSL if none exists."

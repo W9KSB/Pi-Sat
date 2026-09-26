@@ -13,7 +13,7 @@ from array import array
 
 RX_GAIN_MIN_DB = -30.0
 RX_GAIN_MAX_DB = 12.0
-# Dire Wolf and slowrx both decode best with the audio near half scale.
+# Dire Wolf decodes best with the audio near half scale.
 RX_GAIN_DEFAULT_DB = -6.0
 
 _S16_MAX = 32767

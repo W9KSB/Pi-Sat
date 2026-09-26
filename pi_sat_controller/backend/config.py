@@ -164,11 +164,6 @@ class AprsConfig:
 
 
 @dataclass(frozen=True)
-class SstvConfig:
-    rx_gain_db: float
-
-
-@dataclass(frozen=True)
 class AppConfig:
     server: ServerConfig
     station: StationConfig
@@ -182,7 +177,6 @@ class AppConfig:
     safety: SafetyConfig
     icom: IcomConfig
     aprs: AprsConfig
-    sstv: SstvConfig
 
 
 def _decode_source_url(value: str) -> str:
@@ -308,7 +302,6 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             min_interval_s=_get_int(parser, "aprs", "min_interval_s", 30),
             rx_gain_db=_get_rx_gain_db(parser, "aprs"),
         ),
-        sstv=SstvConfig(rx_gain_db=_get_rx_gain_db(parser, "sstv")),
     )
 
 
@@ -613,9 +606,6 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "min_interval_s",
         "rx_gain_db",
     ],
-    "sstv": [
-        "rx_gain_db",
-    ],
 }
 
 
@@ -765,9 +755,6 @@ def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str,
         for key, default in aprs_defaults.items():
             if not str(settings["aprs"].get(key, "")).strip():
                 settings["aprs"][key] = default
-    if "sstv" in settings:
-        if not str(settings["sstv"].get("rx_gain_db", "")).strip():
-            settings["sstv"]["rx_gain_db"] = f"{RX_GAIN_DEFAULT_DB:g}"
     if parser.has_section("my_satellites"):
         for key, value in parser.items("my_satellites"):
             if key.startswith("satellite_"):
@@ -1031,11 +1018,6 @@ def _render_settings(
     lines.append("# Pi-Sat sends it through the native radio. An empty mycall disables transmit.")
     lines.append("# channel selects the decoder side: main (left) or right, or both.")
     _append_keys(lines, values, SETTINGS_SCHEMA["aprs"])
-    lines.append("")
-    values = section("sstv")
-    lines.append("# Level trim in dB for the copy of the receive audio handed to the")
-    lines.append("# SSTV decoder. It never changes the radio or the browser audio.")
-    _append_keys(lines, values, SETTINGS_SCHEMA["sstv"])
     lines.append("")
     return "\n".join(lines)
 

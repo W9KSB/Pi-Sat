@@ -578,7 +578,13 @@ class RxTrackingManager:
                     )
 
             tx_readback = _ReadbackDelta(frequency_hz=None, delta_hz=None)
-            if not self._rx_only and self.tx_radio_manager and plan.uplink_hz is not None:
+            if self._radio_is_transmitting(self.tx_radio_manager):
+                # A burst owns the transmit band until it ends. Moving it mid
+                # frame corrupts the modulation, and every readback would cost a
+                # CI-V round trip the burst is waiting on for its own PTT and
+                # audio. The next cycle resumes tracking once the key is clear.
+                skip_tx_write = True
+            elif not self._rx_only and self.tx_radio_manager and plan.uplink_hz is not None:
                 tx_readback = self._read_tx_frequency_for_reconciliation(
                     tracking_active,
                     pass_active,
@@ -1026,6 +1032,16 @@ class RxTrackingManager:
         setter = getattr(self.sdr_manager, "set_background_polling_enabled", None)
         if setter is not None:
             setter(enabled)
+
+    @staticmethod
+    def _radio_is_transmitting(radio_manager) -> bool:
+        """Whether the native radio currently has a key asserted.
+
+        Only the native controller owns a commanded key; a polled client has no
+        transmit state Pi-Sat controls, so it never blocks a write.
+        """
+        client = getattr(radio_manager, "client", None)
+        return getattr(client, "transmit_active", False) is True
 
     def _radio_operation_batch(self):
         radio_manager = getattr(self.sdr_manager, "radio_manager", None)
