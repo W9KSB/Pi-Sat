@@ -44,6 +44,8 @@ let qsoOpportunities = [];
 let selectedQsoOpportunityIndex = -1;
 const PAGE_NAMES = ['home', 'radio', 'satellites', 'modules', 'monitor', 'settings'];
 const MODULE_NAV = [
+  { id: 'audio-stream', label: 'RX Audio Stream' },
+  { id: 'sstv-decoder', label: 'SSTV Decoder' },
   { id: 'qso-finder', label: 'QSO Finder' },
   { id: 'map', label: 'Map' },
   { id: 'aprs', label: 'APRS' },
@@ -1145,6 +1147,8 @@ function showPage(pageName) {
   } else if (selectedPage === 'map') {
     loadTrackedSatelliteLocations();
     drawTrackedSatellitesMap();
+  } else if (selectedPage === 'audio-stream') {
+    window.AudioStreamModule?.load();
   } else if (selectedPage === 'radio') {
     loadRadioState();
   } else {
@@ -2469,12 +2473,13 @@ async function loadSettings() {
       rotator: 'devices',
       automation: 'application',
       aprs: 'other',
+      sstv: 'other',
       safety: 'other',
     };
     const appendToSettingsPanel = (source, element) => {
       panels.get(settingsPanelBySource[source] || 'other').appendChild(element);
     };
-    const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'aprs', 'safety'];
+    const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'aprs', 'sstv', 'safety'];
     orderedSections.forEach((section) => {
       if (section === 'device_roles') {
         appendToSettingsPanel(section,

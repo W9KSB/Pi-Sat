@@ -563,6 +563,84 @@
             </div>
           </section>
 
+          <section class="module-view" id="audio-stream-page" data-module-view="audio-stream" role="tabpanel" aria-labelledby="modules-nav-audio-stream" hidden>
+            <div class="audio-stream-toolbar card">
+              <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
+                <div>
+                  <div class="d-flex flex-wrap align-items-center gap-2">
+                    <h2 class="h5 mb-0">RX Audio Stream</h2>
+                    <span id="audio-stream-state" class="audio-stream-state-badge">Disabled</span>
+                  </div>
+                  <p id="audio-stream-detail" class="text-body-secondary small mb-0 mt-2">Passive listener is disabled in the config file.</p>
+                </div>
+                <div class="small text-body-secondary">Mono SUB/RX only · read-only audio fan-out</div>
+              </div>
+            </div>
+            <div class="row g-3">
+              <section class="col-12 col-xl-5">
+                <div class="card h-100"><div class="card-header"><h3 class="h6 mb-0">Server</h3></div><div class="card-body"><dl class="audio-stream-readouts mb-0">
+                  <div><dt>Status</dt><dd id="audio-stream-running">--</dd></div>
+                  <div><dt>Bind address</dt><dd id="audio-stream-address">--</dd></div>
+                  <div><dt>Port</dt><dd id="audio-stream-port">--</dd></div>
+                  <div><dt>Connected clients</dt><dd id="audio-stream-listeners">0</dd></div>
+                  <div><dt>Client limit</dt><dd id="audio-stream-client-limit">--</dd></div>
+                  <div><dt>Audio source</dt><dd id="audio-stream-source">Existing Pi-Sat RX PCM</dd></div>
+                </dl></div></div>
+              </section>
+              <section class="col-12 col-xl-7">
+                <div class="card h-100"><div class="card-header"><h3 class="h6 mb-0">Stream Statistics</h3></div><div class="card-body"><dl class="audio-stream-readouts mb-0">
+                  <div><dt>Audio frames sent</dt><dd id="audio-stream-frames">0</dd></div>
+                  <div><dt>Audio bytes sent</dt><dd id="audio-stream-bytes">0</dd></div>
+                  <div><dt>Accepted connections</dt><dd id="audio-stream-accepted">0</dd></div>
+                  <div><dt>Refused connections</dt><dd id="audio-stream-refused">0</dd></div>
+                  <div><dt>Overflow drops</dt><dd id="audio-stream-drops">0</dd></div>
+                  <div><dt>Last error</dt><dd id="audio-stream-error">None</dd></div>
+                </dl></div></div>
+              </section>
+            </div>
+            <p class="small text-body-secondary mt-3 mb-0">Enable this listener in <code>[audio_stream]</code> in the Pi-Sat config file. It becomes active only when an external client connects and never controls the radio.</p>
+          </section>
+
+          <section class="module-view" id="sstv-decoder-page" data-module-view="sstv-decoder" role="tabpanel" aria-labelledby="modules-nav-sstv-decoder" hidden>
+            <div class="sstv-toolbar card">
+              <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
+                <div>
+                  <div class="d-flex flex-wrap align-items-center gap-2">
+                    <h2 class="h5 mb-0">SSTV Decoder</h2>
+                    <span id="sstv-state" class="sstv-state-badge">Disabled</span>
+                  </div>
+                  <p id="sstv-detail" class="text-body-secondary small mb-0 mt-2">Decoder is off. Radio audio continues normally.</p>
+                </div>
+                <div class="d-flex align-items-center gap-2 flex-shrink-0">
+                  <input type="range" class="form-range module-level-slider" id="sstv-rx-gain" min="-30" max="12" step="1" value="-6" title="Decoder input level" aria-label="Decoder input level">
+                  <output class="small text-body-secondary module-level-value" id="sstv-rx-gain-value" for="sstv-rx-gain">-6 dB</output>
+                  <button type="button" id="sstv-enable" class="btn btn-primary" aria-pressed="false">Enable</button>
+                </div>
+              </div>
+            </div>
+            <div class="row g-3">
+              <section class="col-12 col-xl-8">
+                <div class="card h-100"><div class="card-header d-flex justify-content-between gap-2"><h3 class="h6 mb-0">Live Decode</h3><span id="sstv-progress-label" class="small text-body-secondary">0%</span></div><div class="card-body">
+                  <div id="sstv-active-indicator" class="sstv-active-indicator mb-3" role="status" aria-live="polite" hidden><span class="sstv-active-dot" aria-hidden="true"></span><strong>Image decoding in progress</strong><span id="sstv-active-mode"></span></div>
+                  <div class="progress sstv-progress" role="progressbar" aria-label="SSTV decode progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="sstv-progress" class="progress-bar" style="width: 0%"></div></div>
+                  <div id="sstv-canvas-wrap" class="sstv-canvas-wrap mt-3"><canvas id="sstv-canvas" aria-label="Live SSTV image"></canvas><p id="sstv-canvas-empty" class="text-body-secondary mb-0">Enable the decoder to listen for an SSTV transmission.</p></div>
+                </div></div>
+              </section>
+              <section class="col-12 col-xl-4"><div class="card h-100"><div class="card-header"><h3 class="h6 mb-0">Decoder Status</h3></div><div class="card-body"><dl class="sstv-readouts mb-0">
+                <div><dt>Mode</dt><dd id="sstv-mode">--</dd></div><div><dt>Line</dt><dd id="sstv-line">--</dd></div><div><dt>Quality</dt><dd id="sstv-quality">--</dd></div><div><dt>Audio losses</dt><dd id="sstv-losses">0</dd></div><div><dt>Audio source</dt><dd id="sstv-source">Native IC-9700 SUB/RX PCM</dd></div><div><dt>Engine</dt><dd id="sstv-engine">slowrx.rs 0.5.3</dd></div><div><dt>Decoder level</dt><dd id="sstv-decoder-level">silent</dd></div>
+              </dl><p class="small text-body-secondary mt-3 mb-0">SSTV decoding powered by slowrx.rs, based on slowrx by Oona Raisanen (OH2EIQ).</p></div></div></section>
+            </div>
+            <section class="card sstv-upload-card"><div class="card-header"><h3 class="h6 mb-0">Decode a recording</h3></div><div class="card-body">
+              <form id="sstv-upload-form" class="row g-2 align-items-end">
+                <div class="col-12 col-lg"><label class="form-label small" for="sstv-upload-file">MP3 or WAV recording</label><input class="form-control" id="sstv-upload-file" name="file" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav,audio/x-wav" required></div>
+                <div class="col-12 col-lg-auto"><button class="btn btn-outline-info" id="sstv-upload-submit" type="submit">Decode recording</button></div>
+              </form>
+              <p id="sstv-upload-status" class="small text-body-secondary mb-0 mt-2" role="status" aria-live="polite">The audio file is temporary and is deleted after processing.</p>
+            </div></section>
+            <section class="card"><div class="card-header d-flex justify-content-between gap-2"><h3 class="h6 mb-0">Recent Images</h3><span class="small text-body-secondary">Latest 25 captures</span></div><div class="card-body"><div id="sstv-gallery" class="sstv-gallery"><p class="text-body-secondary mb-0">No SSTV images yet.</p></div></div></section>
+            <dialog id="sstv-image-dialog" class="sstv-image-dialog"><form method="dialog" class="d-flex justify-content-end"><button class="btn btn-sm btn-outline-light" aria-label="Close image">Close</button></form><img id="sstv-large-image" alt="Completed SSTV decode"><div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3"><p id="sstv-large-meta" class="small text-body-secondary mb-0"></p><a id="sstv-large-download" class="btn btn-sm btn-outline-info" href="#" download>Download</a></div></dialog>
+          </section>
+
           <section class="module-view" id="aprs-page" data-module-view="aprs" role="tabpanel" aria-labelledby="modules-nav-aprs" hidden>
             <div class="aprs-toolbar card">
               <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
@@ -679,7 +757,9 @@
     </footer>
     <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
   <script src="/app.js?v=20260916-uplink1"></script>
-  <script src="/radio-console.js?v=20260916-uplink1"></script>
+    <script src="/radio-console.js?v=20260916-uplink1"></script>
+    <script src="/audio-stream.js?v=20260927-passive1"></script>
+    <script src="/sstv.js?v=20260926-loss-aware"></script>
     <script src="/aprs.js?v=20260914-aprs4"></script>
   </body>
 </html>

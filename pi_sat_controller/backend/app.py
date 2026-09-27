@@ -28,6 +28,7 @@ from pi_sat_controller.backend.api_satellites import register_satellites_api
 from pi_sat_controller.backend.api_settings import register_settings_api
 from pi_sat_controller.backend.api_system import register_system_api
 from pi_sat_controller.backend.api_tracking import register_tracking_api
+from pi_sat_controller.backend.api_audio_stream import register_audio_stream_api
 from pi_sat_controller.backend.automation_scripts import (
     list_automation_scripts,
     run_automation_script,
@@ -84,8 +85,13 @@ from pi_sat_controller.backend.radio.icom_lan_controller import (
     IcomLanController,
 )
 from pi_sat_controller.backend.radio.icom_radio_controller import IcomRadioController
+from pi_sat_controller.backend.radio.audio_stream_server import (
+    RxAudioStreamServer,
+    radio_channels,
+)
 from pi_sat_controller.backend.radio.native_icom_tracking import NativeIcomTrackingRole
 from pi_sat_controller.backend.api_radio import register_radio_api
+from pi_sat_controller.backend.api_sstv import register_sstv_api
 from pi_sat_controller.backend.api_aprs import register_aprs_api
 from pi_sat_controller.backend.runtime_fallbacks import (
     DisabledTrackingSdrManager,
@@ -107,6 +113,7 @@ from pi_sat_controller.backend.sdr.polling_sdr import (
 )
 from pi_sat_controller.backend.aprs.manager import AprsManager
 from pi_sat_controller.backend.aprs.transmit import AprsTransmitter
+from pi_sat_controller.backend.sstv.manager import SstvManager
 from pi_sat_controller.backend.models import (SatellitePass, SatelliteProfile)
 
 logging.basicConfig(
@@ -170,6 +177,8 @@ rx_tracking_manager: RxTrackingManager | None = None
 rotator_manager: RotatorManager | None = None
 tx_radio_manager: RadioManager | None = None
 icom_controller: IcomRadioController | None = None
+audio_stream_server: RxAudioStreamServer | None = None
+audio_stream_error: str | None = None
 pass_cache_lock = Lock()
 pass_cache: list[SatellitePass] = []
 pass_cache_refreshed_at_utc: str | None = None
@@ -185,6 +194,35 @@ hamlib_radio_models_cache: list[dict[str, object]] = []
 hamlib_radio_models_error: str | None = None
 hamlib_rotator_models_cache: list[dict[str, object]] = []
 hamlib_rotator_models_error: str | None = None
+
+
+def _sstv_capture_context() -> dict[str, object]:
+    frequency_hz = None
+    satellite = None
+    controller = icom_controller
+    if controller is not None:
+        try:
+            radio = controller.try_snapshot()
+            if radio is not None:
+                frequency_hz = radio.get("sub", {}).get("frequency_hz")
+        except Exception:
+            pass
+    manager = rx_tracking_manager
+    if manager is not None:
+        try:
+            satellite = manager.snapshot().satellite_name
+        except Exception:
+            pass
+    return {"frequency_hz": frequency_hz, "satellite": satellite}
+
+
+sstv_manager = SstvManager(
+    project_root=PROJECT_ROOT,
+    data_dir=PROJECT_ROOT / "data" / "sstv",
+    get_controller=lambda: icom_controller,
+    get_context=_sstv_capture_context,
+    rx_gain_db=configured_rx_gain_db("sstv"),
+)
 
 
 aprs_manager = AprsManager(
@@ -220,8 +258,11 @@ async def lifespan(app: FastAPI):
         _stop_pass_refresh_scheduler()
         _stop_autotrack_scheduler()
         _stop_transponder_refresh_scheduler()
+        sstv_manager.shutdown()
         aprs_manager.shutdown()
         aprs_transmitter.shutdown()
+        if audio_stream_server is not None:
+            audio_stream_server.shutdown()
         _shutdown_runtime()
 
 
@@ -265,6 +306,7 @@ def _build_status_payload() -> dict[str, object]:
                 and config.rx.device_id == NATIVE_ICOM_DEVICE_ID
             ),
         },
+        "audio_stream": _audio_stream_status(),
         "satellite_count": len(satellites),
     }
 
@@ -687,6 +729,68 @@ def _shutdown_runtime(
             LOGGER.exception("Native Icom shutdown failed during runtime reload")
 
 
+def _reload_audio_stream_server(config) -> None:
+    """Apply passive RX audio listener configuration without radio access."""
+
+    global audio_stream_server, audio_stream_error
+    desired = config.audio_stream
+    existing = audio_stream_server
+    if existing is not None:
+        same = (
+            existing.host == desired.bind_host
+            and existing.port == desired.port
+            and existing.channel == desired.channel
+            and existing.sample_rate == config.icom.sample_rate
+            and existing.channels == radio_channels(config.icom.rx_codec)
+        )
+        if same and desired.enabled:
+            return
+        existing.shutdown()
+        audio_stream_server = None
+    audio_stream_error = None
+    if not desired.enabled:
+        return
+    try:
+        server = RxAudioStreamServer(
+            host=desired.bind_host,
+            port=desired.port,
+            channel=desired.channel,
+            sample_rate=config.icom.sample_rate,
+            channels=radio_channels(config.icom.rx_codec),
+            get_controller=lambda: icom_controller,
+        )
+        server.start()
+        audio_stream_server = server
+    except Exception as exc:
+        audio_stream_error = str(exc)
+        LOGGER.warning("RX audio stream startup failed: %s", exc)
+
+
+def _audio_stream_status() -> dict[str, object]:
+    config = load_config().audio_stream
+    if audio_stream_server is not None:
+        status = audio_stream_server.snapshot()
+    else:
+        status = {
+            "enabled": bool(config.enabled),
+            "running": False,
+            "host": config.bind_host,
+            "port": config.port,
+            "channel": config.channel,
+            "listeners": 0,
+            "max_clients": 8,
+            "accepted": 0,
+            "refused": 0,
+            "frames_sent": 0,
+            "audio_bytes": 0,
+            "overflow_dropped": 0,
+            "last_error": audio_stream_error,
+        }
+    status["passive"] = True
+    status["source"] = "Existing Pi-Sat mono SUB/RX PCM fan-out"
+    return status
+
+
 def _reload_runtime_config() -> list[str]:
     with tracking_command_lock:
         return _reload_runtime_config_locked()
@@ -699,6 +803,7 @@ def _reload_runtime_config_locked() -> list[str]:
 
     startup_errors: list[str] = []
     config = load_config()
+    _reload_audio_stream_server(config)
     native_selected = any(
         role.device_id == NATIVE_ICOM_DEVICE_ID
         for role in (config.rx, config.tx)
@@ -1616,6 +1721,12 @@ register_settings_api(
 )
 
 register_radio_api(app, get_controller=lambda: icom_controller)
+register_audio_stream_api(app, get_status=_audio_stream_status)
+register_sstv_api(
+    app,
+    get_manager=lambda: sstv_manager,
+    save_rx_gain=lambda value: save_rx_gain_db("sstv", value),
+)
 register_aprs_api(
     app,
     get_manager=lambda: aprs_manager,

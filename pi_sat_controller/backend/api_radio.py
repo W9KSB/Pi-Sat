@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from pi_sat_controller.backend.radio.audio_websocket import stream_audio, stream_microphone
 from pi_sat_controller.backend.radio.audio_webrtc import (
@@ -15,6 +16,24 @@ from pi_sat_controller.backend.radio.audio_webrtc import (
 from pi_sat_controller.backend.radio.state_websocket import stream_radio_state
 
 LOGGER = logging.getLogger(__name__)
+
+
+async def _close_websocket_safely(
+    websocket: WebSocket,
+    *,
+    code: int,
+    reason: str | None = None,
+) -> None:
+    """Close a socket only when this handler still owns its close state."""
+
+    if websocket.application_state is not WebSocketState.CONNECTED:
+        return
+    try:
+        await websocket.close(code=code, reason=reason)
+    except RuntimeError:
+        # A peer or another task may have completed the close between the
+        # state check and the send.
+        return
 
 
 def register_radio_api(
@@ -256,18 +275,26 @@ def register_radio_api(
         await websocket.accept()
         controller = get_controller()
         if controller is None:
-            await websocket.close(code=1011, reason="Advanced Icom control is disabled")
+            await _close_websocket_safely(
+                websocket,
+                code=1011,
+                reason="Advanced Icom control is disabled",
+            )
             return
         try:
             await stream_audio(websocket, controller, get_controller,
                                holds_microphone=lambda: microphone_sessions > 0)
-            await websocket.close(code=1000, reason="Radio configuration changed")
+            await _close_websocket_safely(
+                websocket,
+                code=1000,
+                reason="Radio configuration changed",
+            )
         except WebSocketDisconnect:
             return
         except Exception as exc:
             # Log RX socket failures so operators can diagnose lost listening audio.
             LOGGER.warning("RX audio session ended: %s", exc)
-            await websocket.close(code=1011)
+            await _close_websocket_safely(websocket, code=1011)
 
     @app.post("/api/radio/audio/webrtc/offer")
     async def radio_audio_webrtc_offer(payload: dict[str, Any] = Body(...)) -> dict[str, str]:

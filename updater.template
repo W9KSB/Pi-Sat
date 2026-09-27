@@ -27,12 +27,6 @@ if [ ! -f "${REPO_ROOT}/requirements.txt" ]; then
   exit 1
 fi
 
-if [ ! -d "${REPO_ROOT}/.venv" ]; then
-  echo "Python virtual environment not found in ${REPO_ROOT}/.venv."
-  echo "Run install/install_pi.sh first."
-  exit 1
-fi
-
 echo "Updating Pi-Sat Controller in: ${REPO_ROOT}"
 
 cd "${REPO_ROOT}"
@@ -67,8 +61,7 @@ fi
 sudo systemctl stop "${SERVICE_NAME}"
 service_stopped=1
 sudo usermod -aG dialout "$(id -un)"
-. .venv/bin/activate
-python -m pip install -r requirements.txt
+sudo python3 -m pip install --break-system-packages -r requirements.txt
 sudo systemctl daemon-reload
 # Pi-Sat no longer runs a local STUN service. Retire the unit an earlier
 # install added, and the coturn package it existed for, so the station stops

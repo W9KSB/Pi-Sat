@@ -14,3 +14,7 @@ pi-sat-controller.conf
 update_pi.sh
 /tests/
 /pi-sat-tests-backup/
+external-streamer/build/
+external-streamer/dist/
+external-streamer/*.exe
+external-streamer/*.spec

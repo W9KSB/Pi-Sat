@@ -133,3 +133,18 @@ min_interval_s = 30
 # APRS decoder. It never changes the radio, the browser audio, or the other
 # modules. Dire Wolf suggests keeping most stations near half scale.
 rx_gain_db = -6
+
+[sstv]
+# Level trim in dB applied only to the copy of receive audio handed to slowrx.
+# It never changes the radio, browser audio, or APRS decoder.
+rx_gain_db = -6
+
+[audio_stream]
+# Passive mono SUB/RX PCM listener for external decoders and audio adapters.
+# This module never controls the radio or participates in CI-V operations.
+enabled = false
+bind_host = 0.0.0.0
+port = 8765
+# Native stereo RX maps SUB/RX to the right side by default. Use both to
+# preserve the untouched interleaved stereo PCM for channel diagnostics.
+channel = right

@@ -21,6 +21,43 @@
   --dashboard-rotator-actions-justify: flex-end;
 }
 
+.sstv-toolbar { border-left: 0.25rem solid var(--bs-info); }
+.audio-stream-toolbar { border-left: 0.25rem solid var(--bs-success); }
+.audio-stream-state-badge { padding: 0.25rem 0.55rem; border: 1px solid var(--app-border); border-radius: 999px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+.audio-stream-state-badge[data-state="listening"] { border-color: var(--bs-success); color: var(--bs-success); }
+.audio-stream-state-badge[data-state="error"] { border-color: var(--bs-danger); color: var(--bs-danger); }
+.audio-stream-readouts { display: grid; gap: 0.7rem; }
+.audio-stream-readouts div { display: grid; grid-template-columns: minmax(10rem, 1fr) minmax(0, 2fr); gap: 0.75rem; padding-bottom: 0.6rem; border-bottom: 1px solid var(--app-border); }
+.audio-stream-readouts dt { color: var(--app-muted); font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+.audio-stream-readouts dd { margin: 0; overflow-wrap: anywhere; }
+.sstv-state-badge { padding: 0.25rem 0.55rem; border: 1px solid var(--app-border); border-radius: 999px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+.sstv-state-badge[data-state="listening"], .sstv-state-badge[data-state="decode-complete"] { border-color: var(--bs-info); color: var(--bs-info); }
+.sstv-state-badge[data-state="sstv-detected"], .sstv-state-badge[data-state="decoding"] { border-color: var(--bs-success); color: var(--bs-success); }
+.sstv-state-badge[data-state="decode-failed"] { border-color: var(--bs-danger); color: var(--bs-danger); }
+.sstv-progress { height: 0.35rem; background: #071018; }
+.sstv-active-indicator { display: flex; align-items: center; gap: 0.5rem; color: #56d890; }
+.sstv-active-indicator[hidden] { display: none; }
+.sstv-active-dot { width: 0.65rem; height: 0.65rem; flex: 0 0 auto; border-radius: 50%; background: currentColor; box-shadow: 0 0 0.65rem rgb(86 216 144 / 80%); }
+#sstv-active-mode { color: var(--app-muted); font-size: 0.8rem; }
+.sstv-canvas-wrap { display: grid; min-height: 22rem; place-items: center; overflow: auto; border: 1px solid var(--app-border); background: #020609; }
+.sstv-canvas-wrap canvas { display: none; width: 100%; max-height: 70vh; object-fit: contain; }
+.sstv-canvas-wrap.has-image canvas { display: block; }
+.sstv-canvas-wrap.has-image p { display: none; }
+.sstv-readouts { display: grid; gap: 0.7rem; }
+.sstv-readouts div { display: grid; gap: 0.1rem; padding-bottom: 0.6rem; border-bottom: 1px solid var(--app-border); }
+.sstv-readouts dt { color: var(--app-muted); font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+.sstv-readouts dd { margin: 0; }
+.sstv-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: 1rem; }
+.sstv-gallery-card { overflow: hidden; border: 1px solid var(--app-border); border-radius: 0.5rem; background: #111820; }
+.sstv-gallery-preview { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
+.sstv-gallery-preview img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; }
+.sstv-gallery-body { display: grid; gap: 0.35rem; padding: 0.8rem; }
+.sstv-gallery-body time, .sstv-gallery-body span { color: var(--app-muted); font-size: 0.75rem; }
+.sstv-gallery-body .btn { justify-self: start; margin-top: 0.25rem; }
+.sstv-image-dialog { width: min(96vw, 1000px); max-width: none; border: 1px solid var(--app-border); background: #081018; color: #fff; }
+.sstv-image-dialog::backdrop { background: rgb(0 0 0 / 80%); }
+.sstv-image-dialog img { display: block; max-width: 100%; max-height: 75vh; margin: 0 auto; }
+
 .radio-state-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

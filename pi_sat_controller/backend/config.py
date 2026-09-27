@@ -26,6 +26,8 @@ LOGGER = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "pi-sat-controller.conf"
+AUDIO_STREAM_DEFAULT_HOST = "0.0.0.0"
+AUDIO_STREAM_DEFAULT_PORT = 8765
 MULTI_URL_SEPARATOR = " || "
 CAT_DEVICE_SECTION_PREFIX = "cat_device_"
 NATIVE_ICOM_DEVICE_ID = "native-ic9700"
@@ -164,6 +166,19 @@ class AprsConfig:
 
 
 @dataclass(frozen=True)
+class SstvConfig:
+    rx_gain_db: float
+
+
+@dataclass(frozen=True)
+class AudioStreamConfig:
+    enabled: bool
+    bind_host: str
+    port: int
+    channel: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     server: ServerConfig
     station: StationConfig
@@ -177,6 +192,8 @@ class AppConfig:
     safety: SafetyConfig
     icom: IcomConfig
     aprs: AprsConfig
+    sstv: SstvConfig
+    audio_stream: AudioStreamConfig
 
 
 def _decode_source_url(value: str) -> str:
@@ -301,6 +318,15 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             amplitude=_get_int(parser, "aprs", "amplitude", 100),
             min_interval_s=_get_int(parser, "aprs", "min_interval_s", 30),
             rx_gain_db=_get_rx_gain_db(parser, "aprs"),
+        ),
+        sstv=SstvConfig(rx_gain_db=_get_rx_gain_db(parser, "sstv")),
+        audio_stream=AudioStreamConfig(
+            # Config-file only: this listener carries unauthenticated PCM on the
+            # LAN, so it stays off until an operator turns it on deliberately.
+            enabled=_get_bool(parser, "audio_stream", "enabled", False),
+            bind_host=_get_text(parser, "audio_stream", "bind_host", AUDIO_STREAM_DEFAULT_HOST),
+            port=_get_int(parser, "audio_stream", "port", AUDIO_STREAM_DEFAULT_PORT),
+            channel=_get_audio_stream_channel(parser),
         ),
     )
 
@@ -507,6 +533,13 @@ def _get_rx_gain_db(parser: ConfigParser, section: str) -> float:
         raise ValueError(f"[{section}] rx_gain_db: {exc}") from exc
 
 
+def _get_audio_stream_channel(parser: ConfigParser) -> str:
+    value = parser.get("audio_stream", "channel", fallback="right").strip().lower()
+    if value not in {"left", "right", "both"}:
+        raise ValueError("[audio_stream] channel must be left, right, or both")
+    return value
+
+
 CAT_DEVICE_FIELDS = [
     "name",
     "connectivity",
@@ -605,6 +638,15 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "amplitude",
         "min_interval_s",
         "rx_gain_db",
+    ],
+    "sstv": [
+        "rx_gain_db",
+    ],
+    "audio_stream": [
+        "enabled",
+        "bind_host",
+        "port",
+        "channel",
     ],
 }
 
@@ -755,6 +797,18 @@ def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str,
         for key, default in aprs_defaults.items():
             if not str(settings["aprs"].get(key, "")).strip():
                 settings["aprs"][key] = default
+    if "sstv" in settings and not str(settings["sstv"].get("rx_gain_db", "")).strip():
+        settings["sstv"]["rx_gain_db"] = f"{RX_GAIN_DEFAULT_DB:g}"
+    if "audio_stream" in settings:
+        audio_stream_defaults = {
+            "enabled": "false",
+            "bind_host": AUDIO_STREAM_DEFAULT_HOST,
+            "port": str(AUDIO_STREAM_DEFAULT_PORT),
+            "channel": "right",
+        }
+        for key, default in audio_stream_defaults.items():
+            if not str(settings["audio_stream"].get(key, "")).strip():
+                settings["audio_stream"][key] = default
     if parser.has_section("my_satellites"):
         for key, value in parser.items("my_satellites"):
             if key.startswith("satellite_"):
@@ -1018,6 +1072,15 @@ def _render_settings(
     lines.append("# Pi-Sat sends it through the native radio. An empty mycall disables transmit.")
     lines.append("# channel selects the decoder side: main (left) or right, or both.")
     _append_keys(lines, values, SETTINGS_SCHEMA["aprs"])
+    lines.append("")
+    values = section("sstv")
+    lines.append("# Level trim in dB for the copy of receive audio handed to the SSTV decoder.")
+    lines.append("# It never changes the radio or browser audio.")
+    _append_keys(lines, values, SETTINGS_SCHEMA["sstv"])
+    lines.append("")
+    values = section("audio_stream")
+    lines.append("# Passive mono SUB/RX PCM for external listeners; no radio control is performed.")
+    _append_keys(lines, values, SETTINGS_SCHEMA["audio_stream"])
     lines.append("")
     return "\n".join(lines)
 

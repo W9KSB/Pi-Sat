@@ -19,6 +19,9 @@ MANUAL_ONLY_SETTINGS: dict[str, set[str]] = {
     # hand, and it is preserved across settings saves.
     "icom": {"connectivity", "tx_codec"},
     "tx": {"shared_local_split_mode"},
+    # The listener exposes status in its module page; binding and enablement
+    # remain config-file-only so a browser cannot unexpectedly open a PCM port.
+    "audio_stream": {"enabled", "bind_host", "port", "channel"},
 }
 
 

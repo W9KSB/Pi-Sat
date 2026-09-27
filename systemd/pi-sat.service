@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=/home/REPLACE_WITH_INSTALL_USER/pi-sat
-ExecStart=/home/REPLACE_WITH_INSTALL_USER/pi-sat/.venv/bin/python -m pi_sat_controller.backend.run_server
+ExecStart=/usr/bin/python3 -m pi_sat_controller.backend.run_server
 Restart=on-failure
 RestartSec=5
 User=REPLACE_WITH_INSTALL_USER

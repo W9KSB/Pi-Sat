@@ -39,8 +39,8 @@ echo "That is normal."
 log_step "Installing system packages"
 log_info "Running apt update"
 sudo apt update
-log_info "Installing Python, Git, Hamlib, and Dire Wolf"
-sudo apt install -y python3-venv python3-pip git libhamlib-utils direwolf
+log_info "Installing host-level Python, Git, Hamlib, ffmpeg, and Dire Wolf"
+sudo apt install -y python3 python3-pip git ffmpeg libhamlib-utils direwolf
 log_info "Granting the service user serial-device access"
 sudo usermod -aG dialout "${RUN_USER}"
 
@@ -68,6 +68,19 @@ else
 fi
 
 cd "${INSTALL_DIR}"
+
+if [ ! -f bin/pi-sat-sstv-decoder ]; then
+  echo "Missing bundled SSTV decoder: ${INSTALL_DIR}/bin/pi-sat-sstv-decoder"
+  exit 1
+fi
+chmod +x bin/pi-sat-sstv-decoder
+if command -v file >/dev/null 2>&1; then
+  file_output="$(file -b bin/pi-sat-sstv-decoder)"
+  case "${file_output}" in
+    *"ELF 64-bit"*"ARM aarch64"*) : ;;
+    *) echo "Bundled SSTV decoder is not a 64-bit AArch64 ELF: ${file_output}"; exit 1 ;;
+  esac
+fi
 
 log_step "Ensuring local runtime files"
 created_runtime_file=0
@@ -98,14 +111,11 @@ if [ "${created_runtime_file}" -eq 0 ]; then
   log_info "Local runtime files already exist"
 fi
 
-log_step "Creating Python environment"
-log_info "Creating virtual environment in ${INSTALL_DIR}/.venv"
-python3 -m venv .venv
-. .venv/bin/activate
-log_info "Upgrading pip"
-python -m pip install --upgrade pip
+log_step "Installing host-level Python dependencies"
+PYTHON_BIN="$(command -v python3)"
+log_info "Using ${PYTHON_BIN}"
 log_info "Installing Python dependencies from requirements.txt"
-python -m pip install -r requirements.txt
+sudo "${PYTHON_BIN}" -m pip install --break-system-packages -r requirements.txt
 
 log_step "Checking Dire Wolf for the APRS module"
 if command -v direwolf >/dev/null 2>&1; then
@@ -127,7 +137,7 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/.venv/bin/python -m pi_sat_controller.backend.run_server
+ExecStart=${PYTHON_BIN} -m pi_sat_controller.backend.run_server
 Restart=on-failure
 RestartSec=5
 User=${RUN_USER}

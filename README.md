@@ -33,6 +33,7 @@ compatibility problems or hardware-specific behavior in
 - Multi-source TLE loading and merge handling
 - Satellite profile management
 - Monitor page with backend event logging
+- Optional live SSTV decoding from the existing native IC-9700 SUB/RX audio stream
 - Optional APRS decoding from a selectable side of the native IC-9700 RX audio
   stream, plus manual APRS transmit of a beacon, status line, or message
 - Systemd-based Pi service install and update flow
@@ -41,8 +42,9 @@ compatibility problems or hardware-specific behavior in
 
 - Raspberry Pi OS or another Debian-based Linux environment
 - Raspberry Pi 3B or newer
-- Python 3 with `venv`
+- Host-level Python 3 with `pip`
 - `git`
+- 64-bit Raspberry Pi OS (AArch64); the bundled SSTV worker is shipped natively
 - Dire Wolf for the optional APRS receiver and `gen_packets` transmit modulator
   (installed by the installer, or built from source)
 - Hamlib utilities through `libhamlib-utils`
@@ -66,9 +68,9 @@ curl -fsSL https://raw.githubusercontent.com/W9KSB/Pi-Sat/main/install/install_p
 - clones or updates the repo into `~/pi-sat`
 - creates `pi-sat-controller.conf` from the example template if needed
 - creates `update_pi.sh` from `updater.template` if needed
-- creates `.venv`
-- installs Python dependencies from `requirements.txt`
+- installs Python dependencies from `requirements.txt` into the host Python
 - grants the service user serial-device access for local USB/serial radios and rotators
+- includes the native `bin/pi-sat-sstv-decoder` worker; no Rust or Cargo build is required
 - installs Dire Wolf for the optional APRS receiver
 - installs the `pi-sat` systemd service
 - starts the service
@@ -113,13 +115,15 @@ chmod +x update_pi.sh
 
 - [Hamlib](https://hamlib.github.io/) for radio and rotator control interfaces
 - [Skyfield](https://rhodesmill.org/skyfield/) for orbital calculations and pass prediction
+- [slowrx.rs](https://github.com/jasonherald/slowrx.rs), based on slowrx by Oona Raisanen (OH2EIQ), for SSTV decoding
 - [Dire Wolf](https://github.com/wb2osz/direwolf) by John Langner (WB2OSZ) for APRS and AX.25 decoding
 
-Full third-party notices for the APRS receiver are preserved in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+Full third-party notices for the SSTV decoder and APRS receiver are preserved in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 
 ### Data Sources
 
 - [CelesTrak](https://celestrak.org/) for TLE data used by the application
 
-Pi-Sat depends on these projects and data sources for core functionality. Thanks to them for the outstanding work they have done for years in this space and wish them continued success.
+Pi-Sat depends on these projects and data sources for core functionality. We
+thank their maintainers for the outstanding work they have done in this space.
