@@ -107,6 +107,8 @@ class IcomRadioState:
     sub_b_hz: int | None = None
     main_mode: str | None = None
     sub_mode: str | None = None
+    main_data_mode: bool | None = None
+    sub_data_mode: bool | None = None
     ptt: bool | None = None
     # Commanded PTT state while it differs from the confirmed radio readback.
     # None means the last command has been confirmed (or nothing is pending).
@@ -130,7 +132,8 @@ class IcomRadioState:
             "vfo": self.vfo,
             **{side: {"a_hz": getattr(self, f"{side}_a_hz"), "b_hz": getattr(self, f"{side}_b_hz"),
                       "frequency_hz": getattr(self, f"{side}_frequency_hz"), "vfo": getattr(self, f"{side}_vfo"),
-                      "mode": getattr(self, f"{side}_mode"), "filter": getattr(self, f"{side}_filter"),
+                      "mode": getattr(self, f"{side}_mode"), "data_mode": getattr(self, f"{side}_data_mode"),
+                      "filter": getattr(self, f"{side}_filter"),
                       **{key: getattr(self, f"{side}_{key}") for key in
                          ("bandwidth_hz", "af_gain", "rf_gain", "squelch", "s_meter", "squelch_open",
                           "preamp_int", "preamp_ext",
@@ -533,9 +536,12 @@ class IcomRadioController:
 
     def set_mode(self, physical_side: str, mode: str, vfo: str | None = None) -> dict[str, Any]:
         physical_side = self._normalize_side(physical_side)
+        requested_mode = mode.upper()
+        data_mode = requested_mode.endswith("-DATA")
+        base_mode = requested_mode[:-5] if data_mode else requested_mode
         mode_code = {"LSB": 0x00, "USB": 0x01, "AM": 0x02, "CW": 0x03, "FM": 0x05,
-                     "CW-R": 0x07, "DV": 0x17, "DD": 0x22}.get(mode.upper())
-        if mode_code is None:
+                     "CW-R": 0x07, "DV": 0x17, "DD": 0x22}.get(base_mode)
+        if mode_code is None or (data_mode and base_mode not in ("FM", "USB", "LSB")):
             raise ValueError(f"Unsupported IC-9700 mode: {mode}")
         with self._operator_operation():
             self._ensure_connected_locked()
@@ -550,12 +556,20 @@ class IcomRadioController:
                     vfo=self._echo_vfo(physical_side, self._state.vfo),
                 )
                 self._civ_transaction_locked(self._frame(0x06, bytes([mode_code])))
+                if base_mode in ("FM", "USB", "LSB"):
+                    self._civ_transaction_locked(self._frame(
+                        0x1A, b"\x06\x01\x01" if data_mode else b"\x06\x00\x00"))
                 actual, _ = self._read_mode_state_locked(physical_side)
-                if actual != mode.upper():
-                    raise IcomRadioError("Radio mode readback did not match the requested mode")
+                if (actual != base_mode or
+                        (base_mode in ("FM", "USB", "LSB") and
+                         getattr(self._state, f"{physical_side.lower()}_data_mode") != data_mode) or
+                        (data_mode and getattr(self._state, f"{physical_side.lower()}_filter") != 1)):
+                    raise IcomRadioError("Radio mode/DATA readback did not match the requested mode")
             except Exception:
-                # As above: let the unused echo expire rather than clearing the
-                # whole history and losing unrelated pending echoes.
+                try:
+                    self._read_mode_state_locked(physical_side)
+                except IcomRadioError:
+                    pass
                 raise
             finally:
                 self._select_locked(previous_side, previous_vfo)
@@ -581,9 +595,14 @@ class IcomRadioController:
                 mode = self._civ_transaction_locked(self._frame(0x04))
                 if len(mode) not in (7, 8):
                     raise IcomRadioError("Invalid mode readback; filter write cancelled")
-                self._civ_transaction_locked(self._frame(0x06, bytes([mode[5], filter_number])))
+                data_mode, _ = self._read_data_mode_locked()
+                if data_mode:
+                    self._civ_transaction_locked(self._frame(0x1A, bytes([0x06, 0x01, filter_number])))
+                else:
+                    self._civ_transaction_locked(self._frame(0x06, bytes([mode[5], filter_number])))
                 _, actual = self._read_mode_state_locked(side)
-                if actual != filter_number:
+                if (actual != filter_number or
+                        getattr(self._state, f"{side.lower()}_data_mode") != data_mode):
                     raise IcomRadioError("Radio filter readback did not match the requested filter")
             finally:
                 self._select_locked(previous_side, None)
@@ -1083,7 +1102,7 @@ class IcomRadioController:
                 raise IcomRadioError("Release PTT before exchanging MAIN and SUB bands")
             self._civ_transaction_locked(self._frame(0x07, b"\xb0"))
             for side in ("main", "sub"):
-                for field in ("frequency_hz", "mode", "filter", "bandwidth_hz",
+                for field in ("frequency_hz", "mode", "data_mode", "filter", "bandwidth_hz",
                               "af_gain", "rf_gain", "squelch", "s_meter",
                               "squelch_open", "a_hz", "b_hz", "updated"):
                     setattr(self._state, f"{side}_{field}", None)
@@ -1510,6 +1529,7 @@ class IcomRadioController:
         if len(mode) not in (7, 8):
             raise IcomRadioError("Invalid IC-9700 mode/filter readback")
         filter_number = mode[6] if len(mode) == 8 and mode[6] in (1, 2, 3) else None
+        data_mode, data_filter = self._read_data_mode_locked()
         bandwidth = self._read_bandwidth_locked(mode[5], filter_number)
         # Front-panel selection can change even when we are the sole LAN owner.
         if self._read_side_locked() != side:
@@ -1518,7 +1538,8 @@ class IcomRadioController:
         setattr(self._state, f"{side.lower()}_mode", {
             0: "LSB", 1: "USB", 2: "AM", 3: "CW", 5: "FM", 7: "CW-R", 0x17: "DV", 0x22: "DD"
         }.get(mode[5]))
-        setattr(self._state, f"{side.lower()}_filter", filter_number)
+        setattr(self._state, f"{side.lower()}_data_mode", data_mode)
+        setattr(self._state, f"{side.lower()}_filter", data_filter if data_mode else filter_number)
         setattr(self._state, f"{side.lower()}_bandwidth_hz", bandwidth)
         setattr(self._state, f"{side.lower()}_updated", monotonic())
         ptt = self._civ_transaction_locked(self._frame(0x1C, b"\x00"))
@@ -1553,6 +1574,7 @@ class IcomRadioController:
         if len(response) not in (7, 8):
             raise IcomRadioError("Invalid IC-9700 mode/filter readback")
         filter_number = response[6] if len(response) == 8 and response[6] in (1, 2, 3) else None
+        data_mode, data_filter = self._read_data_mode_locked()
         bandwidth = self._read_bandwidth_locked(response[5], filter_number)
         if self._read_side_locked() != side:
             raise IcomRadioError("MAIN/SUB changed during mode readback")
@@ -1560,10 +1582,22 @@ class IcomRadioController:
             0: "LSB", 1: "USB", 2: "AM", 3: "CW", 5: "FM", 7: "CW-R", 0x17: "DV", 0x22: "DD"
         }.get(response[5])
         setattr(self._state, f"{side.lower()}_mode", mode)
-        setattr(self._state, f"{side.lower()}_filter", filter_number)
+        setattr(self._state, f"{side.lower()}_data_mode", data_mode)
+        setattr(self._state, f"{side.lower()}_filter", data_filter if data_mode else filter_number)
         setattr(self._state, f"{side.lower()}_bandwidth_hz", bandwidth)
         setattr(self._state, f"{side.lower()}_updated", monotonic())
         return mode, filter_number
+
+    def _read_data_mode_locked(self) -> tuple[bool, int | None]:
+        response = self._civ_transaction_locked(self._frame(0x1A, b"\x06"))
+        if len(response) != 9 or response[4:6] != b"\x1a\x06":
+            raise IcomRadioError("Invalid IC-9700 DATA mode readback")
+        enabled, filter_number = response[6:8]
+        if (enabled == 0 and filter_number == 0):
+            return False, None
+        if enabled == 1 and filter_number in (1, 2, 3):
+            return True, filter_number
+        raise IcomRadioError("Invalid IC-9700 DATA mode/filter readback")
 
     def _prime_frequency_state_locked(self) -> None:
         self._read_dualwatch_locked()
@@ -1790,7 +1824,7 @@ class IcomRadioController:
                     b"\x07\xd2", b"\x1c\x00", b"\x1a\x03", b"\x14\x01", b"\x14\x02",
                     b"\x14\x03", b"\x15\x01", b"\x15\x02", b"\x15\x11", b"\x15\x12", b"\x15\x14",
                     b"\x21\x00", b"\x21\x01", b"\x16\x02")
-                query = query or request[4:-1] in (b"\x16\x59", b"\x1a\x05\x01\x14", b"\x1a\x05\x01\x15", b"\x1a\x05\x01\x16")
+                query = query or request[4:-1] in (b"\x16\x59", b"\x1a\x06", b"\x1a\x05\x01\x14", b"\x1a\x05\x01\x15", b"\x1a\x05\x01\x16")
                 query = query or (request[4:6] == b"\x27\x15" and len(request) == 8)
                 matched = (frame[4] == request[4] and
                            (request[4] in (0x03, 0x04) or frame[5:6] == request[5:6])) if query else frame[4] == 0xFB

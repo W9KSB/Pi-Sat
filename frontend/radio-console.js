@@ -31,7 +31,7 @@
         <span class="rc-meter-track"><i id="rc-${side}-meter-fill"></i></span><span id="rc-${side}-meter-scale" class="rc-meter-scale"><span>S0</span><span>S9</span><span>S9 +60</span></span></button>
       <div class="rc-path-controls">
         <label>BAND <select id="rc-${side}-band" disabled title="Radio band readback; band switching is not implemented"><option value="">—</option><option>2 m</option><option>70 cm</option><option>23 cm</option></select></label>
-        <label>MODE <select id="rc-${side}-mode" data-radio-select="mode" data-side="${side}" data-radio><option value="">Unknown</option>${['FM', 'USB', 'LSB', 'CW', 'CW-R', 'AM', 'DV', 'DD'].map(mode => `<option>${mode}</option>`).join('')}</select></label>
+        <label>MODE <select id="rc-${side}-mode" data-radio-select="mode" data-side="${side}" data-radio><option value="">Unknown</option>${['FM', 'FM-DATA', 'USB', 'USB-DATA', 'LSB', 'LSB-DATA', 'CW', 'CW-R', 'AM', 'DV', 'DD'].map(mode => `<option>${mode}</option>`).join('')}</select></label>
         <label>VFO <select id="rc-${side}-vfo" data-radio-select="vfo" data-side="${side}" data-radio title="A/B is independent on each physical side"><option value="">Unknown</option>${['A', 'B'].map(vfo => `<option value="${vfo}">${vfo} (${side === 'MAIN' ? 'Main' : 'Sub'})</option>`).join('')}</select></label>
         <label>FILTER PRESET <select id="rc-${side}-filter" data-radio-select="filter" data-side="${side}" data-radio><option value="">Unknown</option>${[1, 2, 3].map(filter => `<option value="${filter}">FIL${filter}</option>`).join('')}</select></label>
       </div>
@@ -141,6 +141,11 @@
     <div class="rc-notices"><span id="rc-status" role="status">Checking radio configuration…</span><span id="rc-command-status" role="status"></span></div>`;
 
   const state = { enabled: false, connected: false, main: {}, sub: {} };
+  function displayMode(data) {
+    if (!data.mode) return '';
+    return data.data_mode === true && ['FM', 'USB', 'LSB'].includes(data.mode)
+      ? `${data.mode}-DATA` : data.mode;
+  }
   let busy = false;
   // A refresh joins an existing radio session; it never connects the radio.
   let wantAudio = true;
@@ -321,7 +326,8 @@
         $(`rc-${side}-band`).value = band(data.frequency_hz) === '—' ? '' : band(data.frequency_hz);
         for (const field of ['mode', 'filter', 'vfo']) {
           const input = $(`rc-${side}-${field}`);
-          if (document.activeElement !== input) input.value = data[field] == null ? '' : String(data[field]);
+          const value = field === 'mode' ? displayMode(data) : data[field];
+          if (document.activeElement !== input) input.value = value == null ? '' : String(value);
         }
         for (const control of ['af_gain', 'rf_gain', 'squelch']) {
           const input = $(`rc-${side}-${control}`);
@@ -666,7 +672,9 @@
           await command(field, { physical_side: side, [field]: field === 'filter' ? Number(value) : value });
         }
         // A menu choice is a request, not an authoritative radio readback.
-        input.value = state[side.toLowerCase()]?.[field] == null ? '' : String(state[side.toLowerCase()][field]);
+        const readback = state[side.toLowerCase()] || {};
+        const actual = field === 'mode' ? displayMode(readback) : readback[field];
+        input.value = actual == null ? '' : String(actual);
       });
     }
     $(`rc-${side}-editor`).addEventListener('submit', async event => {
