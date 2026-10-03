@@ -121,9 +121,13 @@ without altering the final decoded image.
 
 ## Decoder timing
 
-`slowrx` 0.5.3 performs VIS detection, synchronization, and slant correction.
+The bundled `slowrx.rs 0.5.3-pisat.3` worker performs tolerant VIS detection,
+mode-aware line synchronization, slant correction, and color reconstruction.
 Pi-Sat renders each `line_decoded` event as it arrives. Audio collection and the
 engine's whole-image processing must finish before that line batch is available.
+Uploaded clips without a VIS header are acquired from their repeated line-sync
+cadence. When enough complete lines are present, Pi-Sat saves those rows as a
+partial image and marks the original vertical position as unknown.
 
 ## Decoder executable
 

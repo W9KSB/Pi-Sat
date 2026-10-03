@@ -58,6 +58,19 @@ if [ "${PI_SAT_UPDATER_REEXEC:-0}" -eq 0 ] \
   exec "${LOCAL_UPDATER}"
 fi
 
+if [ ! -f bin/pi-sat-sstv-decoder ]; then
+  echo "Missing bundled SSTV decoder: ${REPO_ROOT}/bin/pi-sat-sstv-decoder"
+  exit 1
+fi
+chmod +x bin/pi-sat-sstv-decoder
+if command -v file >/dev/null 2>&1; then
+  file_output="$(file -b bin/pi-sat-sstv-decoder)"
+  case "${file_output}" in
+    *"ELF 64-bit"*"ARM aarch64"*) : ;;
+    *) echo "Bundled SSTV decoder is not a 64-bit AArch64 ELF: ${file_output}"; exit 1 ;;
+  esac
+fi
+
 sudo systemctl stop "${SERVICE_NAME}"
 service_stopped=1
 sudo usermod -aG dialout "$(id -un)"

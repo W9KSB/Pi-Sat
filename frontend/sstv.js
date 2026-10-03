@@ -193,8 +193,14 @@
   function openImage(image) {
     const dialog = byId('sstv-image-dialog');
     byId('sstv-large-image').src = `/api/sstv/images/${encodeURIComponent(image.id)}`;
+    const acquisition = image.acquisition || {};
+    const partial = image.partial === true;
+    const partialText = partial && acquisition.recovered_lines
+      ? `Partial: ${acquisition.recovered_lines}/${acquisition.expected_lines || '?'} rows, vertical position unknown`
+      : partial ? 'Partial image' : '';
     byId('sstv-large-meta').textContent = [
       image.mode,
+      partialText,
       formatFrequency(image.frequency_hz),
       image.satellite || 'Satellite unavailable',
       new Date(image.timestamp_utc).toLocaleString(),
@@ -227,7 +233,10 @@
     const meta = document.createElement('span');
     meta.textContent = [formatFrequency(image.frequency_hz), image.satellite].filter(Boolean).join(' · ');
     const status = document.createElement('span');
-    status.textContent = `Status: ${image.decode_status || 'complete'}`;
+    const acquisition = image.acquisition || {};
+    status.textContent = image.partial && acquisition.recovered_lines
+      ? `Partial: ${acquisition.recovered_lines}/${acquisition.expected_lines || '?'} rows; vertical position unknown`
+      : `Status: ${image.decode_status || 'complete'}`;
     const download = document.createElement('a');
     download.className = 'btn btn-sm btn-outline-info';
     download.href = `/api/sstv/images/${encodeURIComponent(image.id)}/download`;
@@ -281,7 +290,10 @@
     } else if (event.type === 'image_started') {
       prepareCanvas(Number(event.width), Number(event.height));
       setProgress(0);
-      appendDebug('info', `Image started: ${event.mode || 'SSTV'}, ${event.width}x${event.height}.`);
+      appendDebug(
+        'info',
+        `${event.partial ? 'Partial image acquired without VIS' : 'Image started'}: ${event.mode || 'SSTV'}, ${event.width}x${event.height}.`,
+      );
     } else if (event.type === 'line_decoded') {
       const line = Number(event.line_index) + 1;
       const rendered = drawLine(event);
@@ -413,7 +425,10 @@
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || 'Recording decode failed');
-      uploadStatus.textContent = `${result.mode || 'SSTV'} image saved to the gallery.`;
+      const acquisition = result.acquisition || {};
+      uploadStatus.textContent = result.partial && acquisition.recovered_lines
+        ? `${result.mode || 'SSTV'} partial saved: ${acquisition.recovered_lines}/${acquisition.expected_lines || '?'} rows; vertical position unknown.`
+        : `${result.mode || 'SSTV'} image saved to the gallery.`;
       uploadInput.value = '';
       await loadGalleryImage(result);
       await loadGallery();

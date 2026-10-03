@@ -1,8 +1,11 @@
 # Third-Party Licenses
 
-## slowrx.rs 0.5.3
+## slowrx.rs 0.5.3-pisat.3
 
-Pi-Sat uses `slowrx.rs`, a Rust port of `slowrx`, as its SSTV decoding engine.
+Pi-Sat distributes a modified build of `slowrx.rs` 0.5.3, a Rust port of
+`slowrx`, as its SSTV decoding engine. The Pi-Sat build applies mode-specific
+line-sync phase normalization, VIS timing interoperability, and finite-clip
+line-sync acquisition while preserving the upstream license below.
 
 MIT License
 

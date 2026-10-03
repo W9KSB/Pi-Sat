@@ -81,6 +81,7 @@ class SstvGallery:
         context: dict[str, Any],
         source: str = "radio",
         diagnostic: dict[str, Any] | None = None,
+        acquisition: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         png = encode_png(width, height, rgb)
         capture_id = uuid4().hex
@@ -95,6 +96,7 @@ class SstvGallery:
             "width": width,
             "height": height,
             "decode_status": "degraded" if partial or quality != "clean" else "complete",
+            "partial": bool(partial),
             "quality": quality if quality in {"clean", "degraded", "rejected"} else "degraded",
             "interference_packets": max(0, int(interference_packets)),
             "source": source if source in {"radio", "uploaded"} else "radio",
@@ -104,6 +106,8 @@ class SstvGallery:
         }
         if diagnostic is not None:
             metadata["diagnostic"] = dict(diagnostic)
+        if acquisition is not None:
+            metadata["acquisition"] = dict(acquisition)
         with self._lock:
             self._atomic_write(self.root / f"{capture_id}.png", png)
             try:

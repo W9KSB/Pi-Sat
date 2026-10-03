@@ -36,7 +36,7 @@ _MAX_FILE_PCM_BYTES = 128 * 1024 * 1024
 
 
 class SstvDecodeError(RuntimeError):
-    """Raised when an uploaded audio file cannot produce a complete image."""
+    """Raised when uploaded audio cannot produce a complete or partial image."""
 
 
 class SstvManager:
@@ -130,7 +130,7 @@ class SstvManager:
                 "dropped_packets": self._dropped_packets,
                 "gallery_count": self._gallery_count,
                 "audio_source": "Native IC-9700 SUB/RX PCM",
-                "decoder": "slowrx.rs 0.5.3",
+                "decoder": "slowrx.rs 0.5.3-pisat.3",
                 "decoder_error": self._last_worker_error,
                 "current_image": current,
                 "file_decode": {
@@ -287,6 +287,8 @@ class SstvManager:
         width = 0
         height = 0
         final_rgb: bytes | None = None
+        partial = False
+        acquisition: dict[str, Any] | None = None
         for raw_line in stdout.splitlines():
             try:
                 event = json.loads(raw_line)
@@ -295,13 +297,33 @@ class SstvManager:
             if not isinstance(event, dict):
                 continue
             event_type = event.get("type")
-            if event_type == "vis_detected":
+            if event_type in {"vis_detected", "blind_detected"}:
                 mode = str(event.get("mode") or "SSTV")
                 width = int(event["width"])
                 height = int(event["height"])
                 if not 0 < width <= 2048 or not 0 < height <= 2048:
                     raise SstvDecodeError("The decoder returned invalid image dimensions")
                 progressive = bytearray(width * height * 3)
+                if event_type == "blind_detected":
+                    confidence = float(event.get("confidence", 0.0))
+                    confidence = (
+                        max(0.0, min(1.0, confidence))
+                        if math.isfinite(confidence)
+                        else 0.0
+                    )
+                    expected_height = int(event.get("expected_height", height))
+                    if not height <= expected_height <= 2048:
+                        raise SstvDecodeError("The decoder returned an invalid expected image height")
+                    acquisition = {
+                        "method": "blind",
+                        "confidence": confidence,
+                        "recovered_lines": height,
+                        "expected_lines": expected_height,
+                        "row_origin_known": False,
+                        "mode_inferred": bool(event.get("mode_inferred", False)),
+                        "color_phase_inferred": bool(event.get("color_phase_inferred", False)),
+                        "candidates": [str(value) for value in event.get("candidates", [])],
+                    }
                 self._publish(
                     {
                         "type": "image_started",
@@ -310,6 +332,8 @@ class SstvManager:
                         "width": width,
                         "height": height,
                         "frequency_offset_hz": float(event.get("frequency_offset_hz", 0.0)),
+                        "partial": event_type == "blind_detected",
+                        "acquisition": acquisition,
                     }
                 )
             elif event_type == "line_decoded" and progressive is not None:
@@ -337,9 +361,33 @@ class SstvManager:
                 final_rgb = base64.b64decode(str(event["rgb_base64"]), validate=True)
                 if len(final_rgb) != width * height * 3:
                     raise SstvDecodeError("The decoder returned an invalid final image")
+                partial = bool(event.get("partial", False))
+                if event.get("acquisition") == "blind":
+                    recovered = int(event.get("recovered_lines", height))
+                    if recovered != height:
+                        raise SstvDecodeError("The decoder returned inconsistent partial image metadata")
+                    if acquisition is None:
+                        confidence = float(event.get("confidence", 0.0))
+                        confidence = (
+                            max(0.0, min(1.0, confidence))
+                            if math.isfinite(confidence)
+                            else 0.0
+                        )
+                        expected_height = int(event.get("expected_height", height))
+                        if not height <= expected_height <= 2048:
+                            raise SstvDecodeError(
+                                "The decoder returned an invalid expected image height"
+                            )
+                        acquisition = {
+                            "method": "blind",
+                            "confidence": confidence,
+                            "recovered_lines": height,
+                            "expected_lines": expected_height,
+                            "row_origin_known": False,
+                        }
 
         if final_rgb is None or not mode:
-            raise SstvDecodeError("No complete SSTV image was detected in the uploaded audio")
+            raise SstvDecodeError("No decodable SSTV image was detected in the uploaded audio")
         diagnostic = self.compare_progressive_to_final(
             progressive, received_lines, final_rgb, width, height
         )
@@ -348,16 +396,24 @@ class SstvManager:
             width=width,
             height=height,
             rgb=final_rgb,
-            partial=False,
-            quality="clean",
+            partial=partial,
+            quality="degraded" if partial else "clean",
             interference_packets=0,
             context={"source": "uploaded"},
             source="uploaded",
             diagnostic=diagnostic,
+            acquisition=acquisition,
         )
         with self._lock:
             self._gallery_count = len(self.gallery.list())
-        self._publish({"type": "image_complete", "source": "upload", "image": metadata})
+        self._publish(
+            {
+                "type": "image_complete",
+                "source": "upload",
+                "image": metadata,
+                "degraded": partial,
+            }
+        )
         return metadata
 
     def set_rx_gain_db(self, value: Any) -> dict[str, Any]:
