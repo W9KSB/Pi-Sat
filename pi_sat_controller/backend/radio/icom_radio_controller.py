@@ -233,6 +233,7 @@ class IcomRadioController:
         self._audio_subscribers: list[AudioBuffer] = []
         self._operator_waiters = 0
         self._connection_generation = 0
+        self._lan_if_commanded = False
         self._connection_attempt = 0
         self._retry_in_s: float | None = None
         self._ptt_confirm_due = 0.0
@@ -423,6 +424,8 @@ class IcomRadioController:
                                     self.connectivity.kind, exc)
                     self._recover_unconfirmed_transmit_locked()
                     self._activate_transport_microphone_locked()
+                    if self._lan_if_commanded:
+                        self.set_lan_audio_output("AF")
             except Exception:
                 self.connectivity.disconnect()
                 self._clear_disconnected_state_locked()
@@ -1159,9 +1162,15 @@ class IcomRadioController:
             self._audio_queue.clear()
             return packets
 
-    def subscribe_audio(self, notify: Callable[[], None] | None = None) -> AudioBuffer:
+    def subscribe_audio(
+        self, notify: Callable[[], None] | None = None,
+        *, max_seconds: float = 0.12, drop_oldest: bool = True,
+    ) -> AudioBuffer:
         with self._audio_lock:
-            queue = AudioBuffer(self.config.sample_rate, 2 if self.config.rx_codec == "lpcm16_stereo" else 1, notify)
+            queue = AudioBuffer(
+                self.config.sample_rate, 2 if self.config.rx_codec == "lpcm16_stereo" else 1,
+                notify, max_seconds=max_seconds, drop_oldest=drop_oldest,
+            )
             self._audio_subscribers.append(queue)
             return queue
 
@@ -1331,6 +1340,23 @@ class IcomRadioController:
             # repaired without the browser having to reload the page.
             self._scope_request = (self._normalize_side(physical_side), enabled, span_hz)
             return self._state.to_dict()
+
+    def set_lan_audio_output(self, output: str) -> None:
+        """Select and verify the IC-9700 LAN AF/IF Output setting."""
+        if output not in ("AF", "IF"):
+            raise ValueError("LAN audio output must be AF or IF")
+        value = 0 if output == "AF" else 1
+        setting = b"\x05\x01\x10"
+        with self._operator_operation():
+            self._ensure_connected_locked()
+            if output == "IF":
+                self._lan_if_commanded = True
+            self._civ_transaction_locked(self._frame(0x1A, setting + bytes([value])))
+            response = self._civ_transaction_locked(self._frame(0x1A, setting))
+            if len(response) != 10 or response[5:9] != setting + bytes([value]):
+                raise IcomRadioError("LAN AF/IF output readback did not match the request")
+            if output == "AF":
+                self._lan_if_commanded = False
 
     def _scope_configure_locked(self, physical_side: str, enabled: bool, span_hz: int | None) -> None:
         side = self._normalize_side(physical_side)
@@ -1824,7 +1850,7 @@ class IcomRadioController:
                     b"\x07\xd2", b"\x1c\x00", b"\x1a\x03", b"\x14\x01", b"\x14\x02",
                     b"\x14\x03", b"\x15\x01", b"\x15\x02", b"\x15\x11", b"\x15\x12", b"\x15\x14",
                     b"\x21\x00", b"\x21\x01", b"\x16\x02")
-                query = query or request[4:-1] in (b"\x16\x59", b"\x1a\x06", b"\x1a\x05\x01\x14", b"\x1a\x05\x01\x15", b"\x1a\x05\x01\x16")
+                query = query or request[4:-1] in (b"\x16\x59", b"\x1a\x06", b"\x1a\x05\x01\x10", b"\x1a\x05\x01\x14", b"\x1a\x05\x01\x15", b"\x1a\x05\x01\x16")
                 query = query or (request[4:6] == b"\x27\x15" and len(request) == 8)
                 matched = (frame[4] == request[4] and
                            (request[4] in (0x03, 0x04) or frame[5:6] == request[5:6])) if query else frame[4] == 0xFB

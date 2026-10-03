@@ -1079,7 +1079,7 @@ def _render_settings(
     _append_keys(lines, values, SETTINGS_SCHEMA["sstv"])
     lines.append("")
     values = section("audio_stream")
-    lines.append("# Passive mono SUB/RX PCM for external listeners; no radio control is performed.")
+    lines.append("# External DATA Decode streams demodulated 48 kHz IF audio; bind settings remain manual.")
     _append_keys(lines, values, SETTINGS_SCHEMA["audio_stream"])
     lines.append("")
     return "\n".join(lines)

@@ -37,6 +37,7 @@ from pi_sat_controller.backend.config import (
     NATIVE_ICOM_DEVICE_ID,
     PROJECT_ROOT,
     SETTINGS_SCHEMA,
+    config_transaction,
     load_cat_devices,
     load_config,
     load_my_satellites,
@@ -729,8 +730,8 @@ def _shutdown_runtime(
             LOGGER.exception("Native Icom shutdown failed during runtime reload")
 
 
-def _reload_audio_stream_server(config) -> None:
-    """Apply passive RX audio listener configuration without radio access."""
+def _reload_audio_stream_server(config, *, force: bool = False) -> None:
+    """Apply External DATA Decode listener configuration."""
 
     global audio_stream_server, audio_stream_error
     desired = config.audio_stream
@@ -739,11 +740,11 @@ def _reload_audio_stream_server(config) -> None:
         same = (
             existing.host == desired.bind_host
             and existing.port == desired.port
-            and existing.channel == desired.channel
+            and existing.channel == "right"
             and existing.sample_rate == config.icom.sample_rate
             and existing.channels == radio_channels(config.icom.rx_codec)
         )
-        if same and desired.enabled:
+        if same and desired.enabled and not force:
             return
         existing.shutdown()
         audio_stream_server = None
@@ -754,10 +755,11 @@ def _reload_audio_stream_server(config) -> None:
         server = RxAudioStreamServer(
             host=desired.bind_host,
             port=desired.port,
-            channel=desired.channel,
+            channel="right",
             sample_rate=config.icom.sample_rate,
             channels=radio_channels(config.icom.rx_codec),
             get_controller=lambda: icom_controller,
+            external_decode=True,
         )
         server.start()
         audio_stream_server = server
@@ -784,11 +786,36 @@ def _audio_stream_status() -> dict[str, object]:
             "frames_sent": 0,
             "audio_bytes": 0,
             "overflow_dropped": 0,
+            "source_dropped": 0,
             "last_error": audio_stream_error,
+            "active": False,
         }
-    status["passive"] = True
-    status["source"] = "Existing Pi-Sat mono SUB/RX PCM fan-out"
+    status["passive"] = False
+    status["source"] = "IC-9700 LAN IF, software FM demodulated to 48 kHz mono PCM"
     return status
+
+
+def _set_audio_stream_enabled(enabled: bool) -> dict[str, object]:
+    with config_transaction():
+        with tracking_command_lock:
+            config = load_config()
+            if enabled:
+                if config.icom.sample_rate != 48000:
+                    raise ValueError(
+                        "External DATA Decode requires [icom] sample_rate = 48000; "
+                        f"configured rate is {config.icom.sample_rate} Hz"
+                    )
+                if not config.icom.enabled or config.rx.device_id != NATIVE_ICOM_DEVICE_ID:
+                    raise ValueError("External DATA Decode requires the native IC-9700 RX radio")
+                if icom_controller is None or not icom_controller.try_snapshot().get("connected"):
+                    raise ValueError("Connect the IC-9700 before enabling External DATA Decode")
+            save_settings({"audio_stream": {"enabled": "true" if enabled else "false"}})
+            _reload_audio_stream_server(load_config(), force=enabled)
+            status = _audio_stream_status()
+            if enabled and not status["running"]:
+                save_settings({"audio_stream": {"enabled": "false"}})
+                raise RuntimeError(str(status["last_error"] or "External DATA Decode could not start"))
+            return status
 
 
 def _reload_runtime_config() -> list[str]:
@@ -797,13 +824,12 @@ def _reload_runtime_config() -> list[str]:
 
 
 def _reload_runtime_config_locked() -> list[str]:
-    global rotator_manager, sdr_manager, tx_radio_manager, icom_controller
+    global rotator_manager, sdr_manager, tx_radio_manager, icom_controller, audio_stream_server
     global hamlib_radio_models_cache, hamlib_radio_models_error
     global hamlib_rotator_models_cache, hamlib_rotator_models_error
 
     startup_errors: list[str] = []
     config = load_config()
-    _reload_audio_stream_server(config)
     native_selected = any(
         role.device_id == NATIVE_ICOM_DEVICE_ID
         for role in (config.rx, config.tx)
@@ -818,6 +844,9 @@ def _reload_runtime_config_locked() -> list[str]:
         and desired_icom_config is not None
         and getattr(icom_controller.connectivity, "config", None) == desired_icom_config
     )
+    if not preserve_icom_controller and audio_stream_server is not None:
+        audio_stream_server.shutdown()
+        audio_stream_server = None
     _shutdown_runtime(
         preserve_tracking_manager=True,
         preserve_icom_controller=preserve_icom_controller,
@@ -836,6 +865,7 @@ def _reload_runtime_config_locked() -> list[str]:
         except Exception as exc:
             startup_errors.append(f"Native Icom startup failed: {exc}")
             LOGGER.warning("Native Icom startup failed: %s", exc)
+    _reload_audio_stream_server(config)
     failure_threshold = max(1, config.safety.device_offline_failure_threshold)
     # A selected native route is the sole radio owner.  Generic Hamlib remains
     # available when neither role selects the first-class native device.
@@ -1721,7 +1751,7 @@ register_settings_api(
 )
 
 register_radio_api(app, get_controller=lambda: icom_controller)
-register_audio_stream_api(app, get_status=_audio_stream_status)
+register_audio_stream_api(app, get_status=_audio_stream_status, set_enabled=_set_audio_stream_enabled)
 register_sstv_api(
     app,
     get_manager=lambda: sstv_manager,

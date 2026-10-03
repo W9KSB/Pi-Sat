@@ -44,7 +44,7 @@ let qsoOpportunities = [];
 let selectedQsoOpportunityIndex = -1;
 const PAGE_NAMES = ['home', 'radio', 'satellites', 'modules', 'monitor', 'settings'];
 const MODULE_NAV = [
-  { id: 'audio-stream', label: 'RX Audio Stream' },
+  { id: 'audio-stream', label: 'External DATA Decode' },
   { id: 'sstv-decoder', label: 'SSTV Decoder' },
   { id: 'qso-finder', label: 'QSO Finder' },
   { id: 'map', label: 'Map' },

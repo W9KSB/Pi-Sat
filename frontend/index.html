@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Pi-Sat Controller</title>
     <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
-    <link rel="stylesheet" href="/style.css?v=20260916-controls1">
+    <link rel="stylesheet" href="/style.css?v=20261002-sstv-debug1">
     <link rel="stylesheet" href="/radio-console.css?v=20260909-controls4">
   </head>
   <body>
@@ -565,15 +565,17 @@
 
           <section class="module-view" id="audio-stream-page" data-module-view="audio-stream" role="tabpanel" aria-labelledby="modules-nav-audio-stream" hidden>
             <div class="audio-stream-toolbar card">
-              <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
-                <div>
+              <div class="card-body">
+                <div class="d-flex flex-wrap align-items-center justify-content-between gap-3">
                   <div class="d-flex flex-wrap align-items-center gap-2">
-                    <h2 class="h5 mb-0">RX Audio Stream</h2>
+                    <h2 class="h5 mb-0">External DATA Decode</h2>
                     <span id="audio-stream-state" class="audio-stream-state-badge">Disabled</span>
                   </div>
-                  <p id="audio-stream-detail" class="text-body-secondary small mb-0 mt-2">Passive listener is disabled in the config file.</p>
+                  <button type="button" id="audio-stream-enable" class="btn btn-primary" aria-pressed="false" disabled>Enable</button>
                 </div>
-                <div class="small text-body-secondary">Mono SUB/RX only · read-only audio fan-out</div>
+                <p class="small text-body-secondary mt-3 mb-2">External DATA Decode uses the IC-9700's wide IF output instead of its normal filtered AF audio. While enabled, Pi-Sat switches the radio to FM-DATA/FIL1, software-demodulates the IF stream, and sends 48 kHz audio to the external Windows client for satellite telemetry, packet, GMSK/FSK, SSDV, and similar digital signals.</p>
+                <p class="small text-body-secondary mb-2">Normal Pi-Sat receive audio is temporarily replaced by this data path. Disabling External DATA Decode restores normal AF audio operation.</p>
+                <p id="audio-stream-detail" class="text-body-secondary small mb-0">External DATA Decode is disabled.</p>
               </div>
             </div>
             <div class="row g-3">
@@ -584,7 +586,7 @@
                   <div><dt>Port</dt><dd id="audio-stream-port">--</dd></div>
                   <div><dt>Connected clients</dt><dd id="audio-stream-listeners">0</dd></div>
                   <div><dt>Client limit</dt><dd id="audio-stream-client-limit">--</dd></div>
-                  <div><dt>Audio source</dt><dd id="audio-stream-source">Existing Pi-Sat RX PCM</dd></div>
+                  <div><dt>Audio source</dt><dd id="audio-stream-source">Normal AF audio</dd></div>
                 </dl></div></div>
               </section>
               <section class="col-12 col-xl-7">
@@ -593,12 +595,13 @@
                   <div><dt>Audio bytes sent</dt><dd id="audio-stream-bytes">0</dd></div>
                   <div><dt>Accepted connections</dt><dd id="audio-stream-accepted">0</dd></div>
                   <div><dt>Refused connections</dt><dd id="audio-stream-refused">0</dd></div>
-                  <div><dt>Overflow drops</dt><dd id="audio-stream-drops">0</dd></div>
+                  <div><dt>Source packets dropped</dt><dd id="audio-stream-source-drops">0</dd></div>
+                  <div><dt>Stream queue drops</dt><dd id="audio-stream-drops">0</dd></div>
                   <div><dt>Last error</dt><dd id="audio-stream-error">None</dd></div>
                 </dl></div></div>
               </section>
             </div>
-            <p class="small text-body-secondary mt-3 mb-0">Enable this listener in <code>[audio_stream]</code> in the Pi-Sat config file. It becomes active only when an external client connects and never controls the radio.</p>
+            <p class="small text-body-secondary mt-3 mb-0">Connect the IC-9700 and set its receive sample rate to 48 kHz before enabling. The existing external Windows client connects to this server. Connection settings remain in <code>[audio_stream]</code> in the Pi-Sat config file.</p>
           </section>
 
           <section class="module-view" id="sstv-decoder-page" data-module-view="sstv-decoder" role="tabpanel" aria-labelledby="modules-nav-sstv-decoder" hidden>
@@ -638,6 +641,14 @@
               <p id="sstv-upload-status" class="small text-body-secondary mb-0 mt-2" role="status" aria-live="polite">The audio file is temporary and is deleted after processing.</p>
             </div></section>
             <section class="card"><div class="card-header d-flex justify-content-between gap-2"><h3 class="h6 mb-0">Recent Images</h3><span class="small text-body-secondary">Latest 25 captures</span></div><div class="card-body"><div id="sstv-gallery" class="sstv-gallery"><p class="text-body-secondary mb-0">No SSTV images yet.</p></div></div></section>
+            <section class="card sstv-debug-card"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
+              <h3 class="h6 mb-0">Decoder Console</h3>
+              <div class="d-flex flex-wrap align-items-center gap-3">
+                <label class="small text-body-secondary d-flex align-items-center gap-2 mb-0"><input id="sstv-debug-follow" type="checkbox" checked> Follow</label>
+                <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/decoder-audio" download="sstv-decoder-input.wav" title="Last three minutes of mono audio sent to the decoder">Download decoder audio</a>
+                <button type="button" id="sstv-debug-clear" class="btn btn-sm btn-outline-secondary">Clear</button>
+              </div>
+            </div><div class="card-body p-0"><div id="sstv-debug-output" class="sstv-debug-output" role="log" aria-label="Live SSTV decoder debug log" aria-live="off" tabindex="0"></div></div></section>
             <dialog id="sstv-image-dialog" class="sstv-image-dialog"><form method="dialog" class="d-flex justify-content-end"><button class="btn btn-sm btn-outline-light" aria-label="Close image">Close</button></form><img id="sstv-large-image" alt="Completed SSTV decode"><div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3"><p id="sstv-large-meta" class="small text-body-secondary mb-0"></p><a id="sstv-large-download" class="btn btn-sm btn-outline-info" href="#" download>Download</a></div></dialog>
           </section>
 
@@ -756,10 +767,10 @@
       <a href="https://github.com/w9ksb" target="_blank" rel="noopener noreferrer">github.com/w9ksb</a>
     </footer>
     <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
-  <script src="/app.js?v=20260916-uplink1"></script>
+  <script src="/app.js?v=20260928-external-data1"></script>
     <script src="/radio-console.js?v=20260916-uplink1"></script>
-    <script src="/audio-stream.js?v=20260927-passive1"></script>
-    <script src="/sstv.js?v=20260926-loss-aware"></script>
+    <script src="/audio-stream.js?v=20260928-external-data1"></script>
+    <script src="/sstv.js?v=20261002-sstv-debug4"></script>
     <script src="/aprs.js?v=20260914-aprs4"></script>
   </body>
 </html>

@@ -16,7 +16,8 @@ PREAMBLE = struct.Struct("<8sHHIBB6x")
 FRAME = struct.Struct("<BBHII")
 FRAME_TYPE_AUDIO = 1
 MAX_FRAME_BYTES = 65535
-BUFFER_SECONDS = 1.0
+BUFFER_SECONDS = 5.0
+STARTUP_BUFFER_SECONDS = 0.25
 
 
 def recv_exact(conn: socket.socket, size: int) -> bytes:
@@ -42,6 +43,7 @@ def parse_preamble(data: bytes) -> tuple[int, int]:
 
 class PcmBuffer:
     def __init__(self, sample_rate: int, channels: int) -> None:
+        self._bytes_per_second = sample_rate * 2 * channels
         self._limit = max(1, int(sample_rate * BUFFER_SECONDS * 2 * channels))
         self._chunks: deque[bytes] = deque()
         self._bytes = 0
@@ -50,11 +52,11 @@ class PcmBuffer:
 
     def put(self, payload: bytes) -> None:
         with self._condition:
+            if self._bytes + len(payload) > self._limit:
+                self.dropped_bytes += 1
+                raise BufferError("Audio buffer exceeded 5 seconds; playback stopped before skipping PCM")
             self._chunks.append(payload)
             self._bytes += len(payload)
-            while self._bytes > self._limit and len(self._chunks) > 1:
-                self._bytes -= len(self._chunks.popleft())
-                self.dropped_bytes += 1
             self._condition.notify()
 
     def get(self, timeout: float = 0.5) -> bytes | None:
@@ -66,6 +68,18 @@ class PcmBuffer:
             payload = self._chunks.popleft()
             self._bytes -= len(payload)
             return payload
+
+    def wait_for_startup(self, stop: threading.Event) -> bool:
+        minimum = int(self._bytes_per_second * STARTUP_BUFFER_SECONDS)
+        with self._condition:
+            while self._bytes < minimum and not stop.is_set():
+                self._condition.wait(0.1)
+            return not stop.is_set()
+
+    @property
+    def queued_ms(self) -> int:
+        with self._condition:
+            return round(self._bytes * 1000 / self._bytes_per_second)
 
 
 class StreamSession:
@@ -84,6 +98,7 @@ class StreamSession:
         self.frames = 0
         self.bytes = 0
         self.gaps = 0
+        self.output_underflows = 0
         self.error = ""
 
     def start(self) -> None:
@@ -135,7 +150,7 @@ class StreamSession:
                     self.bytes += len(payload)
                     self.buffer.put(payload)
                     self.on_status("streaming")
-        except (OSError, ConnectionError, ValueError) as exc:
+        except (OSError, ConnectionError, ValueError, BufferError) as exc:
             if not self.stop.is_set():
                 self.error = str(exc)
                 self.on_status("error")
@@ -148,18 +163,22 @@ class StreamSession:
     def _playback_loop(self) -> None:
         stream = None
         try:
+            buffer = self.buffer
+            if buffer is None or not buffer.wait_for_startup(self.stop):
+                return
             stream = sd.RawOutputStream(
                 samplerate=self.sample_rate,
                 channels=self.channels,
                 dtype="int16",
                 device=self.device,
-                latency="low",
+                latency=STARTUP_BUFFER_SECONDS,
             )
             stream.start()
-            while not self.stop.is_set() and self.buffer is not None:
-                payload = self.buffer.get()
+            while not self.stop.is_set():
+                payload = buffer.get()
                 if payload:
-                    stream.write(payload)
+                    if stream.write(payload):
+                        self.output_underflows += 1
         except Exception as exc:
             if not self.stop.is_set():
                 self.error = f"Audio output failed: {exc}"
@@ -262,7 +281,12 @@ class Application:
         if session is None:
             return
         dropped = session.buffer.dropped_bytes if session.buffer is not None else 0
-        self.stats.set(f"Frames {session.frames:,} · Gaps {session.gaps:,} · {session.bytes:,} bytes · Buffer drops {dropped:,}")
+        queued_ms = session.buffer.queued_ms if session.buffer is not None else 0
+        self.stats.set(
+            f"Frames {session.frames:,} · Gaps {session.gaps:,} · {session.bytes:,} bytes"
+            f" · Buffer drops {dropped:,} · Queued {queued_ms} ms"
+            f" · Output underflows {session.output_underflows:,}"
+        )
         if session.stop.is_set() and self.session is session:
             self.start_button.configure(state="normal")
             self.stop_button.configure(state="disabled")

@@ -179,11 +179,14 @@
   // visible canvas. Each sweep inserts a row at the top and the visible canvas
   // is drawn at a fractional offset, so 4-5 sweeps/s glide instead of jumping.
   let waterfallBufferCanvas = null;
+  let waterfallContext = null;
   let scrollFrame = 0;
   let scrollOffset = 0;
   let scrollLastAt = 0;
+  let scrollLastPaintAt = 0;
   let sweepIntervalMs = 0;
   let sweepLastAt = 0;
+  const WATERFALL_SCROLL_PAINT_MS = 50;
   let scopeSyncQueued = true;
   let scopeSyncRunning = false;
   let requestedSpan = null;
@@ -986,7 +989,8 @@
     if (!waterfall || !buffer) return;
     // A fractional offset with smoothing enabled is what turns discrete sweep
     // insertions into continuous motion.
-    waterfall.getContext('2d').drawImage(buffer, 0, -scrollOffset);
+    waterfallContext ||= waterfall.getContext('2d');
+    waterfallContext.drawImage(buffer, 0, -scrollOffset);
   }
   function scrollActive() {
     return display.smooth && Boolean(scope) && Boolean(state.connected) && Boolean(waterfallBufferCanvas);
@@ -994,17 +998,32 @@
   function requestScroll() {
     if (scrollFrame || !scrollActive()) return;
     scrollLastAt = 0;
+    scrollLastPaintAt = 0;
     scrollFrame = requestAnimationFrame(scrollStep);
   }
   function scrollStep(now) {
     scrollFrame = 0;
     if (!scrollActive()) { scrollOffset = 0; return; }
     const at = Number.isFinite(now) ? now : Date.now();
+    if (!scrollLastAt) {
+      // drawScope already painted the whole row. Start measuring from this
+      // frame instead of immediately copying the same canvas again.
+      scrollLastAt = at;
+      scrollLastPaintAt = at;
+      scrollFrame = requestAnimationFrame(scrollStep);
+      return;
+    }
     const delta = scrollLastAt ? Math.min(100, at - scrollLastAt) : 0;
     scrollLastAt = at;
     if (delta > 0) scrollOffset = Math.min(1, scrollOffset + delta / (sweepIntervalMs || 200));
-    paintWaterfall();
-    scrollFrame = requestAnimationFrame(scrollStep);
+    const complete = scrollOffset >= 1;
+    if (complete || at - scrollLastPaintAt >= WATERFALL_SCROLL_PAINT_MS) {
+      paintWaterfall();
+      scrollLastPaintAt = at;
+    }
+    // One row is the full distance between sweeps. Stop once it is reached so
+    // a stalled scope does not keep repainting an unchanged waterfall.
+    if (!complete) scrollFrame = requestAnimationFrame(scrollStep);
   }
   function drawScope(next) {
     const waterfall = $('rc-waterfall');

@@ -140,11 +140,11 @@ rx_gain_db = -6
 rx_gain_db = -6
 
 [audio_stream]
-# Passive mono SUB/RX PCM listener for external decoders and audio adapters.
-# This module never controls the radio or participates in CI-V operations.
+# External DATA Decode sends demodulated SUB/RX IF audio to the external client.
+# Enable from the module page after configuring [icom] sample_rate = 48000.
 enabled = false
 bind_host = 0.0.0.0
 port = 8765
-# Native stereo RX maps SUB/RX to the right side by default. Use both to
-# preserve the untouched interleaved stereo PCM for channel diagnostics.
+# External DATA Decode always selects the SUB/RX (right) channel from stereo RX.
+# This legacy setting is retained for config-file compatibility.
 channel = right

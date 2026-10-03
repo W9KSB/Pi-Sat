@@ -10,10 +10,39 @@
   const enableButton = byId('sstv-enable');
   const progress = byId('sstv-progress');
   const progressWrap = progress.closest('[role="progressbar"]');
+  const debugOutput = byId('sstv-debug-output');
+  const debugFollow = byId('sstv-debug-follow');
   let enabled = false;
   let socket = null;
   let reconnectTimer = null;
   let currentSequence = 0;
+  let lastLoggedState = null;
+  let lastLoggedEnabled = null;
+  const maxDebugEntries = 1200;
+
+  function appendDebug(level, message) {
+    if (!debugOutput || !message) return;
+    const entry = document.createElement('div');
+    entry.className = 'sstv-debug-entry';
+    const normalizedLevel = ['warn', 'error'].includes(level) ? level : 'info';
+    entry.dataset.level = normalizedLevel;
+    const timestamp = document.createElement('span');
+    timestamp.className = 'sstv-debug-time';
+    const now = new Date();
+    timestamp.textContent = `${now.toLocaleTimeString([], { hour12: false })}.${String(now.getMilliseconds()).padStart(3, '0')}`;
+    const severity = document.createElement('span');
+    severity.className = 'sstv-debug-level';
+    severity.textContent = normalizedLevel.toUpperCase();
+    const text = document.createElement('span');
+    text.className = 'sstv-debug-message';
+    text.textContent = String(message);
+    entry.append(timestamp, severity, text);
+    debugOutput.appendChild(entry);
+    while (debugOutput.childElementCount > maxDebugEntries) {
+      debugOutput.firstElementChild.remove();
+    }
+    if (debugFollow?.checked) debugOutput.scrollTop = debugOutput.scrollHeight;
+  }
 
   function decodeRgb(value, width) {
     if (!Number.isInteger(width) || width <= 0 || typeof value !== 'string') return null;
@@ -74,9 +103,29 @@
     return details[status.state] || 'SSTV decoder status unavailable.';
   }
 
-  function renderStatus(status) {
+  function renderStatus(status, eventSequence = 0) {
     if (!status) return;
+    const statusSequence = Number(eventSequence) || Number(status.sequence) || 0;
+    if (statusSequence && statusSequence < currentSequence) return;
+    currentSequence = Math.max(currentSequence, statusSequence);
     enabled = status.enabled === true;
+    if (lastLoggedEnabled !== enabled) {
+      appendDebug('info', `Decoder ${enabled ? 'enabled' : 'disabled'}.`);
+      lastLoggedEnabled = enabled;
+    }
+    const state = status.state || 'Unknown';
+    if (lastLoggedState !== state) {
+      const level = state === 'Decode failed' ? 'error' : 'info';
+      const detail = [
+        status.mode,
+        status.total_lines ? `line ${status.line || 0}/${status.total_lines}` : null,
+        `level ${status.decoder_level_dbfs ?? 'silent'} dBFS`,
+        `${Number(status.dropped_packets) || 0} missing packets total`,
+        status.error,
+      ].filter(Boolean).join('; ');
+      appendDebug(level, `State: ${state}${detail ? ` (${detail})` : ''}.`);
+      lastLoggedState = state;
+    }
     stateNode.textContent = status.state || 'Disabled';
     stateNode.dataset.state = (status.state || 'Disabled').toLowerCase().replaceAll(' ', '-');
     byId('sstv-detail').textContent = stateDetail(status);
@@ -96,15 +145,23 @@
     renderDecoderGain(status);
     const activelyDecoding = ['SSTV detected', 'Decoding'].includes(status.state);
     byId('sstv-active-indicator').hidden = !activelyDecoding;
+    byId('sstv-active-indicator').querySelector('strong').textContent = status.state === 'SSTV detected'
+      ? 'SSTV signal detected'
+      : 'Image decoding in progress';
     byId('sstv-active-mode').textContent = activelyDecoding && status.mode ? `· ${status.mode}` : '';
     setProgress(status.progress_percent);
     if (status.current_image) {
       prepareCanvas(Number(status.current_image.width), Number(status.current_image.height));
-    } else if (!enabled) {
+    } else {
       byId('sstv-canvas-wrap').classList.remove('has-image');
-      byId('sstv-canvas-empty').textContent = 'Enable the decoder to listen for an SSTV transmission.';
+      byId('sstv-canvas-empty').textContent = !enabled
+        ? 'Enable the decoder to listen for an SSTV transmission.'
+        : status.state === 'Waiting for radio audio'
+          ? 'Waiting for radio audio.'
+          : status.state === 'Decode failed'
+            ? status.error || 'The decoder could not start.'
+            : 'Listening for an SSTV transmission.';
     }
-    currentSequence = Math.max(currentSequence, Number(status.sequence) || 0);
   }
 
   async function loadImage(url) {
@@ -217,27 +274,52 @@
     const sequence = Number(event.sequence) || 0;
     if (sequence && sequence <= currentSequence) return;
     if (sequence) currentSequence = sequence;
-    if (event.type === 'status') {
-      renderStatus(event.status);
+    if (event.type === 'debug_log') {
+      appendDebug(event.level, event.message);
+    } else if (event.type === 'status') {
+      renderStatus(event.status, sequence);
     } else if (event.type === 'image_started') {
       prepareCanvas(Number(event.width), Number(event.height));
       setProgress(0);
+      appendDebug('info', `Image started: ${event.mode || 'SSTV'}, ${event.width}x${event.height}.`);
     } else if (event.type === 'line_decoded') {
-      if (drawLine(event)) {
-        const line = Number(event.line_index) + 1;
+      const line = Number(event.line_index) + 1;
+      const rendered = drawLine(event);
+      if (rendered) {
         byId('sstv-line').textContent = `${line} / ${canvas.height}`;
         setProgress(100 * line / canvas.height);
+        byId('sstv-detail').textContent = `Receiving ${event.mode || byId('sstv-mode').textContent || 'SSTV'} line ${line} of ${event.height || canvas.height}.`;
+        appendDebug('info', `Decoder emitted line ${line}/${event.height || canvas.height}; rendered.`);
+      } else {
+        const width = Number(event.width);
+        const lineIndex = Number(event.line_index);
+        const rgb = decodeRgb(event.rgb_base64, width);
+        const reason = !rgb
+          ? 'invalid RGB payload'
+          : canvas.width !== width
+            ? `canvas width ${canvas.width} != event width ${width}`
+            : !Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= canvas.height
+              ? `line index ${event.line_index} outside canvas height ${canvas.height}`
+              : 'canvas draw failed';
+        appendDebug('error', `Decoder emitted line ${line}/${event.height || '?'}; page rejected it: ${reason}.`);
       }
     } else if (event.type === 'image_complete') {
       setProgress(100);
       if (event.source === 'upload') loadGalleryImage(event.image);
       else loadCurrentImage();
       loadGallery();
+      appendDebug(
+        event.degraded ? 'warn' : 'info',
+        `${event.degraded ? 'Degraded partial image saved' : 'Image saved to gallery'}${event.image?.filename ? `: ${event.image.filename}` : '.'}`,
+      );
     } else if (event.type === 'audio_gap') {
       const count = Number(event.missing_packets) || 0;
-      byId('sstv-detail').textContent = event.severity === 'major'
-        ? `Audio loss detected (${count} packet${count === 1 ? '' : 's'}); restarting at a clean boundary.`
-        : `Interference detected (${count} packet${count === 1 ? '' : 's'}); keeping the image and marking it degraded.`;
+      appendDebug(
+        event.severity === 'major' ? 'warn' : 'info',
+        event.severity === 'major'
+          ? `Audio sequence gap: ${count} packets missing; restarting decoder at a clean VIS search boundary.`
+          : `Audio sequence gap: ${count} packets missing; continuing and marking image degraded.`,
+      );
     }
   }
 
@@ -245,10 +327,12 @@
     clearTimeout(reconnectTimer);
     const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
     socket = new WebSocket(`${scheme}//${location.host}/api/sstv/events`);
+    socket.onopen = () => appendDebug('info', 'Connected to live decoder event stream.');
     socket.onmessage = message => {
       try { handleEvent(JSON.parse(message.data)); } catch (_) { /* Ignore malformed events. */ }
     };
     socket.onclose = () => {
+      appendDebug('warn', 'Decoder event stream disconnected; reconnecting.');
       socket = null;
       reconnectTimer = setTimeout(connectEvents, 1500);
     };
@@ -272,6 +356,8 @@
       enableButton.disabled = false;
     }
   });
+
+  byId('sstv-debug-clear')?.addEventListener('click', () => debugOutput?.replaceChildren());
 
   function renderDecoderGain(status) {
     const slider = byId('sstv-rx-gain');
@@ -339,6 +425,7 @@
   });
 
   window.PiSatSstv = { decodeRgb, drawLine, renderStatus };
+  appendDebug('info', 'Console attached; showing live events from this page session.');
   loadState();
   loadGallery();
   connectEvents();

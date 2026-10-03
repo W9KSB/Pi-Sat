@@ -46,6 +46,20 @@ def register_sstv_api(
     def list_sstv_images() -> list[dict[str, Any]]:
         return get_manager().gallery.list()
 
+    @app.get("/api/sstv/decoder-audio")
+    def download_decoder_audio() -> Response:
+        audio = get_manager().decoder_audio_wav()
+        if audio is None:
+            raise HTTPException(status_code=404, detail="No decoder input audio has been captured")
+        return Response(
+            content=audio,
+            media_type="audio/wav",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": 'attachment; filename="sstv-decoder-input.wav"',
+            },
+        )
+
     @app.post("/api/sstv/upload")
     async def upload_sstv_audio(request: Request) -> dict[str, Any]:
         """Decode one streamed MP3/WAV upload and save its image to the gallery."""

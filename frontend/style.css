@@ -54,6 +54,24 @@
 .sstv-gallery-body { display: grid; gap: 0.35rem; padding: 0.8rem; }
 .sstv-gallery-body time, .sstv-gallery-body span { color: var(--app-muted); font-size: 0.75rem; }
 .sstv-gallery-body .btn { justify-self: start; margin-top: 0.25rem; }
+.sstv-debug-card { overflow: hidden; }
+.sstv-debug-output {
+  height: 18rem;
+  overflow: auto;
+  padding: 0.65rem 0.75rem;
+  background: #080d12;
+  color: #d4e0e9;
+  font-family: Consolas, "SFMono-Regular", "Liberation Mono", monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  scrollbar-color: #475967 #10171e;
+}
+.sstv-debug-entry { display: grid; grid-template-columns: 6ch 5ch minmax(0, 1fr); gap: 0.65rem; }
+.sstv-debug-time { color: #8193a2; }
+.sstv-debug-level { color: #68c8e8; }
+.sstv-debug-entry[data-level="warn"] .sstv-debug-level { color: #f0c36a; }
+.sstv-debug-entry[data-level="error"] .sstv-debug-level { color: #ff7777; }
+.sstv-debug-message { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .sstv-image-dialog { width: min(96vw, 1000px); max-width: none; border: 1px solid var(--app-border); background: #081018; color: #fff; }
 .sstv-image-dialog::backdrop { background: rgb(0 0 0 / 80%); }
 .sstv-image-dialog img { display: block; max-width: 100%; max-height: 75vh; margin: 0 auto; }
