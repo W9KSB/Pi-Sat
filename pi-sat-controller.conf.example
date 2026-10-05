@@ -138,6 +138,8 @@ rx_gain_db = -6
 # Level trim in dB applied only to the copy of receive audio handed to slowrx.
 # It never changes the radio, browser audio, or APRS decoder.
 rx_gain_db = -6
+# Optional Discord incoming webhook used to post each newly decoded image.
+discord_webhook_url =
 
 [audio_stream]
 # External DATA Decode sends demodulated SUB/RX IF audio to the external client.

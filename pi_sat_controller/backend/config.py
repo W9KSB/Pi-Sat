@@ -20,6 +20,7 @@ from typing import Any
 from pi_sat_controller.backend.audio_gain import RX_GAIN_DEFAULT_DB, clamp_gain_db
 from pi_sat_controller.backend.maidenhead import lat_lon_to_locator, locator_to_lat_lon
 from pi_sat_controller.backend.models import MySatellite
+from pi_sat_controller.backend.sstv.discord_webhook import validate_discord_webhook_url
 
 LOGGER = logging.getLogger(__name__)
 
@@ -168,6 +169,7 @@ class AprsConfig:
 @dataclass(frozen=True)
 class SstvConfig:
     rx_gain_db: float
+    discord_webhook_url: str
 
 
 @dataclass(frozen=True)
@@ -319,7 +321,12 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             min_interval_s=_get_int(parser, "aprs", "min_interval_s", 30),
             rx_gain_db=_get_rx_gain_db(parser, "aprs"),
         ),
-        sstv=SstvConfig(rx_gain_db=_get_rx_gain_db(parser, "sstv")),
+        sstv=SstvConfig(
+            rx_gain_db=_get_rx_gain_db(parser, "sstv"),
+            discord_webhook_url=validate_discord_webhook_url(
+                _get_text(parser, "sstv", "discord_webhook_url", "")
+            ),
+        ),
         audio_stream=AudioStreamConfig(
             # Config-file only: this listener carries unauthenticated PCM on the
             # LAN, so it stays off until an operator turns it on deliberately.
@@ -641,6 +648,7 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
     ],
     "sstv": [
         "rx_gain_db",
+        "discord_webhook_url",
     ],
     "audio_stream": [
         "enabled",

@@ -21,6 +21,7 @@ let serialDevices = [];
 let automationScripts = [];
 let catDevicesCache = [];
 let currentSettingsState = {};
+let currentSecretStatus = {};
 let qthTimezone = 'UTC';
 let rotatorControlEnabled = false;
 let deviceControlUpdatesPending = 0;
@@ -2450,6 +2451,7 @@ async function loadSettings() {
     serialDevices = devices;
     automationScripts = scripts;
     currentSettingsState = result.settings || {};
+    currentSecretStatus = result.secret_status || {};
     catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : [];
     form.replaceChildren();
     const panelHost = document.createElement('div');
@@ -4092,9 +4094,23 @@ function buildSettingControl(section, key, value) {
       control = document.createElement('input');
       control.className = 'form-control';
       control.value = value;
-      if (section === 'icom' && key === 'password') {
+      if (
+        (section === 'icom' && key === 'password')
+        || (section === 'sstv' && key === 'discord_webhook_url')
+      ) {
         control.type = 'password';
         control.autocomplete = 'off';
+      }
+      if (section === 'sstv' && key === 'discord_webhook_url') {
+        control.value = currentSecretStatus?.sstv?.discord_webhook_url ? '********' : '';
+        control.dataset.secretSetting = 'true';
+        control.dataset.secretDirty = 'false';
+        control.placeholder = currentSecretStatus?.sstv?.discord_webhook_url
+          ? ''
+          : 'https://discord.com/api/webhooks/...';
+        control.addEventListener('input', () => {
+          control.dataset.secretDirty = 'true';
+        });
       }
       if (isNumericSetting(key)) {
         control.inputMode = 'decimal';
@@ -4461,6 +4477,9 @@ async function saveSettings(event) {
     if (element.type === 'checkbox') {
       return;
     }
+    if (element.dataset.secretSetting === 'true' && element.dataset.secretDirty !== 'true') {
+      return;
+    }
     const [section, key] = element.name.split('.');
     if (!settings[section]) {
       settings[section] = {};
@@ -4618,7 +4637,8 @@ function isNumericSetting(key) {
 function isWideSetting(key) {
   return key === 'source_url'
     || key === 'cache_dir'
-    || key === 'satellites_file';
+    || key === 'satellites_file'
+    || key === 'discord_webhook_url';
 }
 
 function compactRowClassForKey(key) {
@@ -4671,6 +4691,7 @@ function formatSettingLabel(key) {
     amplitude: 'APRS TX Amplitude (%)',
     min_interval_s: 'APRS Minimum Interval (s)',
     rx_gain_db: 'Decoder Input Level (dB)',
+    discord_webhook_url: 'Discord Webhook URL',
     manual_offset_readback_active_pass_only: 'Monitor Manual Offset Only During Live Pass',
     gui_resources_caching: 'GUI Resources Caching',
     civ_address: 'Radio CI-V Address',

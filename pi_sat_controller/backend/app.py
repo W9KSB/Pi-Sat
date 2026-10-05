@@ -115,6 +115,7 @@ from pi_sat_controller.backend.sdr.polling_sdr import (
 from pi_sat_controller.backend.aprs.manager import AprsManager
 from pi_sat_controller.backend.aprs.transmit import AprsTransmitter
 from pi_sat_controller.backend.sstv.manager import SstvManager
+from pi_sat_controller.backend.sstv.discord_webhook import DiscordWebhookNotifier
 from pi_sat_controller.backend.models import (SatellitePass, SatelliteProfile)
 
 logging.basicConfig(
@@ -217,12 +218,18 @@ def _sstv_capture_context() -> dict[str, object]:
     return {"frequency_hz": frequency_hz, "satellite": satellite}
 
 
+sstv_discord_notifier = DiscordWebhookNotifier(
+    lambda: load_config().sstv.discord_webhook_url
+)
+
+
 sstv_manager = SstvManager(
     project_root=PROJECT_ROOT,
     data_dir=PROJECT_ROOT / "data" / "sstv",
     get_controller=lambda: icom_controller,
     get_context=_sstv_capture_context,
     rx_gain_db=configured_rx_gain_db("sstv"),
+    on_image_saved=sstv_discord_notifier.enqueue,
 )
 
 
@@ -260,6 +267,7 @@ async def lifespan(app: FastAPI):
         _stop_autotrack_scheduler()
         _stop_transponder_refresh_scheduler()
         sstv_manager.shutdown()
+        sstv_discord_notifier.shutdown()
         aprs_manager.shutdown()
         aprs_transmitter.shutdown()
         if audio_stream_server is not None:
@@ -1787,7 +1795,6 @@ register_qso_api(
     load_my_satellites=load_my_satellites,
     build_qso_opportunities=_build_qso_opportunities,
 )
-
 
 frontend_dir = PROJECT_ROOT / "frontend"
 if frontend_dir.exists():

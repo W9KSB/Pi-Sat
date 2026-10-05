@@ -58,11 +58,13 @@ class SstvManager:
         get_controller: Callable[[], Any],
         get_context: Callable[[], dict[str, Any]],
         rx_gain_db: float = -6.0,
+        on_image_saved: Callable[[Path, dict[str, Any]], None] | None = None,
     ) -> None:
         self.project_root = Path(project_root)
         self.gallery = SstvGallery(data_dir, retention=25)
         self.get_controller = get_controller
         self.get_context = get_context
+        self.on_image_saved = on_image_saved
         self._lock = RLock()
         self._lifecycle_lock = Lock()
         self._process_lock = Lock()
@@ -404,6 +406,7 @@ class SstvManager:
             diagnostic=diagnostic,
             acquisition=acquisition,
         )
+        self._notify_image_saved(metadata)
         with self._lock:
             self._gallery_count = len(self.gallery.list())
         self._publish(
@@ -652,6 +655,7 @@ class SstvManager:
             interference_packets=interference_packets,
             context=context,
         )
+        self._notify_image_saved(metadata)
         with self._lock:
             if self._current is current:
                 current["partial_saved"] = True
@@ -1153,6 +1157,7 @@ class SstvManager:
                 source="radio",
                 diagnostic=diagnostic,
             )
+            self._notify_image_saved(metadata)
             with self._lock:
                 self._gallery_count = len(self.gallery.list())
                 self._terminal_until = monotonic() + 3.0
@@ -1171,6 +1176,19 @@ class SstvManager:
             )
             self._set_state(self.COMPLETE)
             self._publish({"type": "image_complete", "source": "radio", "image": metadata})
+
+    def _notify_image_saved(self, metadata: dict[str, Any]) -> None:
+        if self.on_image_saved is None:
+            return
+        capture_id = str(metadata.get("id", ""))
+        image_path = self.gallery.image_path(capture_id)
+        if image_path is None:
+            LOGGER.error("Saved SSTV image could not be found for notification")
+            return
+        try:
+            self.on_image_saved(image_path, metadata)
+        except Exception:
+            LOGGER.exception("Unable to enqueue the saved SSTV image notification")
 
     def _set_failure(self, message: str, *, fatal: bool) -> None:
         with self._lock:

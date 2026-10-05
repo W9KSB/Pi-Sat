@@ -24,6 +24,10 @@ MANUAL_ONLY_SETTINGS: dict[str, set[str]] = {
     "audio_stream": {"enabled", "bind_host", "port", "channel"},
 }
 
+SENSITIVE_SETTINGS: dict[str, set[str]] = {
+    "sstv": {"discord_webhook_url"},
+}
+
 
 def _payload_bool(value: Any, field_name: str) -> bool:
     if isinstance(value, bool):
@@ -42,16 +46,23 @@ def _sanitize_settings_payload(
 ) -> dict[str, object]:
     schema: dict[str, list[str]] = {}
     sanitized_settings: dict[str, dict[str, str]] = {}
+    secret_status: dict[str, dict[str, bool]] = {}
     for section, keys in settings_schema.items():
         hidden = MANUAL_ONLY_SETTINGS.get(section, set())
         schema[section] = [key for key in keys if key not in hidden]
         section_settings = dict(settings.get(section, {}))
         for key in hidden:
             section_settings.pop(key, None)
+        for key in SENSITIVE_SETTINGS.get(section, set()):
+            secret_status.setdefault(section, {})[key] = bool(
+                str(section_settings.get(key, "")).strip()
+            )
+            section_settings[key] = ""
         sanitized_settings[section] = section_settings
     return {
         "schema": schema,
         "settings": sanitized_settings,
+        "secret_status": secret_status,
     }
 
 
