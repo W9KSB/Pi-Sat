@@ -102,6 +102,8 @@ from pi_sat_controller.backend.runtime_fallbacks import (
 )
 from pi_sat_controller.backend.satellites.satellite_profiles import (
     load_satellite_profiles,
+    preferred_transponder_index,
+    remember_satellite_transponder,
     upsert_satellite_transponders,
 )
 from pi_sat_controller.backend.satellites.tle_manager import TleManager
@@ -427,7 +429,7 @@ def _clear_split_for_single_role_radios(
 
 def _get_or_create_rx_tracking_manager(
     norad_id: int | None = None,
-    transponder_index: int = 0,
+    transponder_index: int | None = None,
 ) -> RxTrackingManager:
     global rx_tracking_manager
 
@@ -438,6 +440,7 @@ def _get_or_create_rx_tracking_manager(
     if (
         rx_tracking_manager is not None
         and rx_tracking_manager.satellite.norad_id == selected_norad
+        and transponder_index is not None
         and 0 <= transponder_index < len(rx_tracking_manager.satellite.transponders)
         and (
             rx_tracking_manager.transponder
@@ -460,11 +463,18 @@ def _get_or_create_rx_tracking_manager(
                 "Pass tracking is available, but RX/TX frequency tracking needs a frequency profile."
             ),
         )
+    if transponder_index is None:
+        transponder_index = preferred_transponder_index(selected_satellite)
     if transponder_index < 0 or transponder_index >= len(selected_satellite.transponders):
         raise HTTPException(status_code=400, detail="Selected frequency profile is invalid")
 
     selected_transponder = selected_satellite.transponders[transponder_index]
     if rx_tracking_manager is not None:
+        if (
+            rx_tracking_manager.satellite.norad_id == selected_norad
+            and rx_tracking_manager.transponder == selected_transponder
+        ):
+            return rx_tracking_manager
         rx_tracking_manager.update_target(selected_satellite, selected_transponder)
         return rx_tracking_manager
 
@@ -513,7 +523,7 @@ def _get_or_create_rx_tracking_manager(
 
 def _start_rx_tracking_manager(
     norad_id: int | None,
-    transponder_index: int,
+    transponder_index: int | None,
     sync_offsets: bool | None,
     source: str,
 ) -> RxTrackingManager:
@@ -529,6 +539,18 @@ def _start_rx_tracking_manager(
         if sync_offsets is not None:
             manager.set_offset_sync(sync_offsets)
         manager.start()
+        try:
+            config = load_config()
+            remember_satellite_transponder(
+                config.profiles.satellites_file,
+                manager.satellite.norad_id,
+                manager.transponder.name,
+            )
+        except (OSError, ValueError):
+            LOGGER.exception(
+                "Could not remember transponder for NORAD %s",
+                manager.satellite.norad_id,
+            )
         LOGGER.info(
             "Tracking target accepted source=%s previous_norad=%s norad=%s profile=%s",
             source,
@@ -1383,7 +1405,7 @@ def _start_autotrack_pass(satellite_pass: SatellitePass) -> bool:
         )
         _start_rx_tracking_manager(
             satellite_pass.norad_id,
-            0,
+            None,
             current_sync,
             "backend_autotrack",
         )

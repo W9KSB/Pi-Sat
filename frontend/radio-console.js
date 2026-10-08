@@ -52,6 +52,12 @@
         ${button('Both', 'listen', 'data-value="BOTH" aria-pressed="false" title="Dual audio: MAIN left, SUB right; requires stereo and both receivers active"')}</div>
       ${button('Dualwatch —', 'dualwatch', 'id="rc-dualwatch" data-radio title="Turn the radio SUB receiver on or off"')}
       <button id="rc-power" type="button" class="rc-button rc-power" data-action="power"><span aria-hidden="true">⏻</span> Connect</button></div>
+    <div class="rc-tracking rc-panel" aria-label="Satellite tracking">
+      <span class="rc-tracking-satellite"><span id="rc-tracking-label" class="rc-tracking-label">Currently tracking:</span>
+        <strong id="rc-tracking-name">None</strong></span>
+      <div class="rc-tracking-metrics"><span>Az: <b id="rc-tracking-az">—</b></span>
+        <span>El: <b id="rc-tracking-el">—</b></span><span>LOS: <b id="rc-tracking-los">—</b></span></div>
+    </div>
     <section class="rc-scope rc-panel" aria-label="Spectrum and waterfall">
       <div class="rc-scope-toolbar"><h2>Spectrum <span>/ Waterfall</span></h2>
         <span id="rc-scope-source" class="rc-scope-source">Spectrum follows listening · SUB</span>
@@ -498,6 +504,15 @@
     },
   };
   window.RadioConsole = consoleApi;
+
+  function renderTrackingSummary() {
+    if (typeof getRadioTrackingSummary !== 'function') return;
+    const summary = getRadioTrackingSummary();
+    for (const field of ['label', 'name', 'az', 'el', 'los']) {
+      const node = $(`rc-tracking-${field}`);
+      if (node.textContent !== summary[field]) node.textContent = summary[field];
+    }
+  }
 
   function resumeAudioOnInteraction() {
     if (!state.connected || !wantAudio) return;
@@ -1233,10 +1248,12 @@
   syncDisplayControls();
   paintSpectrum();
   consoleApi.render({});
+  renderTrackingSummary();
   void refreshStateFromRest();
   // Age indicators and audio recovery remain active while other tabs are shown.
   // REST is a low-rate control-state fallback; spectrum still requires WebSocket.
   setInterval(() => {
+    renderTrackingSummary();
     if (Date.now() - lastStateTime > 6000) {
       streamHealthy = false;
       void refreshStateFromRest();

@@ -106,6 +106,7 @@ class IcomLanConnectivity:
         # Embedded TX-audio counter: a separate, zero-based per-fragment stream
         # counter (not the transport sequence) that rolls over through 0.
         self._audio_send_seq = 0
+        self._reset_rx_audio_statistics()
         self._tx_pcm_buffer = bytearray()
         self._stage = "idle"
         self._connected = False
@@ -121,6 +122,12 @@ class IcomLanConnectivity:
             "transport_authenticated": self._authenticated,
             "audio_available": self._connected and self._audio is not None,
             "audio_capability": self._audio_capability,
+            "rx_audio_native_packets": self._rx_audio_packets,
+            "rx_audio_sequence_gaps": self._rx_audio_sequence_gaps,
+            "rx_audio_sequence_skipped": self._rx_audio_sequence_skipped,
+            "rx_audio_duplicates": self._rx_audio_duplicates,
+            "rx_audio_out_of_order": self._rx_audio_out_of_order,
+            "rx_audio_last_sequence": self._rx_audio_last_sequence,
         }
 
     def connect(self) -> None:
@@ -131,6 +138,7 @@ class IcomLanConnectivity:
         self._auth_inner_seq = self._AUTH_INNER_SEQ_START
         self._civ_seq = 1
         self._audio_send_seq = 0
+        self._reset_rx_audio_statistics()
         self._last_keepalive = monotonic()
         self._last_ping = self._last_keepalive
         self._pending_renewal = None
@@ -202,6 +210,7 @@ class IcomLanConnectivity:
                     if pcm_length == 0 or pcm_length != len(packet) - 24:
                         self._debug("ignored malformed audio packet length=%d", len(packet))
                         continue
+                    self._observe_rx_audio_sequence(struct.unpack_from(">H", packet, 18)[0])
                     audio_chunks.append(packet[24:])
                 elif sock is self._serial:
                     if len(packet) >= 22 and packet[16] == 0xC1:
@@ -219,6 +228,33 @@ class IcomLanConnectivity:
             self._last_auth_renewal = now
             self._debug("token renewal sent")
         return IcomConnectivityRead(tuple(control_chunks), tuple(audio_chunks))
+
+    def _reset_rx_audio_statistics(self) -> None:
+        self._rx_audio_packets = 0
+        self._rx_audio_sequence_gaps = 0
+        self._rx_audio_sequence_skipped = 0
+        self._rx_audio_duplicates = 0
+        self._rx_audio_out_of_order = 0
+        self._rx_audio_last_sequence: int | None = None
+
+    def _observe_rx_audio_sequence(self, sequence: int) -> None:
+        self._rx_audio_packets += 1
+        previous = self._rx_audio_last_sequence
+        if previous is None:
+            self._rx_audio_last_sequence = sequence
+            return
+        delta = (sequence - previous) & 0xFFFF
+        if delta == 0:
+            self._rx_audio_duplicates += 1
+        elif delta < 0x8000:
+            if delta > 1:
+                # Forward skips describe arrival order, not permanent loss:
+                # skipped packets may subsequently arrive out of order.
+                self._rx_audio_sequence_gaps += 1
+                self._rx_audio_sequence_skipped += delta - 1
+            self._rx_audio_last_sequence = sequence
+        else:
+            self._rx_audio_out_of_order += 1
 
     def write_control(self, payload: bytes) -> None:
         if self._serial is None or not self._connected:

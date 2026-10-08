@@ -1,4 +1,4 @@
-"""Small, independently locked live-audio buffers, never protected by CAT locks."""
+"""Independently locked audio buffers, never protected by CAT locks."""
 from collections import deque
 from threading import Lock
 from time import monotonic
@@ -9,13 +9,16 @@ class AudioBuffer:
     def __init__(
         self, sample_rate: int, channels: int,
         notify: Callable[[], None] | None = None,
-        *, max_seconds: float = 0.12, drop_oldest: bool = True,
+        *, max_seconds: float | None = 0.12, drop_oldest: bool = True,
     ):
         self._lock = Lock()
         self._packets: deque[tuple[float, bytes, int]] = deque()
         self._frames = 0
-        self._max_frames = max(1, int(sample_rate * max_seconds))
+        # A lossless consumer accepts growing latency and memory use instead
+        # of deleting samples when processing stalls.
+        self._max_frames = None if max_seconds is None else max(1, int(sample_rate * max_seconds))
         self._max_seconds = max_seconds
+        self._sample_rate = sample_rate
         self._drop_oldest = drop_oldest
         self._channels = channels
         self._notify = notify
@@ -27,11 +30,17 @@ class AudioBuffer:
         with self._lock:
             return self._overrun
 
+    @property
+    def pending_seconds(self) -> float:
+        with self._lock:
+            return self._frames / self._sample_rate
+
     def append(self, packet: bytes) -> None:
         frames = max(1, (len(packet) - 24) // (2 * self._channels))
         now = monotonic()
         with self._lock:
-            if not self._drop_oldest and (self._overrun or self._frames + frames > self._max_frames):
+            if (self._max_frames is not None and not self._drop_oldest
+                    and (self._overrun or self._frames + frames > self._max_frames)):
                 self._overrun = True
                 self.dropped += 1
                 wake = True
@@ -39,7 +48,7 @@ class AudioBuffer:
                 wake = not self._packets
                 self._packets.append((now, packet, frames))
                 self._frames += frames
-                if self._drop_oldest:
+                if self._drop_oldest and self._max_frames is not None:
                     while self._packets and (self._frames > self._max_frames or now - self._packets[0][0] > self._max_seconds):
                         self._frames -= self._packets.popleft()[2]
                         self.dropped += 1
@@ -51,7 +60,7 @@ class AudioBuffer:
         with self._lock:
             packets = []
             for timestamp, packet, _ in self._packets:
-                if not self._drop_oldest or now - timestamp <= self._max_seconds:
+                if self._max_seconds is None or not self._drop_oldest or now - timestamp <= self._max_seconds:
                     packets.append(packet)
                 else:
                     self.dropped += 1

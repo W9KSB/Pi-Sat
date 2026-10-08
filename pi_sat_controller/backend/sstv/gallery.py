@@ -82,8 +82,14 @@ class SstvGallery:
         source: str = "radio",
         diagnostic: dict[str, Any] | None = None,
         acquisition: dict[str, Any] | None = None,
+        png: bytes | None = None,
+        reception: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        png = encode_png(width, height, rgb)
+        if not 0 < width <= 2048 or not 0 < height <= 2048:
+            raise ValueError("SSTV image dimensions are outside the supported range")
+        if len(rgb) != width * height * 3:
+            raise ValueError("SSTV image buffer length does not match its dimensions")
+        encoded = encode_png(width, height, rgb) if png is None else png
         capture_id = uuid4().hex
         now = datetime.now(timezone.utc)
         safe_mode = re.sub(r"[^A-Za-z0-9]+", "-", mode).strip("-").lower() or "sstv"
@@ -108,8 +114,10 @@ class SstvGallery:
             metadata["diagnostic"] = dict(diagnostic)
         if acquisition is not None:
             metadata["acquisition"] = dict(acquisition)
+        if reception is not None:
+            metadata["reception"] = dict(reception)
         with self._lock:
-            self._atomic_write(self.root / f"{capture_id}.png", png)
+            self._atomic_write(self.root / f"{capture_id}.png", encoded)
             try:
                 self._atomic_write(
                     self.root / f"{capture_id}.json",

@@ -5,4 +5,6 @@ skyfield==1.49
 timezonefinderL==4.0.2
 aiortc==1.15.0
 numpy>=1.26,<3
-scipy>=1.11,<2
+scipy>=1.12,<2
+Pillow>=10,<13
+./vendor/sstvflow/wheels/sstvflow-0.1.1+pisat.20261008-py3-none-any.whl

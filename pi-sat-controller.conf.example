@@ -23,6 +23,8 @@ longitude_deg = 80.041667
 elevation_m = 250.0
 
 [tle]
+# Named TLE and CelesTrak GP/OMM JSON links are detected automatically.
+# For six-digit NORAD IDs, use FORMAT=JSON instead of FORMAT=tle.
 source_url = https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=tle
 cache_dir = data/tle_cache
 stale_after_hours = 48
@@ -135,7 +137,7 @@ min_interval_s = 30
 rx_gain_db = -6
 
 [sstv]
-# Level trim in dB applied only to the copy of receive audio handed to slowrx.
+# Level trim in dB applied only to the copy of receive audio handed to SSTVFlow.
 # It never changes the radio, browser audio, or APRS decoder.
 rx_gain_db = -6
 # Optional Discord incoming webhook used to post each newly decoded image.

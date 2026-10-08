@@ -6,7 +6,7 @@
     <title>Pi-Sat Controller</title>
     <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
     <link rel="stylesheet" href="/style.css?v=20261002-sstv-debug1">
-    <link rel="stylesheet" href="/radio-console.css?v=20260909-controls4">
+    <link rel="stylesheet" href="/radio-console.css?v=20261005-tracking-strip1">
   </head>
   <body>
     <main class="container-fluid py-3 app-shell">
@@ -630,8 +630,8 @@
                 </div></div>
               </section>
               <section class="col-12 col-xl-4"><div class="card h-100"><div class="card-header"><h3 class="h6 mb-0">Decoder Status</h3></div><div class="card-body"><dl class="sstv-readouts mb-0">
-                <div><dt>Mode</dt><dd id="sstv-mode">--</dd></div><div><dt>Line</dt><dd id="sstv-line">--</dd></div><div><dt>Quality</dt><dd id="sstv-quality">--</dd></div><div><dt>Audio losses</dt><dd id="sstv-losses">0</dd></div><div><dt>Audio source</dt><dd id="sstv-source">Native IC-9700 SUB/RX PCM</dd></div><div><dt>Engine</dt><dd id="sstv-engine">slowrx.rs 0.5.3-pisat.3</dd></div><div><dt>Decoder level</dt><dd id="sstv-decoder-level">silent</dd></div>
-              </dl><p class="small text-body-secondary mt-3 mb-0">SSTV decoding powered by slowrx.rs, based on slowrx by Oona Raisanen (OH2EIQ).</p></div></div></section>
+                <div><dt>Mode</dt><dd id="sstv-mode">--</dd></div><div><dt>Line</dt><dd id="sstv-line">--</dd></div><div><dt>Quality</dt><dd id="sstv-quality">--</dd></div><div><dt>Audio losses</dt><dd id="sstv-losses">0</dd></div><div><dt>Queued audio</dt><dd id="sstv-queued-audio">0.0 s</dd></div><div><dt>Audio source</dt><dd id="sstv-source">Native IC-9700 SUB/RX PCM</dd></div><div><dt>Engine</dt><dd id="sstv-engine">SSTVFlow 0.1.1</dd></div><div><dt>Decoder level</dt><dd id="sstv-decoder-level">silent</dd></div><div><dt>Clipped samples</dt><dd id="sstv-clipped-samples">0</dd></div><div><dt>Audio capture</dt><dd id="sstv-capture-status">No errors</dd></div>
+              </dl><p class="small text-body-secondary mt-3 mb-0">SSTVFlow decodes Robot24/36/72, Martin M1/M2, and PD120/180 from SUB/RX audio.</p></div></div></section>
             </div>
             <section class="card sstv-upload-card"><div class="card-header"><h3 class="h6 mb-0">Decode a recording</h3></div><div class="card-body">
               <form id="sstv-upload-form" class="row g-2 align-items-end">
@@ -645,7 +645,9 @@
               <h3 class="h6 mb-0">Decoder Console</h3>
               <div class="d-flex flex-wrap align-items-center gap-3">
                 <label class="small text-body-secondary d-flex align-items-center gap-2 mb-0"><input id="sstv-debug-follow" type="checkbox" checked> Follow</label>
-                <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/decoder-audio" download="sstv-decoder-input.wav" title="Last three minutes of mono audio sent to the decoder">Download decoder audio</a>
+                <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/source-audio" download="sstv-sub-source.wav" title="SUB audio before decoder gain, captured since Enable">Download SUB audio</a>
+                <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/decoder-audio" download="sstv-decoder-input.wav" title="Audio supplied to the decoder after gain, captured since Enable">Download decoder audio</a>
+                <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/audio-diagnostics" download="sstv-audio-diagnostics.jsonl" title="Audio packet, gain, and discontinuity diagnostics">Download audio diagnostics</a>
                 <button type="button" id="sstv-debug-clear" class="btn btn-sm btn-outline-secondary">Clear</button>
               </div>
             </div><div class="card-body p-0"><div id="sstv-debug-output" class="sstv-debug-output" role="log" aria-label="Live SSTV decoder debug log" aria-live="off" tabindex="0"></div></div></section>
@@ -743,7 +745,7 @@
               <div class="card-body">
                 <form id="settings-form" class="settings-form"></form>
                   <div class="d-flex justify-content-end gap-2 mt-3">
-                    <button type="button" class="btn btn-outline-info" id="refresh-tle-btn">Force Update TLE Data</button>
+                    <button type="button" class="btn btn-outline-info" id="refresh-tle-btn">Force Update Orbital Data</button>
                     <button type="submit" form="settings-form" class="btn btn-primary">Save Settings</button>
                   </div>
                 <p id="settings-status" class="command-status mb-0"></p>
@@ -767,10 +769,10 @@
       <a href="https://github.com/w9ksb" target="_blank" rel="noopener noreferrer">github.com/w9ksb</a>
     </footer>
     <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
-  <script src="/app.js?v=20260928-external-data1"></script>
-    <script src="/radio-console.js?v=20260916-uplink1"></script>
+  <script src="/app.js?v=20261007-orbital-json1"></script>
+    <script src="/radio-console.js?v=20261005-tracking-strip1"></script>
     <script src="/audio-stream.js?v=20260928-external-data1"></script>
-    <script src="/sstv.js?v=20261003-sstv-blind1"></script>
+    <script src="/sstv.js?v=20261008-sstvflow-modes1"></script>
     <script src="/aprs.js?v=20260914-aprs4"></script>
   </body>
 </html>

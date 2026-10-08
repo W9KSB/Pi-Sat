@@ -10,6 +10,7 @@ venv/
 data/tle_cache/
 data/tls/
 data/aprs/
+data/sstv/sstv_audio_capture/
 pi-sat-controller.conf
 update_pi.sh
 /tests/
@@ -18,3 +19,6 @@ external-streamer/build/
 external-streamer/dist/
 external-streamer/*.exe
 external-streamer/*.spec
+vendor/sstvflow/build/
+vendor/sstvflow/dist/
+vendor/sstvflow/src/*.egg-info/

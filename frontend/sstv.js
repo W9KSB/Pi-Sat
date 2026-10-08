@@ -18,6 +18,10 @@
   let currentSequence = 0;
   let lastLoggedState = null;
   let lastLoggedEnabled = null;
+  let activeImageId = null;
+  let canvasGeneration = 0;
+  let receivedLines = 0;
+  const rowRevisions = new Map();
   const maxDebugEntries = 1200;
 
   function appendDebug(level, message) {
@@ -54,11 +58,14 @@
     }
   }
 
-  function prepareCanvas(width, height) {
+  function prepareCanvas(width, height, clear = false) {
     if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return false;
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
       canvas.height = height;
+      clear = true;
+    }
+    if (clear) {
       context.fillStyle = '#020609';
       context.fillRect(0, 0, width, height);
     }
@@ -93,8 +100,9 @@
     if (status.error) return status.error;
     const details = {
       Disabled: 'Decoder is off. Radio audio continues normally.',
+      'Finishing queued audio': 'Reception stopped; finishing queued audio and saving the final image.',
       'Waiting for radio audio': 'Waiting for the existing native IC-9700 audio stream.',
-      Listening: 'Live SUB/RX PCM is being analyzed for an SSTV VIS header.',
+      Listening: 'Live SUB/RX PCM is being analyzed for Robot24/36/72, Martin M1/M2, or PD120/180 SSTV.',
       'SSTV detected': `Detected ${status.mode || 'an SSTV transmission'}.`,
       Decoding: `Receiving ${status.mode || 'SSTV'} line ${status.line || 0} of ${status.total_lines || '--'}.`,
       'Decode complete': 'Image saved to the persistent gallery.',
@@ -136,9 +144,14 @@
     byId('sstv-mode').textContent = status.mode || '--';
     byId('sstv-line').textContent = status.total_lines ? `${status.line || 0} / ${status.total_lines}` : '--';
     byId('sstv-source').textContent = status.audio_source || 'Native IC-9700 SUB/RX PCM';
-    byId('sstv-engine').textContent = status.decoder || 'slowrx.rs';
+    byId('sstv-engine').textContent = status.decoder || 'SSTVFlow 0.1.1';
     byId('sstv-quality').textContent = status.image_quality || 'clean';
     byId('sstv-losses').textContent = String(Number(status.dropped_packets) || 0);
+    byId('sstv-queued-audio').textContent = Number.isFinite(status.queued_audio_seconds)
+      ? `${status.queued_audio_seconds.toFixed(1)} s`
+      : '--';
+    byId('sstv-clipped-samples').textContent = String(Number(status.clipped_samples) || 0);
+    byId('sstv-capture-status').textContent = status.capture_error || 'No errors';
     byId('sstv-decoder-level').textContent = Number.isFinite(status.decoder_level_dbfs)
       ? `${status.decoder_level_dbfs} dBFS`
       : 'silent';
@@ -165,10 +178,15 @@
   }
 
   async function loadImage(url) {
+    const generation = canvasGeneration;
     try {
       const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`, { cache: 'no-store' });
       if (!response.ok) return;
       const bitmap = await createImageBitmap(await response.blob());
+      if (generation !== canvasGeneration) {
+        bitmap.close?.();
+        return;
+      }
       prepareCanvas(bitmap.width, bitmap.height);
       context.drawImage(bitmap, 0, 0);
       bitmap.close?.();
@@ -195,8 +213,9 @@
     byId('sstv-large-image').src = `/api/sstv/images/${encodeURIComponent(image.id)}`;
     const acquisition = image.acquisition || {};
     const partial = image.partial === true;
+    const originText = acquisition.row_origin_known === false ? ', vertical position unknown' : '';
     const partialText = partial && acquisition.recovered_lines
-      ? `Partial: ${acquisition.recovered_lines}/${acquisition.expected_lines || '?'} rows, vertical position unknown`
+      ? `Partial: ${acquisition.recovered_lines}/${acquisition.expected_lines || '?'} rows${originText}`
       : partial ? 'Partial image' : '';
     byId('sstv-large-meta').textContent = [
       image.mode,
@@ -234,8 +253,9 @@
     meta.textContent = [formatFrequency(image.frequency_hz), image.satellite].filter(Boolean).join(' · ');
     const status = document.createElement('span');
     const acquisition = image.acquisition || {};
+    const originText = acquisition.row_origin_known === false ? '; vertical position unknown' : '';
     status.textContent = image.partial && acquisition.recovered_lines
-      ? `Partial: ${acquisition.recovered_lines}/${acquisition.expected_lines || '?'} rows; vertical position unknown`
+      ? `Partial: ${acquisition.recovered_lines}/${acquisition.expected_lines || '?'} rows${originText}`
       : `Status: ${image.decode_status || 'complete'}`;
     const download = document.createElement('a');
     download.className = 'btn btn-sm btn-outline-info';
@@ -288,20 +308,31 @@
     } else if (event.type === 'status') {
       renderStatus(event.status, sequence);
     } else if (event.type === 'image_started') {
-      prepareCanvas(Number(event.width), Number(event.height));
+      canvasGeneration += 1;
+      activeImageId = event.image_id || null;
+      receivedLines = 0;
+      rowRevisions.clear();
+      prepareCanvas(Number(event.width), Number(event.height), true);
       setProgress(0);
+      byId('sstv-line').textContent = `0 / ${canvas.height}`;
       appendDebug(
         'info',
-        `${event.partial ? 'Partial image acquired without VIS' : 'Image started'}: ${event.mode || 'SSTV'}, ${event.width}x${event.height}.`,
+        `${event.acquisition?.row_origin_known === false ? 'Image acquired with unknown vertical position' : 'Image started'}: ${event.mode || 'SSTV'}, ${event.width}x${event.height}.`,
       );
     } else if (event.type === 'line_decoded') {
+      if (event.image_id && activeImageId && event.image_id !== activeImageId) return;
+      const lineIndex = Number(event.line_index);
+      const revision = Number(event.revision) || 0;
+      if (rowRevisions.has(lineIndex) && revision <= rowRevisions.get(lineIndex)) return;
       const line = Number(event.line_index) + 1;
       const rendered = drawLine(event);
       if (rendered) {
-        byId('sstv-line').textContent = `${line} / ${canvas.height}`;
-        setProgress(100 * line / canvas.height);
-        byId('sstv-detail').textContent = `Receiving ${event.mode || byId('sstv-mode').textContent || 'SSTV'} line ${line} of ${event.height || canvas.height}.`;
-        appendDebug('info', `Decoder emitted line ${line}/${event.height || canvas.height}; rendered.`);
+        rowRevisions.set(lineIndex, revision);
+        receivedLines = Math.max(receivedLines, line);
+        byId('sstv-line').textContent = `${receivedLines} / ${canvas.height}`;
+        setProgress(100 * receivedLines / canvas.height);
+        byId('sstv-detail').textContent = `Receiving ${event.mode || byId('sstv-mode').textContent || 'SSTV'} line ${receivedLines} of ${event.height || canvas.height}.`;
+        appendDebug('info', `Decoder ${event.row_revision || revision > 0 ? `revised line ${line} (revision ${revision})` : `emitted line ${line}`}/${event.height || canvas.height}; rendered.`);
       } else {
         const width = Number(event.width);
         const lineIndex = Number(event.line_index);
@@ -316,21 +347,19 @@
         appendDebug('error', `Decoder emitted line ${line}/${event.height || '?'}; page rejected it: ${reason}.`);
       }
     } else if (event.type === 'image_complete') {
-      setProgress(100);
+      if (!event.image?.partial) setProgress(100);
       if (event.source === 'upload') loadGalleryImage(event.image);
       else loadCurrentImage();
       loadGallery();
       appendDebug(
         event.degraded ? 'warn' : 'info',
-        `${event.degraded ? 'Degraded partial image saved' : 'Image saved to gallery'}${event.image?.filename ? `: ${event.image.filename}` : '.'}`,
+        `${event.image?.partial ? 'Partial image saved' : event.degraded ? 'Degraded image saved' : 'Image saved to gallery'}${event.image?.filename ? `: ${event.image.filename}` : '.'}`,
       );
     } else if (event.type === 'audio_gap') {
       const count = Number(event.missing_packets) || 0;
       appendDebug(
         event.severity === 'major' ? 'warn' : 'info',
-        event.severity === 'major'
-          ? `Audio sequence gap: ${count} packets missing; restarting decoder at a clean VIS search boundary.`
-          : `Audio sequence gap: ${count} packets missing; continuing and marking image degraded.`,
+        `Audio sequence gap: ${count} packets missing; closing the current image segment and reacquiring SSTV.`,
       );
     }
   }
@@ -426,9 +455,10 @@
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || 'Recording decode failed');
       const acquisition = result.acquisition || {};
+      const originText = acquisition.row_origin_known === false ? '; vertical position unknown' : '';
       uploadStatus.textContent = result.partial && acquisition.recovered_lines
-        ? `${result.mode || 'SSTV'} partial saved: ${acquisition.recovered_lines}/${acquisition.expected_lines || '?'} rows; vertical position unknown.`
-        : `${result.mode || 'SSTV'} image saved to the gallery.`;
+        ? `${result.mode || 'SSTV'} partial saved: ${acquisition.recovered_lines}/${acquisition.expected_lines || '?'} rows${originText}.`
+        : `${result.mode || 'SSTV'} ${result.partial ? 'partial image' : 'image'} saved to the gallery.`;
       uploadInput.value = '';
       await loadGalleryImage(result);
       await loadGallery();

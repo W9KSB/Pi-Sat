@@ -25,7 +25,7 @@ def register_tracking_api(
     get_tx_radio_manager: Callable[[], Any],
     get_rx_tracking_manager: Callable[[], Any],
     get_rotator_manager: Callable[[], Any],
-    start_rx_tracking_manager: Callable[[int | None, int, bool | None, str], Any],
+    start_rx_tracking_manager: Callable[[int | None, int | None, bool | None, str], Any],
     mutate_rx_tracking_manager: Callable[[int | None, int, Callable[[Any], Any]], Any],
     get_autotrack_enabled: Callable[[], bool],
     disabled_sdr_snapshot: Callable[[], Any],
@@ -106,13 +106,15 @@ def register_tracking_api(
     @app.post("/api/tracking/rx/start")
     def start_rx_tracking(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, object]:
         norad_id = None
-        frequency_profile_index = 0
+        frequency_profile_index = None
         if payload:
             try:
                 raw_norad = payload.get("norad_id")
                 norad_id = int(raw_norad) if raw_norad else None
                 raw_profile_index = payload.get("frequency_profile_index")
-                frequency_profile_index = int(raw_profile_index) if raw_profile_index else 0
+                frequency_profile_index = (
+                    int(raw_profile_index) if raw_profile_index is not None else None
+                )
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400,

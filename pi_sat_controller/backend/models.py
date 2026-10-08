@@ -27,6 +27,7 @@ class SatelliteProfile:
     norad_id: int
     favorite: bool
     transponders: list[TransponderProfile]
+    last_transponder_name: str | None = None
 
 
 @dataclass(frozen=True)

@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from skyfield.api import EarthSatellite, load, wgs84
 
 from pi_sat_controller.backend.models import SatellitePass
+from pi_sat_controller.backend.satellites.orbital_elements import parse_orbital_elements
 from pi_sat_controller.backend.orbital.orbital_engine import (
     OrbitalEngine,
     SatellitePosition,
@@ -196,21 +197,5 @@ class SkyfieldEngine(OrbitalEngine):
         return passes
 
     def _load_satellites(self, tle_file: Path) -> dict[int, EarthSatellite]:
-        lines = [
-            line.strip()
-            for line in tle_file.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        satellites: dict[int, EarthSatellite] = {}
-
-        for index in range(0, len(lines) - 2, 3):
-            name = lines[index]
-            line1 = lines[index + 1]
-            line2 = lines[index + 2]
-            if not line1.startswith("1 ") or not line2.startswith("2 "):
-                continue
-
-            satellite = EarthSatellite(line1, line2, name, self.timescale)
-            satellites[satellite.model.satnum] = satellite
-
-        return satellites
+        records = parse_orbital_elements(tle_file.read_text(encoding="utf-8"), self.timescale)
+        return {record.satnum: record.satellite for record in records}

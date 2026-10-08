@@ -30,21 +30,27 @@ compatibility problems or hardware-specific behavior in
 - Doppler-aware RX/TX tuning
 - SDR, radio, and rotator control
 - Native IC-9700 CI-V control and bidirectional audio over LAN connectivity
-- Multi-source TLE loading and merge handling
+- Multi-source TLE and CelesTrak GP/OMM JSON loading, including six-digit NORAD IDs
 - Satellite profile management
 - Monitor page with backend event logging
-- Optional live SSTV decoding from the existing native IC-9700 SUB/RX audio stream
+- Optional live Robot24/36/72, Martin M1/M2, and PD120/180 SSTV decoding from the existing native IC-9700 SUB/RX audio stream using SSTVFlow
 - Optional APRS decoding from a selectable side of the native IC-9700 RX audio
   stream, plus manual APRS transmit of a beacon, status line, or message
 - Systemd-based Pi service install and update flow
+
+In Settings, **Orbital Data Source URLs** accepts named TLE or CelesTrak JSON
+links, one per line. The format is detected automatically, and saving a changed
+link refreshes the orbital data. For amateur satellites, the JSON source is
+`https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=JSON`.
+TLE and JSON sources can be combined; the newest epoch for each NORAD ID is kept.
 
 ## Software Requirements
 
 - Raspberry Pi OS or another Debian-based Linux environment
 - Raspberry Pi 3B or newer
-- Host-level Python 3 with `pip`
+- Host-level Python 3.11 or newer with `pip`
 - `git`
-- 64-bit Raspberry Pi OS (AArch64); the bundled SSTV worker is shipped natively
+- 64-bit Raspberry Pi OS (AArch64)
 - Dire Wolf for the optional APRS receiver and `gen_packets` transmit modulator
   (installed by the installer, or built from source)
 - Hamlib utilities through `libhamlib-utils`
@@ -70,7 +76,7 @@ curl -fsSL https://raw.githubusercontent.com/W9KSB/Pi-Sat/main/install/install_p
 - creates `update_pi.sh` from `updater.template` if needed
 - installs Python dependencies from `requirements.txt` into the host Python
 - grants the service user serial-device access for local USB/serial radios and rotators
-- includes the native `bin/pi-sat-sstv-decoder` worker; no Rust or Cargo build is required
+- installs the bundled SSTVFlow Python decoder from `vendor/sstvflow`
 - installs Dire Wolf for the optional APRS receiver
 - installs the `pi-sat` systemd service
 - starts the service
@@ -115,10 +121,9 @@ chmod +x update_pi.sh
 
 - [Hamlib](https://hamlib.github.io/) for radio and rotator control interfaces
 - [Skyfield](https://rhodesmill.org/skyfield/) for orbital calculations and pass prediction
-- [slowrx.rs](https://github.com/jasonherald/slowrx.rs), based on slowrx by Oona Raisanen (OH2EIQ), for SSTV decoding
 - [Dire Wolf](https://github.com/wb2osz/direwolf) by John Langner (WB2OSZ) for APRS and AX.25 decoding
 
-Full third-party notices for the SSTV decoder and APRS receiver are preserved in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+SSTVFlow and APRS receiver notices are preserved in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 
 ### Data Sources

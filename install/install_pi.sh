@@ -69,19 +69,6 @@ fi
 
 cd "${INSTALL_DIR}"
 
-if [ ! -f bin/pi-sat-sstv-decoder ]; then
-  echo "Missing bundled SSTV decoder: ${INSTALL_DIR}/bin/pi-sat-sstv-decoder"
-  exit 1
-fi
-chmod +x bin/pi-sat-sstv-decoder
-if command -v file >/dev/null 2>&1; then
-  file_output="$(file -b bin/pi-sat-sstv-decoder)"
-  case "${file_output}" in
-    *"ELF 64-bit"*"ARM aarch64"*) : ;;
-    *) echo "Bundled SSTV decoder is not a 64-bit AArch64 ELF: ${file_output}"; exit 1 ;;
-  esac
-fi
-
 log_step "Ensuring local runtime files"
 created_runtime_file=0
 if [ ! -f pi-sat-controller.conf ]; then
@@ -113,9 +100,10 @@ fi
 
 log_step "Installing host-level Python dependencies"
 PYTHON_BIN="$(command -v python3)"
+. "${INSTALL_DIR}/install/python_environment.sh"
 log_info "Using ${PYTHON_BIN}"
 log_info "Installing Python dependencies from requirements.txt"
-sudo "${PYTHON_BIN}" -m pip install --break-system-packages -r requirements.txt
+pi_sat_install_dependencies "${PYTHON_BIN}"
 
 log_step "Checking Dire Wolf for the APRS module"
 if command -v direwolf >/dev/null 2>&1; then

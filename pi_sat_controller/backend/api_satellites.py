@@ -60,6 +60,11 @@ def register_satellites_api(
                 "name": my_satellite.name,
                 "norad_id": my_satellite.norad_id,
                 "favorite": True,
+                "last_transponder_name": (
+                    profile_by_norad[my_satellite.norad_id].last_transponder_name
+                    if my_satellite.norad_id in profile_by_norad
+                    else None
+                ),
                 "frequency_profiles": serialize_frequency_profiles(
                     profile_by_norad.get(
                         my_satellite.norad_id,
@@ -184,7 +189,7 @@ def register_satellites_api(
         if norad_id not in engine.satellites:
             raise HTTPException(
                 status_code=404,
-                detail=f"NORAD {norad_id} was not found in the current TLE cache",
+                detail=f"NORAD {norad_id} was not found in the current orbital data cache",
             )
 
         with config_transaction():
@@ -330,14 +335,14 @@ def register_satellites_api(
     def refresh_tle_data() -> dict[str, object]:
         config = load_config()
         tle_manager = TleManager(config.tle.source_url, config.tle.cache_dir)
-        logger.info("Manual TLE refresh requested")
+        logger.info("Manual orbital data refresh requested")
         try:
             status = tle_manager.download()
         except Exception as exc:
-            logger.exception("Manual TLE refresh failed")
-            raise HTTPException(status_code=502, detail=f"TLE refresh failed: {exc}") from exc
+            logger.exception("Manual orbital data refresh failed")
+            raise HTTPException(status_code=502, detail=f"Orbital data refresh failed: {exc}") from exc
         refresh_pass_cache(force_tle_download=False)
-        logger.info("Manual TLE refresh completed at %s", status.downloaded_at_utc)
+        logger.info("Manual orbital data refresh completed at %s", status.downloaded_at_utc)
         return {
             "ok": True,
             "refreshed_at_utc": status.downloaded_at_utc.isoformat() if status.downloaded_at_utc else None,

@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from array import array
 import base64
-from collections import deque
 from collections.abc import Callable
-import io
 import json
 import logging
 import math
@@ -14,13 +12,15 @@ from queue import Empty, Full, Queue
 import shutil
 import subprocess
 import sys
-import wave
 from threading import Event, Lock, RLock, Thread
 from time import monotonic
 from typing import Any
 
 from pi_sat_controller.backend.audio_gain import apply_gain_db, clamp_gain_db, dbfs_of, peak_of
 from pi_sat_controller.backend.sstv.gallery import SstvGallery, encode_png
+from pi_sat_controller.backend.sstv.events import SSTV_MODE_DIMENSIONS, SstvEventAdapter
+from pi_sat_controller.backend.sstv.worker import MAX_FRAME_BYTES, frame_control, frame_pcm
+from pi_sat_controller.backend.sstv.capture import SstvAudioCapture
 
 
 LOGGER = logging.getLogger(__name__)
@@ -28,8 +28,6 @@ LOGGER = logging.getLogger(__name__)
 _AUDIO_SEQUENCE_OFFSET = 18
 _MINOR_GAP_PACKETS = 3
 _MAX_REASONABLE_GAP_PACKETS = 0x7FFF
-_SSTV_AUDIO_BUFFER_SECONDS = 0.5
-_DECODER_CAPTURE_SECONDS = 180
 _FILE_SAMPLE_RATE = 16_000
 _FILE_DECODE_TIMEOUT_S = 180.0
 _MAX_FILE_PCM_BYTES = 128 * 1024 * 1024
@@ -40,7 +38,7 @@ class SstvDecodeError(RuntimeError):
 
 
 class SstvManager:
-    """Owns one slowrx worker fed from a copy of native Icom RX PCM."""
+    """Owns one SSTVFlow worker fed from a copy of native Icom SUB/RX PCM."""
 
     DISABLED = "Disabled"
     WAITING = "Waiting for radio audio"
@@ -49,6 +47,7 @@ class SstvManager:
     DECODING = "Decoding"
     COMPLETE = "Decode complete"
     FAILED = "Decode failed"
+    FINISHING = "Finishing queued audio"
 
     def __init__(
         self,
@@ -68,6 +67,10 @@ class SstvManager:
         self._lock = RLock()
         self._lifecycle_lock = Lock()
         self._process_lock = Lock()
+        self._write_lock = Lock()
+        self._termination_lock = Lock()
+        self._closing_process: subprocess.Popen[bytes] | None = None
+        self._reader_done = Event()
         self._enabled = False
         self._state = self.DISABLED
         self._error: str | None = None
@@ -76,9 +79,16 @@ class SstvManager:
         self._total_lines = 0
         self._frequency_offset_hz: float | None = None
         self._input_samples = 0
-        self._audio_capture: deque[bytes] = deque()
-        self._audio_capture_bytes = 0
-        self._audio_capture_rate = 0
+        self._audio_capture = SstvAudioCapture(Path(data_dir))
+        self._audio_queue = None
+        self._audio_controller = None
+        self._input_sample_rate = 0
+        self._pending_batch_samples = 0
+        self._finish_requested = False
+        self._input_level_dbfs: float | None = None
+        self._clipped_samples = 0
+        self._radio_audio_diagnostics: dict[str, Any] = {}
+        self._reported_capture_error: str | None = None
         # Level of the trimmed stream actually handed to the decoder.
         self._decoder_peak = 0
         self._rx_gain_db = clamp_gain_db(rx_gain_db)
@@ -109,11 +119,11 @@ class SstvManager:
             if self._current is not None:
                 current = {
                     key: self._current.get(key)
-                    for key in ("mode", "width", "height", "last_line")
+                    for key in ("mode", "width", "height", "last_line", "image_id", "acquisition")
                 }
             return {
                 "enabled": self._enabled,
-                "state": self._state,
+                "state": self.FINISHING if self._finish_requested else self._state,
                 "error": self._error,
                 "mode": self._mode,
                 "line": self._line,
@@ -127,12 +137,20 @@ class SstvManager:
                 "input_samples": self._input_samples,
                 "rx_gain_db": self._rx_gain_db,
                 "decoder_level_dbfs": dbfs_of(self._decoder_peak),
+                "input_level_dbfs": self._input_level_dbfs,
+                "clipped_samples": self._clipped_samples,
+                "queued_audio_seconds": round(
+                    float(getattr(self._audio_queue, "pending_seconds", 0.0))
+                    + self._pending_batch_samples / max(1, self._input_sample_rate), 3),
+                "capture_error": self._audio_capture.status()["error"],
+                "radio_audio_diagnostics": dict(self._radio_audio_diagnostics),
                 "image_quality": self._current.get("quality") if self._current else None,
                 "interference_packets": self._interference_packets,
                 "dropped_packets": self._dropped_packets,
                 "gallery_count": self._gallery_count,
                 "audio_source": "Native IC-9700 SUB/RX PCM",
-                "decoder": "slowrx.rs 0.5.3-pisat.3",
+                "decoder": "SSTVFlow 0.1.1",
+                "supported_modes": list(SSTV_MODE_DIMENSIONS),
                 "decoder_error": self._last_worker_error,
                 "current_image": current,
                 "file_decode": {
@@ -150,7 +168,7 @@ class SstvManager:
         width: int,
         height: int,
     ) -> dict[str, int | str]:
-        """Describe changes between rendered lines and slowrx's final image."""
+        """Describe changes between rendered lines and the authoritative final image."""
         if progressive is None or len(progressive) != width * height * 3:
             return {
                 "schema_version": 1,
@@ -221,9 +239,6 @@ class SstvManager:
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg is None:
             raise SstvDecodeError("ffmpeg is required for MP3/WAV upload decoding")
-        decoder = self._decoder_path()
-        if decoder is None:
-            raise SstvDecodeError("The bundled 64-bit SSTV decoder is unavailable")
         convert: subprocess.Popen[bytes] | None = None
         try:
             convert = subprocess.Popen(
@@ -265,14 +280,16 @@ class SstvManager:
         process: subprocess.Popen[bytes] | None = None
         try:
             process = subprocess.Popen(
-                [str(decoder), str(_FILE_SAMPLE_RATE)],
+                self._decoder_command(_FILE_SAMPLE_RATE),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
                 shell=False,
             )
-            stdout, _ = process.communicate(input=pcm, timeout=_FILE_DECODE_TIMEOUT_S)
+            framed = b"".join(frame_pcm(pcm[start:start + MAX_FRAME_BYTES])
+                              for start in range(0, len(pcm), MAX_FRAME_BYTES))
+            stdout, _ = process.communicate(input=framed, timeout=_FILE_DECODE_TIMEOUT_S)
         except subprocess.TimeoutExpired as exc:
             if process is not None:
                 process.kill()
@@ -291,6 +308,10 @@ class SstvManager:
         final_rgb: bytes | None = None
         partial = False
         acquisition: dict[str, Any] | None = None
+        final_event: dict[str, Any] = {}
+        final_progressive: bytearray | None = None
+        final_received_lines: set[int] = set()
+        adapter = SstvEventAdapter()
         for raw_line in stdout.splitlines():
             try:
                 event = json.loads(raw_line)
@@ -298,43 +319,29 @@ class SstvManager:
                 raise SstvDecodeError("The SSTV decoder returned invalid event data") from exc
             if not isinstance(event, dict):
                 continue
+            event = adapter.adapt(event)
+            if event is None:
+                continue
             event_type = event.get("type")
-            if event_type in {"vis_detected", "blind_detected"}:
+            if event_type == "vis_detected":
+                received_lines.clear()
+                acquisition = event.get("acquisition")
                 mode = str(event.get("mode") or "SSTV")
                 width = int(event["width"])
                 height = int(event["height"])
                 if not 0 < width <= 2048 or not 0 < height <= 2048:
                     raise SstvDecodeError("The decoder returned invalid image dimensions")
                 progressive = bytearray(width * height * 3)
-                if event_type == "blind_detected":
-                    confidence = float(event.get("confidence", 0.0))
-                    confidence = (
-                        max(0.0, min(1.0, confidence))
-                        if math.isfinite(confidence)
-                        else 0.0
-                    )
-                    expected_height = int(event.get("expected_height", height))
-                    if not height <= expected_height <= 2048:
-                        raise SstvDecodeError("The decoder returned an invalid expected image height")
-                    acquisition = {
-                        "method": "blind",
-                        "confidence": confidence,
-                        "recovered_lines": height,
-                        "expected_lines": expected_height,
-                        "row_origin_known": False,
-                        "mode_inferred": bool(event.get("mode_inferred", False)),
-                        "color_phase_inferred": bool(event.get("color_phase_inferred", False)),
-                        "candidates": [str(value) for value in event.get("candidates", [])],
-                    }
                 self._publish(
                     {
                         "type": "image_started",
                         "source": "upload",
+                        "image_id": event.get("image_id"),
                         "mode": mode,
                         "width": width,
                         "height": height,
                         "frequency_offset_hz": float(event.get("frequency_offset_hz", 0.0)),
-                        "partial": event_type == "blind_detected",
+                        "partial": bool(event.get("partial", False)),
                         "acquisition": acquisition,
                     }
                 )
@@ -354,9 +361,18 @@ class SstvManager:
                         "line_index": line,
                         "width": width,
                         "rgb_base64": event["rgb_base64"],
+                        "height": height,
+                        "mode": mode,
+                        "row_revision": event.get("row_revision", False),
+                        "revision": event.get("revision", 0),
+                        "image_id": event.get("image_id"),
                     }
                 )
             elif event_type == "image_complete":
+                final_event = event
+                final_progressive = bytearray(progressive) if progressive is not None else None
+                final_received_lines = set(received_lines)
+                acquisition = event.get("acquisition")
                 mode = str(event.get("mode") or mode or "SSTV")
                 width = int(event["width"])
                 height = int(event["height"])
@@ -364,34 +380,15 @@ class SstvManager:
                 if len(final_rgb) != width * height * 3:
                     raise SstvDecodeError("The decoder returned an invalid final image")
                 partial = bool(event.get("partial", False))
-                if event.get("acquisition") == "blind":
-                    recovered = int(event.get("recovered_lines", height))
-                    if recovered != height:
-                        raise SstvDecodeError("The decoder returned inconsistent partial image metadata")
-                    if acquisition is None:
-                        confidence = float(event.get("confidence", 0.0))
-                        confidence = (
-                            max(0.0, min(1.0, confidence))
-                            if math.isfinite(confidence)
-                            else 0.0
-                        )
-                        expected_height = int(event.get("expected_height", height))
-                        if not height <= expected_height <= 2048:
-                            raise SstvDecodeError(
-                                "The decoder returned an invalid expected image height"
-                            )
-                        acquisition = {
-                            "method": "blind",
-                            "confidence": confidence,
-                            "recovered_lines": height,
-                            "expected_lines": expected_height,
-                            "row_origin_known": False,
-                        }
 
-        if final_rgb is None or not mode:
+        if final_rgb is None or not final_event:
             raise SstvDecodeError("No decodable SSTV image was detected in the uploaded audio")
+        mode = str(final_event["mode"])
+        width, height = int(final_event["width"]), int(final_event["height"])
+        partial = bool(final_event.get("partial"))
+        acquisition = final_event.get("acquisition")
         diagnostic = self.compare_progressive_to_final(
-            progressive, received_lines, final_rgb, width, height
+            final_progressive, final_received_lines, final_rgb, width, height
         )
         metadata = self.gallery.save(
             mode=mode,
@@ -399,12 +396,14 @@ class SstvManager:
             height=height,
             rgb=final_rgb,
             partial=partial,
-            quality="degraded" if partial else "clean",
+            quality=str(final_event.get("quality", "degraded" if partial else "clean")),
             interference_packets=0,
             context={"source": "uploaded"},
             source="uploaded",
             diagnostic=diagnostic,
             acquisition=acquisition,
+            png=final_event.get("png_bytes"),
+            reception=final_event.get("reception"),
         )
         self._notify_image_saved(metadata)
         with self._lock:
@@ -414,7 +413,7 @@ class SstvManager:
                 "type": "image_complete",
                 "source": "upload",
                 "image": metadata,
-                "degraded": partial,
+                "degraded": final_event.get("quality") == "degraded",
             }
         )
         return metadata
@@ -422,7 +421,7 @@ class SstvManager:
     def set_rx_gain_db(self, value: Any) -> dict[str, Any]:
         """Trim the level of the decoder's own copy of the receive audio.
 
-        This affects only the secondary stream that feeds slowrx. The radio, the
+        This affects only the secondary stream that feeds SSTVFlow. The radio, the
         browser playback level, and every other audio consumer are untouched.
         """
         gain = clamp_gain_db(value)
@@ -455,15 +454,26 @@ class SstvManager:
                     raise ValueError("Unable to verify the radio connection; enable SSTV after it reconnects") from exc
                 if not radio or not radio.get("connected"):
                     raise ValueError("The radio is disconnected; wait for it to reconnect before enabling SSTV")
+                try:
+                    self._audio_capture.start()
+                except OSError as exc:
+                    raise ValueError(f"Unable to start SSTV audio capture: {exc}") from exc
                 with self._lock:
                     self._enabled = True
                     self._state = self.WAITING
                     self._error = None
                     self._fatal_worker = False
                     self._decoder_peak = 0
-                    self._audio_capture.clear()
-                    self._audio_capture_bytes = 0
-                    self._audio_capture_rate = 0
+                    self._finish_requested = False
+                    self._input_samples = 0
+                    self._input_level_dbfs = None
+                    self._clipped_samples = 0
+                    self._radio_audio_diagnostics = {}
+                    self._reported_capture_error = None
+                    self._pending_batch_samples = 0
+                    self._last_packet_sequence = None
+                    self._dropped_packets = 0
+                    self._interference_packets = 0
                     self._stop.clear()
                     self._thread = Thread(target=self._run, name="sstv-decoder", daemon=True)
                     thread = self._thread
@@ -475,25 +485,33 @@ class SstvManager:
                 with self._lock:
                     if not self._enabled:
                         return self.snapshot()
+                    self._finish_requested = True
+                    thread = self._thread
+                    controller = self._audio_controller
+                    audio_queue = self._audio_queue
+                # Detach reception before draining so a slow decoder has a
+                # finite set of accepted samples to finish.
+                if controller is not None and audio_queue is not None:
+                    controller.unsubscribe_audio(audio_queue)
+                self._publish_debug("info", "Reception stopped; finishing queued SSTV audio.")
+                self._stop.set()
+                self._wake.set()
+                self._publish_status()
+                if thread is not None:
+                    thread.join()
+                else:
+                    self._terminate_worker(drain=True)
+                    self._audio_capture.close()
+                with self._lock:
                     self._enabled = False
+                    self._finish_requested = False
                     self._state = self.DISABLED
-                    self._error = None
+                    self._thread = None
                     self._mode = None
                     self._line = 0
                     self._total_lines = 0
                     self._frequency_offset_hz = None
                     self._current = None
-                    self._last_packet_sequence = None
-                    self._dropped_packets = 0
-                    self._interference_packets = 0
-                    thread = self._thread
-                    self._thread = None
-                self._publish_debug("info", "SSTV decoder disabled by operator.")
-                self._stop.set()
-                self._wake.set()
-                self._terminate_worker()
-                if thread is not None:
-                    thread.join(timeout=3.0)
                 self._publish_status()
         return self.snapshot()
 
@@ -520,36 +538,21 @@ class SstvManager:
         return encode_png(width, height, rgb)
 
     def _capture_decoder_pcm(self, pcm: bytes, sample_rate: int) -> None:
-        with self._lock:
-            if sample_rate != self._audio_capture_rate:
-                self._audio_capture.clear()
-                self._audio_capture_bytes = 0
-                self._audio_capture_rate = sample_rate
-            self._audio_capture.append(pcm)
-            self._audio_capture_bytes += len(pcm)
-            limit = sample_rate * 2 * _DECODER_CAPTURE_SECONDS
-            while self._audio_capture_bytes > limit:
-                excess = self._audio_capture_bytes - limit
-                first = self._audio_capture.popleft()
-                removed = min(excess, len(first))
-                self._audio_capture_bytes -= removed
-                if removed < len(first):
-                    self._audio_capture.appendleft(first[removed:])
+        self._audio_capture.append_decoder(pcm, sample_rate)
+
+    def export_audio_capture(self, kind: str) -> Path | None:
+        if kind == "metadata":
+            return self._audio_capture.export_metadata()
+        return self._audio_capture.export(kind)
 
     def decoder_audio_wav(self) -> bytes | None:
-        with self._lock:
-            chunks = tuple(self._audio_capture)
-            sample_rate = self._audio_capture_rate
-        if not chunks or not sample_rate:
+        path = self.export_audio_capture("decoder")
+        if path is None:
             return None
-        output = io.BytesIO()
-        with wave.open(output, 'wb') as recording:
-            recording.setnchannels(1)
-            recording.setsampwidth(2)
-            recording.setframerate(sample_rate)
-            for chunk in chunks:
-                recording.writeframesraw(chunk)
-        return output.getvalue()
+        try:
+            return path.read_bytes()
+        finally:
+            path.unlink(missing_ok=True)
 
     @staticmethod
     def extract_rx_pcm(packet: bytes, channels: int) -> bytes:
@@ -603,6 +606,8 @@ class SstvManager:
         return delta - 1
 
     def _handle_audio_gap(self, missing_packets: int) -> None:
+        if missing_packets <= 0:
+            return
         with self._lock:
             self._dropped_packets += missing_packets
             self._interference_packets += missing_packets
@@ -615,7 +620,7 @@ class SstvManager:
         LOGGER.warning(
             "SSTV audio gap detected missing_packets=%d action=%s",
             missing_packets,
-            "restart" if major else "continue",
+            "reacquire",
         )
         self._publish(
             {
@@ -626,41 +631,65 @@ class SstvManager:
         )
         if decoding:
             self._publish_status()
-        if major:
-            self._save_current_as_degraded()
+        self._write_frame(frame_control({"command": "discontinuity", "lost_samples": None}))
 
-    def _save_current_as_degraded(self) -> None:
+    def _feed_audio_packets(self, packets: list[bytes], sample_rate: int, channels: int) -> int:
+        wrote_samples = 0
         with self._lock:
-            current = self._current
-            if (
-                current is None
-                or int(current.get("last_line", 0)) <= 0
-                or current.get("partial_saved")
-            ):
-                return
-            mode = str(current["mode"])
-            width = int(current["width"])
-            height = int(current["height"])
-            rgb = bytes(current["pixels"])
-            context = dict(self._capture_context or self.get_context())
-            interference_packets = int(current.get("interference_packets", 0))
-            current["quality"] = "degraded"
-        metadata = self.gallery.save(
-            mode=mode,
-            width=width,
-            height=height,
-            rgb=rgb,
-            partial=True,
-            quality="degraded",
-            interference_packets=interference_packets,
-            context=context,
-        )
-        self._notify_image_saved(metadata)
+            self._pending_batch_samples = sum(max(0, len(packet) - 24) // (2 * channels)
+                                              for packet in packets)
+        for packet in packets:
+            pcm = self.extract_rx_pcm(packet, channels)
+            if not pcm:
+                self._publish_debug("warn", "Rejected a malformed SSTV audio packet.")
+                continue
+            gap = self._packet_gap(packet)
+            gain = self._rx_gain_db
+            input_level = self._pcm_rms_dbfs(pcm)
+            stream = apply_gain_db(pcm, gain)
+            peak = peak_of(stream)
+            clipped = 0
+            if gain > 0:
+                values = array("h")
+                values.frombytes(pcm)
+                if sys.byteorder != "little":
+                    values.byteswap()
+                factor = 10.0 ** (gain / 20.0)
+                clipped = sum(not -32768 <= int(value * factor) <= 32767 for value in values)
+            with self._lock:
+                self._input_level_dbfs = input_level
+                self._decoder_peak = max(peak, int(self._decoder_peak * 0.9))
+                self._clipped_samples += clipped
+                radio_diagnostics = dict(self._radio_audio_diagnostics)
+            self._audio_capture.append_source(pcm, sample_rate, {
+                "consumer_at_monotonic": monotonic(),
+                "local_sequence": self._packet_sequence(packet),
+                "local_missing_packets": gap,
+                "gain_db": gain,
+                "source_peak_dbfs": dbfs_of(peak_of(pcm)),
+                "source_rms_dbfs": input_level,
+                "decoder_peak_dbfs": dbfs_of(peak),
+                "gain_clipped_samples": clipped,
+                "radio_audio_diagnostics": radio_diagnostics,
+            })
+            if gap:
+                self._handle_audio_gap(gap)
+            if self._write_pcm(stream):
+                self._capture_decoder_pcm(stream, sample_rate)
+                wrote_samples += len(stream) // 2
+            with self._lock:
+                self._pending_batch_samples -= len(pcm) // 2
+            capture_error = self._audio_capture.status()["error"]
+            if capture_error and capture_error != self._reported_capture_error:
+                self._reported_capture_error = capture_error
+                self._publish_debug("error", capture_error)
+                self._publish_status()
         with self._lock:
-            if self._current is current:
-                current["partial_saved"] = True
-            self._gallery_count = len(self.gallery.list())
-        self._publish({"type": "image_complete", "image": metadata, "degraded": True})
+            self._pending_batch_samples = 0
+            self._input_samples += wrote_samples
+            if wrote_samples:
+                self._last_audio_at = monotonic()
+        return wrote_samples
 
     def _run(self) -> None:
         LOGGER.info("SSTV RX audio consumer thread started")
@@ -695,8 +724,13 @@ class SstvManager:
                         channels = 2 if controller.config.rx_codec == "lpcm16_stereo" else 1
                         audio_queue = controller.subscribe_audio(
                             self._wake.set,
-                            max_seconds=_SSTV_AUDIO_BUFFER_SECONDS,
+                            max_seconds=None,
+                            drop_oldest=False,
                         )
+                        with self._lock:
+                            self._audio_controller = controller
+                            self._audio_queue = audio_queue
+                            self._input_sample_rate = sample_rate
                         channel_text = "stereo SUB/RX channel" if channels == 2 else "mono RX"
                         LOGGER.info(
                             "SSTV subscribed to radio RX audio: %d Hz %s",
@@ -718,9 +752,18 @@ class SstvManager:
                         radio = snapshot_reader() if snapshot_reader is not None else controller.snapshot()
                         if radio is not None:
                             connected = bool(radio.get("connected"))
+                            with self._lock:
+                                self._radio_audio_diagnostics = {
+                                    key: value for key, value in radio.items()
+                                    if key.startswith("rx_audio_")
+                                }
                     except Exception:
                         pass
                 if connected != reported_connection:
+                    if reported_connection is True and not connected:
+                        self._terminate_worker()
+                        with self._lock:
+                            self._last_packet_sequence = None
                     LOGGER.info(
                         "SSTV radio connection %s",
                         "up" if connected else "down",
@@ -730,42 +773,24 @@ class SstvManager:
                         "Radio connection is up." if connected else "Radio is disconnected; RX audio is unavailable.",
                     )
                     reported_connection = connected
-                packets = controller.read_audio(audio_queue) if connected and audio_queue is not None else []
-                if packets:
-                    debug_packets += len(packets)
+                if connected and audio_queue is not None:
+                    # Keep packets queued until a worker can accept them.
                     if not self._ensure_worker(int(sample_rate)):
+                        with self._lock:
+                            fatal_worker = self._fatal_worker
+                        if fatal_worker:
+                            break
                         self._wake.wait(0.5)
                         self._wake.clear()
                         continue
-                    wrote_samples = 0
-                    for packet in packets:
-                        gap = self._packet_gap(packet)
-                        if gap:
-                            self._handle_audio_gap(gap)
-                            if gap > _MINOR_GAP_PACKETS:
-                                # A large missing span destroys timing context. Do
-                                # not synthesize samples or let slowrx bridge it;
-                                # terminate the decoder so the next packet starts
-                                # a fresh VIS search boundary.
-                                self._terminate_worker()
-                                if not self._ensure_worker(int(sample_rate)):
-                                    continue
-                        pcm = self.extract_rx_pcm(packet, channels)
-                        if not pcm:
-                            continue
-                        input_level_dbfs = self._pcm_rms_dbfs(pcm)
-                        last_input_rms_dbfs = input_level_dbfs
-                        stream = apply_gain_db(pcm, self._rx_gain_db)
-                        with self._lock:
-                            self._decoder_peak = max(peak_of(stream), int(self._decoder_peak * 0.9))
-                        if self._write_pcm(stream):
-                            self._capture_decoder_pcm(stream, int(sample_rate))
-                            wrote_samples += len(stream) // 2
+                packets = controller.read_audio(audio_queue) if connected and audio_queue is not None else []
+                if packets:
+                    debug_packets += len(packets)
+                    wrote_samples = self._feed_audio_packets(packets, int(sample_rate), channels)
+                    last_input_rms_dbfs = self._input_level_dbfs
                     if wrote_samples:
                         debug_samples += wrote_samples
                         with self._lock:
-                            self._input_samples += wrote_samples
-                            self._last_audio_at = monotonic()
                             resume_listening = (
                                 self._state in (self.WAITING, self.COMPLETE, self.FAILED)
                                 and not self._fatal_worker
@@ -782,12 +807,11 @@ class SstvManager:
                             self._set_state(self.WAITING)
                     self._wake.wait(0.25)
                     self._wake.clear()
-                # slowrx buffers a full mode-duration before emitting pixels.
-                # Audio amplitude cannot identify completion or justify a reset.
                 debug_now = monotonic()
                 debug_elapsed = debug_now - debug_window_started
                 if debug_elapsed >= 5.0:
                     queue_drops = int(getattr(audio_queue, "dropped", 0))
+                    pending_seconds = float(getattr(audio_queue, "pending_seconds", 0.0))
                     new_queue_drops = max(0, queue_drops - debug_queue_drops)
                     if debug_packets:
                         status = self.snapshot()
@@ -800,7 +824,7 @@ class SstvManager:
                         LOGGER.info(
                             "SSTV RX feed: %d packets, %d samples in %.1fs; "
                             "%d Hz %s; decoder peak=%s dBFS; latest packet RMS=%s dBFS; "
-                            "sequence gaps=%d; local queue drops=%d",
+                            "sequence gaps=%d; local queue drops=%d; queued audio=%.2fs",
                             debug_packets,
                             debug_samples,
                             debug_elapsed,
@@ -810,15 +834,23 @@ class SstvManager:
                             input_rms_text,
                             status["dropped_packets"],
                             queue_drops,
+                            pending_seconds,
                         )
                         self._publish_debug(
-                            "warn" if new_queue_drops else "info",
+                            "warn" if new_queue_drops or pending_seconds >= 1.0 else "info",
                             f"RX feed: {debug_packets} packets, {debug_samples} samples in {debug_elapsed:.1f}s; "
                             f"{sample_rate} Hz {input_path}; decoder peak {status['decoder_level_dbfs']} dBFS; "
                             f"latest packet RMS {input_rms_text} dBFS; "
                             f"sequence gaps total {status['dropped_packets']}; local queue drops "
-                            f"{new_queue_drops} this interval/{queue_drops} total.",
+                            f"{new_queue_drops} this interval/{queue_drops} total; "
+                            f"queued audio {pending_seconds:.2f}s.",
                         )
+                        if self._radio_audio_diagnostics:
+                            diagnostics = self._radio_audio_diagnostics
+                            self._publish_debug("info", "Radio audio sequence observations: "
+                                f"{diagnostics.get('rx_audio_sequence_skipped', 0)} skipped slots; "
+                                f"{diagnostics.get('rx_audio_duplicates', 0)} duplicates; "
+                                f"{diagnostics.get('rx_audio_out_of_order', 0)} out of order.")
                     else:
                         LOGGER.warning(
                             "SSTV received no RX audio packets in %.1fs (radio connected=%s, state=%s, local queue drops=%d)",
@@ -843,120 +875,139 @@ class SstvManager:
         finally:
             if controller is not None and audio_queue is not None:
                 controller.unsubscribe_audio(audio_queue)
-            self._terminate_worker()
+                self._feed_audio_packets(controller.read_audio(audio_queue), int(sample_rate), channels)
+            with self._lock:
+                self._audio_queue = None
+                self._audio_controller = None
+            self._terminate_worker(drain=self._stop.is_set() and not self._fatal_worker)
+            self._audio_capture.close()
 
-    def _decoder_path(self) -> Path | None:
+    def _decoder_command(self, sample_rate: int) -> list[str]:
         override = os.environ.get("PI_SAT_SSTV_DECODER")
-        candidates = []
         if override:
-            candidates.append(Path(override).expanduser())
-        suffix = ".exe" if os.name == "nt" else ""
-        candidates.extend(
-            [
-                self.project_root / "bin" / f"pi-sat-sstv-decoder{suffix}",
-            ]
-        )
-        path_entry = shutil.which("pi-sat-sstv-decoder")
-        if path_entry:
-            candidates.append(Path(path_entry))
-        return next((path for path in candidates if path.is_file()), None)
+            # An override implements the same framed input/NDJSON output contract.
+            return [str(Path(override).expanduser()), str(sample_rate)]
+        return [sys.executable, "-u", "-m", "pi_sat_controller.backend.sstv.worker", str(sample_rate)]
 
     def _ensure_worker(self, sample_rate: int) -> bool:
+        with self._lock:
+            if self._fatal_worker:
+                return False
         with self._process_lock:
+            exited = self._process is not None and self._process.poll() is not None
+        if exited:
+            self._terminate_worker()
+        with self._process_lock:
+            if self._closing_process is not None or self._stop.is_set():
+                return False
             if self._process is not None and self._process.poll() is None:
                 return True
-            path = self._decoder_path()
-            if path is None:
-                self._set_failure(
-                    "bundled slowrx worker is unavailable; install the 64-bit Pi-Sat package with bin/pi-sat-sstv-decoder",
-                    fatal=True,
-                )
-                return False
             try:
                 process = subprocess.Popen(
-                    [str(path), str(sample_rate)],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    bufsize=0,
-                    shell=False,
+                    self._decoder_command(sample_rate), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, shell=False,
                 )
             except OSError as exc:
-                self._set_failure(f"Unable to start slowrx worker: {exc}", fatal=True)
+                self._set_failure(f"Unable to start SSTVFlow worker: {exc}", fatal=True)
                 return False
             self._process = process
             self._process_generation += 1
             generation = self._process_generation
+            self._reader_done = Event()
+            reader_done = self._reader_done
             self._last_worker_error = None
-        LOGGER.info("SSTV slowrx worker started: %s (%d Hz)", path.name, sample_rate)
-        self._publish_debug("info", f"slowrx worker started: {path.name}, input rate {sample_rate} Hz.")
-        Thread(
-            target=self._read_worker_events,
-            args=(process, generation),
-            name="sstv-events",
-            daemon=True,
-        ).start()
-        Thread(
-            target=self._read_worker_errors,
-            args=(process, generation),
-            name="sstv-errors",
-            daemon=True,
-        ).start()
-        with self._lock:
             self._fatal_worker = False
+        LOGGER.info("SSTVFlow worker started (%d Hz)", sample_rate)
+        self._publish_debug("info", f"SSTVFlow worker started, input rate {sample_rate} Hz.")
+        Thread(target=self._read_worker_events, args=(process, generation, reader_done),
+               name="sstv-events", daemon=True).start()
+        Thread(target=self._read_worker_errors, args=(process, generation),
+               name="sstv-errors", daemon=True).start()
         return True
 
     def _write_pcm(self, pcm: bytes) -> bool:
-        with self._process_lock:
-            process = self._process
-            if process is None or process.stdin is None or process.poll() is not None:
+        for start in range(0, len(pcm), MAX_FRAME_BYTES):
+            if not self._write_frame(frame_pcm(pcm[start:start + MAX_FRAME_BYTES])):
                 return False
-        # The event reader must drain stdout while stdin is blocked. Holding
-        # the lifecycle lock here deadlocks when both pipe buffers are full.
-        try:
-            remaining = memoryview(pcm)
-            while remaining:
-                written = process.stdin.write(remaining)
-                if not written:
-                    raise BrokenPipeError("decoder input accepted no bytes")
-                remaining = remaining[written:]
-            process.stdin.flush()
-            return True
-        except (OSError, ValueError) as exc:
+        return True
+
+    def _write_frame(self, frame: bytes) -> bool:
+        # Serialize PCM/control frames without blocking the stdout reader's lock.
+        with self._write_lock:
             with self._process_lock:
-                active = process is self._process
-            if active and not self._stop.is_set():
-                self._set_failure(f"slowrx worker input failed: {exc}", fatal=True)
-            return False
+                process = self._process
+                if (process is None or process is self._closing_process or process.stdin is None
+                        or process.poll() is not None):
+                    return False
+            try:
+                remaining = memoryview(frame)
+                while remaining:
+                    written = process.stdin.write(remaining)
+                    if not written:
+                        raise BrokenPipeError("decoder input accepted no bytes")
+                    remaining = remaining[written:]
+                process.stdin.flush()
+                return True
+            except (OSError, ValueError) as exc:
+                with self._process_lock:
+                    active = process is self._process and process is not self._closing_process
+                if active and not self._stop.is_set():
+                    self._set_failure(f"SSTVFlow worker input failed: {exc}", fatal=True)
+                return False
 
-    def _terminate_worker(self) -> None:
-        with self._process_lock:
-            process = self._process
-            self._process = None
-            self._process_generation += 1
-        if process is None:
-            return
-        # Stop the reader first so a blocked stdin write can return before
-        # closing its file object (close may itself wait for a pending write).
-        if process.poll() is None:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=1.0)
-        if process.stdin is not None:
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
+    def _terminate_worker(self, *, drain: bool = False) -> None:
+        with self._termination_lock:
+            with self._process_lock:
+                process = self._process
+                if process is None:
+                    return
+                self._closing_process = process
+                reader_done = self._reader_done
+            graceful = self._write_lock.acquire(timeout=0.5)
+            if graceful:
+                try:
+                    if process.stdin is not None:
+                        process.stdin.close()
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    self._write_lock.release()
+            # A blocked writer means EOF cannot safely be delivered. Terminate
+            # within a finite deadline rather than deadlocking radio disconnect.
+            if process.poll() is None:
+                try:
+                    if not graceful:
+                        process.terminate()
+                    process.wait(timeout=None if drain and graceful else (3.0 if graceful else 1.0))
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=1.0)
+                except ProcessLookupError:
+                    pass
+            reader_done.wait(timeout=None if drain else 2.0)
+            if not reader_done.is_set():
+                LOGGER.warning("SSTVFlow final event drain exceeded shutdown deadline")
+            if not graceful and process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except (OSError, ValueError):
+                    pass
+            with self._process_lock:
+                if self._process is process:
+                    self._process = None
+                    self._process_generation += 1
+                self._closing_process = None
 
-    def _read_worker_events(self, process: subprocess.Popen[bytes], generation: int) -> None:
+    def _read_worker_events(self, process: subprocess.Popen[bytes], generation: int, reader_done: Event | None = None) -> None:
         if process.stdout is None:
+            if reader_done is not None:
+                reader_done.set()
             return
+        adapter = SstvEventAdapter()
         try:
             for raw_line in iter(process.stdout.readline, b""):
                 with self._process_lock:
@@ -966,19 +1017,23 @@ class SstvManager:
                     event = json.loads(raw_line)
                     if not isinstance(event, dict):
                         raise ValueError("worker event is not an object")
-                    self._handle_worker_event(event)
+                    event = adapter.adapt(event)
+                    if event is not None:
+                        self._handle_worker_event(event)
                 except Exception as exc:
-                    LOGGER.warning("Ignored invalid slowrx worker event: %s", exc)
-                    self._set_failure(f"slowrx event handling failed: {exc}", fatal=False)
+                    LOGGER.warning("Ignored invalid SSTVFlow worker event: %s", exc)
+                    self._set_failure(f"SSTVFlow event handling failed: {exc}", fatal=False)
         finally:
             process.stdout.close()
+            if reader_done is not None:
+                reader_done.set()
             with self._process_lock:
                 active = generation == self._process_generation and process is self._process
-            if active and not self._stop.is_set():
+            if active and process is not self._closing_process and not self._stop.is_set():
                 exit_code = process.poll()
                 with self._lock:
                     worker_error = self._last_worker_error
-                message = f"slowrx worker exited unexpectedly (code {exit_code})"
+                message = f"SSTVFlow worker exited unexpectedly (code {exit_code})"
                 if worker_error:
                     message = f"{message}: {worker_error}"
                 self._set_failure(message, fatal=True)
@@ -995,25 +1050,39 @@ class SstvManager:
                 if message:
                     with self._lock:
                         self._last_worker_error = message[-512:]
-                    LOGGER.warning("slowrx: %s", message)
-                    self._publish_debug("warn", f"slowrx stderr: {message}")
+                    LOGGER.warning("SSTVFlow: %s", message)
+                    self._publish_debug("warn", f"SSTVFlow stderr: {message}")
         finally:
             process.stderr.close()
 
     def _handle_worker_event(self, event: dict[str, Any]) -> None:
-        with self._lock:
-            if not self._enabled:
-                return
         event_type = event.get("type")
         if event_type == "ready":
-            LOGGER.info("SSTV slowrx worker ready; scanning for VIS headers")
-            self._publish_debug("info", "slowrx worker ready; scanning audio for SSTV VIS headers.")
+            modes = ", ".join(SSTV_MODE_DIMENSIONS)
+            LOGGER.info("SSTVFlow worker ready; scanning for %s", modes)
+            self._publish_debug("info", f"SSTVFlow ready; scanning for {modes} headers and line structure.")
+            return
+        if event_type in {"status", "quality", "acquisition"}:
+            offset = event.get("frequency_offset_hz")
+            if isinstance(offset, (int, float)) and math.isfinite(offset):
+                with self._lock:
+                    self._frequency_offset_hz = float(offset)
+            self._publish({"type": "decoder_status", "decoder_event": event})
+            self._publish_status()
+            return
+        if event_type in {"warning", "error"}:
+            message = str(event.get("message") or event.get("code") or "Decoder warning")
+            self._publish_debug("error" if event_type == "error" else "warn", message)
+            if event_type == "error":
+                with self._lock:
+                    self._last_worker_error = message[-512:]
+                self._set_failure(message, fatal=event.get("code") == "worker_failed")
             return
         if event_type == "vis_detected":
             width = int(event["width"])
             height = int(event["height"])
             if not 0 < width <= 2048 or not 0 < height <= 2048:
-                raise ValueError("slowrx returned invalid image dimensions")
+                raise ValueError("SSTVFlow returned invalid image dimensions")
             with self._lock:
                 self._mode = str(event["mode"])
                 self._line = 0
@@ -1021,17 +1090,19 @@ class SstvManager:
                 self._frequency_offset_hz = float(event["frequency_offset_hz"])
                 self._capture_context = dict(self.get_context())
                 self._current = {
+                    "image_id": event.get("image_id"),
+                    "acquisition": event.get("acquisition"),
                     "mode": self._mode,
                     "width": width,
                     "height": height,
                     "last_line": 0,
-                    "quality": "clean",
+                    "quality": "degraded" if event.get("partial") else "clean",
                     "interference_packets": 0,
                     "pixels": bytearray(width * height * 3),
                     "received_lines": set(),
                 }
             LOGGER.info(
-                "SSTV VIS detected: %s %dx%d at %+.1f Hz",
+                "SSTV acquired: %s %dx%d at %+.1f Hz",
                 self._mode,
                 width,
                 height,
@@ -1040,7 +1111,7 @@ class SstvManager:
             self._set_state(self.DETECTED)
             self._publish_debug(
                 "info",
-                f"VIS detected: {self._mode}, {width}x{height}, "
+                f"SSTV acquired: {self._mode}, {width}x{height}, "
                 f"frequency offset {self._frequency_offset_hz:+.1f} Hz.",
             )
             self._publish(
@@ -1050,6 +1121,9 @@ class SstvManager:
                     "width": width,
                     "height": height,
                     "frequency_offset_hz": self._frequency_offset_hz,
+                    "partial": bool(event.get("partial")),
+                    "acquisition": event.get("acquisition"),
+                    "image_id": event.get("image_id"),
                 }
             )
             return
@@ -1064,7 +1138,7 @@ class SstvManager:
             line_index = int(event["line_index"])
             width = int(event["width"])
             if len(rgb) != width * 3:
-                raise ValueError("slowrx line buffer length is invalid")
+                raise ValueError("SSTVFlow line buffer length is invalid")
             drop_reason = None
             line_height = 0
             with self._lock:
@@ -1086,19 +1160,19 @@ class SstvManager:
                     self._line = current["last_line"]
             if drop_reason:
                 LOGGER.warning(
-                    "SSTV slowrx line %d discarded by backend: %s",
+                    "SSTVFlow line %d discarded by backend: %s",
                     line_index + 1,
                     drop_reason,
                 )
                 self._publish_debug(
                     "error",
-                    f"slowrx emitted line {line_index + 1}, but Pi-Sat discarded it: {drop_reason}.",
+                    f"SSTVFlow emitted line {line_index + 1}, but Pi-Sat discarded it: {drop_reason}.",
                 )
                 return
-            LOGGER.debug("SSTV slowrx line %d/%d accepted", line_index + 1, line_height)
+            LOGGER.debug("SSTVFlow line %d/%d accepted", line_index + 1, line_height)
             self._publish_debug(
                 "info",
-                f"slowrx emitted line {line_index + 1}/{line_height}; Pi-Sat accepted and forwarding it to the page.",
+                f"SSTVFlow emitted line {line_index + 1}/{line_height}; Pi-Sat accepted and forwarding it to the page.",
             )
             self._set_state(self.DECODING)
             self._publish(
@@ -1107,6 +1181,11 @@ class SstvManager:
                     "line_index": line_index,
                     "width": width,
                     "rgb_base64": event["rgb_base64"],
+                    "height": line_height,
+                    "mode": self._mode,
+                    "row_revision": event.get("row_revision", False),
+                    "revision": event.get("revision", 0),
+                    "image_id": event.get("image_id"),
                 }
             )
             return
@@ -1115,7 +1194,7 @@ class SstvManager:
             height = int(event["height"])
             rgb = base64.b64decode(str(event["rgb_base64"]), validate=True)
             if len(rgb) != width * height * 3:
-                raise ValueError("slowrx image buffer length is invalid")
+                raise ValueError("SSTVFlow image buffer length is invalid")
             with self._lock:
                 mode = str(event["mode"])
                 previous_quality = str(self._current.get("quality", "clean")) if self._current else "clean"
@@ -1130,7 +1209,9 @@ class SstvManager:
                     "width": width,
                     "height": height,
                     "last_line": height,
-                    "quality": "degraded" if event.get("partial", False) or previous_quality != "clean" else "clean",
+                    "quality": "degraded" if event.get("quality") == "degraded" or event.get("partial", False) or previous_quality != "clean" else "clean",
+                    "image_id": event.get("image_id"),
+                    "acquisition": event.get("acquisition"),
                     "interference_packets": previous_interference,
                     "pixels": bytearray(rgb),
                     "received_lines": set(range(height)),
@@ -1156,6 +1237,9 @@ class SstvManager:
                 context=context,
                 source="radio",
                 diagnostic=diagnostic,
+                png=event.get("png_bytes"),
+                acquisition=event.get("acquisition"),
+                reception=event.get("reception"),
             )
             self._notify_image_saved(metadata)
             with self._lock:
@@ -1175,7 +1259,8 @@ class SstvManager:
                 f"{interference_packets} missing audio packets; saved {metadata.get('filename', 'image')}.",
             )
             self._set_state(self.COMPLETE)
-            self._publish({"type": "image_complete", "source": "radio", "image": metadata})
+            self._publish({"type": "image_complete", "source": "radio", "image": metadata,
+                           "degraded": quality != "clean"})
 
     def _notify_image_saved(self, metadata: dict[str, Any]) -> None:
         if self.on_image_saved is None:

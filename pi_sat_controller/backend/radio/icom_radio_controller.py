@@ -1164,7 +1164,7 @@ class IcomRadioController:
 
     def subscribe_audio(
         self, notify: Callable[[], None] | None = None,
-        *, max_seconds: float = 0.12, drop_oldest: bool = True,
+        *, max_seconds: float | None = 0.12, drop_oldest: bool = True,
     ) -> AudioBuffer:
         with self._audio_lock:
             queue = AudioBuffer(

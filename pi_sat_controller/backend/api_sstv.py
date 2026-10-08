@@ -11,6 +11,7 @@ from urllib.parse import unquote
 
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
+from starlette.background import BackgroundTask
 from pi_sat_controller.backend.sstv.manager import SstvDecodeError
 
 LOGGER = logging.getLogger(__name__)
@@ -46,19 +47,34 @@ def register_sstv_api(
     def list_sstv_images() -> list[dict[str, Any]]:
         return get_manager().gallery.list()
 
-    @app.get("/api/sstv/decoder-audio")
-    def download_decoder_audio() -> Response:
-        audio = get_manager().decoder_audio_wav()
-        if audio is None:
-            raise HTTPException(status_code=404, detail="No decoder input audio has been captured")
-        return Response(
-            content=audio,
-            media_type="audio/wav",
-            headers={
-                "Cache-Control": "no-store",
-                "Content-Disposition": 'attachment; filename="sstv-decoder-input.wav"',
-            },
+    def download_audio_capture(kind: str, filename: str, media_type: str) -> FileResponse:
+        try:
+            path = get_manager().export_audio_capture(kind)
+        except (RuntimeError, OSError) as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Could not export SSTV audio capture: {exc}"
+            ) from exc
+        if path is None:
+            raise HTTPException(status_code=404, detail="No SSTV audio capture is available")
+        return FileResponse(
+            path,
+            media_type=media_type,
+            filename=filename,
+            headers={"Cache-Control": "no-store"},
+            background=BackgroundTask(path.unlink, missing_ok=True),
         )
+
+    @app.get("/api/sstv/source-audio")
+    def download_source_audio() -> FileResponse:
+        return download_audio_capture("source", "sstv-sub-source.wav", "audio/wav")
+
+    @app.get("/api/sstv/decoder-audio")
+    def download_decoder_audio() -> FileResponse:
+        return download_audio_capture("decoder", "sstv-decoder-input.wav", "audio/wav")
+
+    @app.get("/api/sstv/audio-diagnostics")
+    def download_audio_diagnostics() -> FileResponse:
+        return download_audio_capture("metadata", "sstv-audio-diagnostics.jsonl", "application/x-ndjson")
 
     @app.post("/api/sstv/upload")
     async def upload_sstv_audio(request: Request) -> dict[str, Any]:

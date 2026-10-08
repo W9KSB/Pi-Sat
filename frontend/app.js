@@ -1,5 +1,6 @@
 ﻿
 let latestTracking = null;
+let latestTrackingReceivedAtMs = 0;
 let selectedSatelliteNorad = null;
 let selectedFrequencyProfileIndex = 0;
 let selectedManagedSatelliteNorad = null;
@@ -1446,7 +1447,9 @@ async function postTrackingAction(path, statusText, options = {}) {
       body: includeTrackingSelection
         ? JSON.stringify({
           norad_id: selectedSatelliteNorad,
-          frequency_profile_index: selectedFrequencyProfileIndex,
+          frequency_profile_index: options.useRememberedProfile
+            ? null
+            : selectedFrequencyProfileIndex,
           // RX-only profiles leave the remembered RX/TX sync preference
           // untouched, so this is false only after RX/TX sync was disabled.
           sync_offsets: syncRxTx,
@@ -1458,6 +1461,7 @@ async function postTrackingAction(path, statusText, options = {}) {
       addLog(result.detail || 'Tracking command failed.');
       return;
     }
+    rememberTrackingProfile(result);
     if (!options.suppressRender) {
       renderTracking(result);
     }
@@ -1623,13 +1627,16 @@ async function selectSatelliteByNorad(noradId, options = {}) {
   }
   beginMapRefresh(satellite.norad_id, satellite.name);
   selectedSatelliteNorad = satellite.norad_id;
-  selectedFrequencyProfileIndex = 0;
+  const rememberedIndex = satellite.frequency_profiles.findIndex((profile) => {
+    return profile.name === satellite.last_transponder_name;
+  });
+  selectedFrequencyProfileIndex = rememberedIndex >= 0 ? rememberedIndex : 0;
   document.getElementById('selected-satellite').textContent = satellite.name;
   document.getElementById('selected-satellite-azimuth').textContent = 'Az --';
   document.getElementById('selected-satellite-elevation').textContent = 'El --';
   document.getElementById('tracking-pass-state').textContent = '--';
   renderFrequencyProfileOptions(satellite);
-  const result = await syncTrackingForSelection(options);
+  const result = await syncTrackingForSelection({ ...options, useRememberedProfile: true });
   if (
     options.suppressRender
     && Number(satellite.norad_id) === Number(result?.norad_id)
@@ -4089,6 +4096,7 @@ function buildSettingControl(section, key, value) {
     control.className = 'form-control multiline-setting';
     control.rows = 4;
     control.value = value;
+    control.title = 'One URL per line. TLE or CelesTrak JSON format is detected automatically.';
     row.classList.add('settings-row-wide');
     } else {
       control = document.createElement('input');
@@ -4487,6 +4495,8 @@ async function saveSettings(event) {
     settings[section][key] = element.value;
   });
 
+  const orbitalSourceChanged = settings.tle?.source_url !== undefined
+    && settings.tle.source_url !== currentSettingsState?.tle?.source_url;
   status.textContent = 'Saving settings...';
   try {
     const response = await fetch('/api/settings', {
@@ -4503,12 +4513,22 @@ async function saveSettings(event) {
     const runtimeWarnings = Array.isArray(result.runtime_warnings)
       ? result.runtime_warnings.filter(Boolean)
       : [];
-    status.textContent = runtimeWarnings.length
+    const savedStatus = runtimeWarnings.length
       ? `Settings saved, with connection warnings: ${runtimeWarnings.join(' ')}`
       : 'Settings saved and connections reloaded.';
+    status.textContent = savedStatus;
     loadStatus();
     await loadSettings();
     loadRotator();
+    if (orbitalSourceChanged) {
+      const refreshed = await refreshTleData();
+      status.textContent = refreshed
+        ? `${savedStatus} ${status.textContent}`
+        : `Settings saved, but orbital data refresh failed. ${status.textContent}`;
+      if (!refreshed && runtimeWarnings.length) {
+        status.textContent += ` Connection warnings: ${runtimeWarnings.join(' ')}`;
+      }
+    }
   } catch (error) {
     status.textContent = 'Settings save failed.';
   }
@@ -4579,22 +4599,24 @@ async function flushDeviceControlUpdates() {
 
 async function refreshTleData() {
   const status = document.getElementById('settings-status');
-  status.textContent = 'Refreshing TLE data...';
+  status.textContent = 'Refreshing orbital data...';
   try {
     const response = await fetch('/api/tle/refresh', { method: 'POST' });
     const result = await response.json();
     if (!response.ok) {
-      status.textContent = result.detail || 'TLE refresh failed.';
-      return;
+      status.textContent = result.detail || 'Orbital data refresh failed.';
+      return false;
     }
-    status.textContent = `TLE data refreshed (${result.refreshed_at_utc || 'complete'}).`;
+    status.textContent = `Orbital data refreshed (${result.refreshed_at_utc || 'complete'}).`;
     await loadPasses();
     await loadTrackedSatelliteLocations();
     await loadTracking(true);
     drawMap();
     drawTrackedSatellitesMap();
+    return true;
   } catch (error) {
-    status.textContent = 'TLE refresh failed.';
+    status.textContent = 'Orbital data refresh failed.';
+    return false;
   }
 }
 
@@ -4667,7 +4689,7 @@ function formatSettingLabel(key) {
     latitude_deg: 'Latitude (deg)',
     longitude_deg: 'Longitude (deg)',
     elevation_m: 'Elevation (m)',
-    source_url: 'TLE Source URLs',
+    source_url: 'Orbital Data Source URLs (TLE or JSON)',
     stale_after_hours: 'Stale After (hours)',
     satellites_file: 'Satellites File',
     min_elevation_deg: 'Minimum Elevation (deg)',
@@ -4717,6 +4739,15 @@ function formatSettingLabel(key) {
     .join(' ');
 }
 
+function rememberTrackingProfile(result) {
+  const satellite = satellitesCache.find((item) => {
+    return Number(item.norad_id) === Number(result?.norad_id);
+  });
+  if (satellite && result.transponder_name) {
+    satellite.last_transponder_name = result.transponder_name;
+  }
+}
+
 function renderTracking(result) {
   if (
     mapRefreshPending
@@ -4727,6 +4758,8 @@ function renderTracking(result) {
     return;
   }
   latestTracking = result;
+  latestTrackingReceivedAtMs = Date.now();
+  rememberTrackingProfile(result);
   if (sharedTrackingSelectionDiffers(result)) {
     restoreSelectionFromTracking();
   }
@@ -5242,6 +5275,35 @@ function drawMapLegend(ctx, width, height) {
     ctx.fillStyle = '#d5e4f1';
     ctx.fillText(activeLabelText, 202, height - 11);
   }
+}
+
+function getRadioTrackingSummary(nowMs = Date.now()) {
+  const summary = { label: 'Currently tracking:', name: 'None', az: '—', el: '—', los: '—' };
+  const tracking = latestTracking;
+  const noradId = Number(selectedSatelliteNorad || tracking?.norad_id);
+  if (!Number.isInteger(noradId) || noradId <= 0) return summary;
+  const matchingSnapshot = Number(tracking?.norad_id) === noradId;
+  summary.name = getSelectedSatellite()?.name
+    || (matchingSnapshot && tracking.satellite_name) || `Satellite ${noradId}`;
+  if (!matchingSnapshot || mapRefreshPending || !Number.isFinite(Date.parse(tracking.last_update_at_utc || ''))) {
+    summary.label = 'Loading tracking:';
+    return summary;
+  }
+  if (!latestTrackingReceivedAtMs || nowMs - latestTrackingReceivedAtMs > 6000) {
+    summary.label = 'Tracking stale:';
+    return summary;
+  }
+  if (Number.isFinite(tracking.azimuth_deg)) summary.az = `${tracking.azimuth_deg.toFixed(1)}°`;
+  if (Number.isFinite(tracking.elevation_deg)) summary.el = `${tracking.elevation_deg.toFixed(1)}°`;
+  if (tracking.pass_active && Array.isArray(latestPasses)) {
+    const pass = latestPasses.find(entry => {
+      const aosMs = Date.parse(entry.aos_utc);
+      const losMs = Date.parse(entry.los_utc);
+      return Number(entry.norad_id) === noradId && nowMs >= aosMs && nowMs < losMs;
+    });
+    if (pass) summary.los = formatCountdown(Math.ceil((Date.parse(pass.los_utc) - nowMs) / 1000));
+  }
+  return summary;
 }
 
 function getActiveOrNextPass() {

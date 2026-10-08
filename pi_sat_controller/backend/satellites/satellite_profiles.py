@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import RLock
@@ -21,6 +22,7 @@ def load_satellite_profiles(path: Path | str) -> list[SatelliteProfile]:
             name=profile["name"],
             norad_id=int(profile["norad_id"]),
             favorite=bool(profile.get("favorite", False)),
+            last_transponder_name=profile.get("last_transponder_name"),
             transponders=[
                 TransponderProfile(
                     name=transponder["name"],
@@ -53,6 +55,7 @@ def save_satellite_profiles(
             "name": profile.name,
             "norad_id": profile.norad_id,
             "favorite": profile.favorite,
+            "last_transponder_name": profile.last_transponder_name,
             "transponders": [
                 {
                     "name": transponder.name,
@@ -108,6 +111,9 @@ def upsert_satellite_transponders(
         replaced = False
         for existing in profiles:
             if existing.norad_id == satellite.norad_id:
+                satellite = replace(
+                    satellite, last_transponder_name=existing.last_transponder_name
+                )
                 updated_profiles.append(satellite)
                 replaced = True
             else:
@@ -116,3 +122,33 @@ def upsert_satellite_transponders(
             updated_profiles.append(satellite)
         save_satellite_profiles(path, updated_profiles)
     return satellite
+
+
+def preferred_transponder_index(satellite: SatelliteProfile) -> int:
+    return next(
+        (
+            index
+            for index, transponder in enumerate(satellite.transponders)
+            if transponder.name == satellite.last_transponder_name
+        ),
+        0,
+    )
+
+
+def remember_satellite_transponder(
+    path: Path | str, norad_id: int, transponder_name: str
+) -> None:
+    with _PROFILE_LOCK:
+        profiles = load_satellite_profiles(path)
+        for index, satellite in enumerate(profiles):
+            if satellite.norad_id != norad_id:
+                continue
+            if not any(item.name == transponder_name for item in satellite.transponders):
+                raise ValueError("Selected frequency profile is invalid")
+            if satellite.last_transponder_name != transponder_name:
+                profiles[index] = replace(
+                    satellite, last_transponder_name=transponder_name
+                )
+                save_satellite_profiles(path, profiles)
+            return
+        raise ValueError(f"NORAD {norad_id} has no local frequency profile")
