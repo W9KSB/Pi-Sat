@@ -38,6 +38,7 @@ def load_satellite_profiles(path: Path | str) -> list[SatelliteProfile]:
                     preferred_uplink=int(transponder["preferred_uplink"]),
                     preferred_downlink=int(transponder["preferred_downlink"]),
                     tone=transponder.get("tone"),
+                    custom=bool(transponder.get("custom", False)),
                 )
                 for transponder in profile.get("transponders", [])
             ],
@@ -71,6 +72,7 @@ def save_satellite_profiles(
                     "preferred_uplink": transponder.preferred_uplink,
                     "preferred_downlink": transponder.preferred_downlink,
                     "tone": transponder.tone,
+                    "custom": transponder.custom,
                 }
                 for transponder in profile.transponders
             ],
@@ -111,8 +113,15 @@ def upsert_satellite_transponders(
         replaced = False
         for existing in profiles:
             if existing.norad_id == satellite.norad_id:
+                custom = [item for item in existing.transponders if item.custom]
+                custom_names = {item.name.casefold() for item in custom}
                 satellite = replace(
-                    satellite, last_transponder_name=existing.last_transponder_name
+                    satellite,
+                    transponders=[
+                        item for item in satellite.transponders
+                        if not item.custom and item.name.casefold() not in custom_names
+                    ] + custom,
+                    last_transponder_name=existing.last_transponder_name,
                 )
                 updated_profiles.append(satellite)
                 replaced = True
@@ -122,6 +131,30 @@ def upsert_satellite_transponders(
             updated_profiles.append(satellite)
         save_satellite_profiles(path, updated_profiles)
     return satellite
+
+
+def add_custom_transponder(
+    path: Path | str,
+    satellite: SatelliteProfile,
+    transponder: TransponderProfile,
+) -> SatelliteProfile:
+    with _PROFILE_LOCK:
+        profiles = load_satellite_profiles(path)
+        index = next(
+            (index for index, item in enumerate(profiles) if item.norad_id == satellite.norad_id),
+            None,
+        )
+        if index is not None:
+            satellite = profiles[index]
+        if any(item.name.casefold() == transponder.name.casefold() for item in satellite.transponders):
+            raise ValueError("A frequency profile with this name already exists for this satellite")
+        satellite = replace(satellite, transponders=[*satellite.transponders, transponder])
+        if index is None:
+            profiles.append(satellite)
+        else:
+            profiles[index] = satellite
+        save_satellite_profiles(path, profiles)
+        return satellite
 
 
 def preferred_transponder_index(satellite: SatelliteProfile) -> int:

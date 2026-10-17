@@ -5,7 +5,12 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
-from pi_sat_controller.backend.config import DeviceConfig, load_cat_devices, load_settings
+from pi_sat_controller.backend.config import (
+    DeviceConfig,
+    load_cat_devices,
+    load_settings,
+    validate_tracking_threshold_deg,
+)
 from pi_sat_controller.backend.radio.hamlib_client import HamlibClient
 from pi_sat_controller.backend.radio.hamlib_models import load_hamlib_radio_models
 from pi_sat_controller.backend.radio.local_hamlib_client import LocalHamlibClient
@@ -140,6 +145,13 @@ def device_config_from_settings(
         home_elevation_deg=parse_float_setting(section_settings.get("home_elevation_deg")),
         return_home_after_pass=parse_bool_setting(
             section_settings.get("return_home_after_pass"),
+            False,
+        ),
+        tracking_threshold_deg=validate_tracking_threshold_deg(
+            parse_float_setting(section_settings.get("tracking_threshold_deg"), 0.0)
+        ),
+        home_below_min_elevation=parse_bool_setting(
+            section_settings.get("home_below_min_elevation"),
             False,
         ),
     )

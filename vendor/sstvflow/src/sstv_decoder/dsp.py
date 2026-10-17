@@ -20,9 +20,9 @@ class Demodulator:
             imag *= np.kaiser(length, 5)
             self.kernel = 1j * imag
             self.kernel[self.delay] += 1
-        elif method in ("quadrature", "narrow"):
+        elif method in ("quadrature", "narrow", "sharp"):
             self.bandpass = None
-            bandwidth=1450 if method=="quadrature" else 950
+            bandwidth={"quadrature":1450,"narrow":950,"sharp":750}[method]
             self.kernel = 2 * firwin(length, bandwidth, fs=rate) * np.exp(2j * np.pi * 1900 * n / rate)
         else:
             raise ValueError("unknown demodulator")

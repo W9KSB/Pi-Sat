@@ -28,7 +28,9 @@ class ProtocolDetector:
         self.leader_start = None
         self.offset = 0.0
         self.sync_start = None
-        self.sync_values = []
+        # Sync candidates last at most 23 ms. Keep tracking a longer tone's
+        # start and frequency without retaining its entire sample-bin history.
+        self.sync_values = deque(maxlen=32)
         self.search_offset = True
         self.sync_frequency = None
         self.start_bit = None
@@ -84,20 +86,25 @@ class ProtocolDetector:
         elif self.stage == "break":
             if self._tone(f, 1900) and .006*rate <= start-self.break_start <= .025*rate:
                 self.second_start = start
-                self.second_values = [f]
+                self.second_values = deque([f], maxlen=400)
                 self.second_good_end = start
                 self.stage = "leader2"
             elif start - self.break_start > .026 * rate:
                 self.stage = "search"
         elif self.stage == "leader2":
-            if self._tone(f, 1900):
+            # A continuous leader tone must also expire; checking this only
+            # after a tone change retains an unbounded, unusable header.
+            if start-self.second_start > .365*rate:
+                self.stage = "search"
+                self.second_values.clear()
+            elif self._tone(f, 1900):
                 self.second_values.append(f)
                 self.second_good_end = start
             elif self._tone(f, 1200) and .24*rate <= start-self.second_start <= .36*rate:
                 self.offset = float(np.median(self.second_values) - 1900)
                 self.start_bit = self._edge(start, 1550 + self.offset)
                 self.stage = "vis"
-            elif start-self.second_good_end > .006*rate or start-self.second_start > .365*rate:
+            elif start-self.second_good_end > .006*rate:
                 self.stage = "search"
         elif self.stage == "vis":
             if start - self.start_bit >= .298 * rate:
@@ -134,11 +141,11 @@ class ProtocolDetector:
         if is_sync:
             if self.sync_start is None:
                 self.sync_start = float(start) if self.search_offset else self._edge(start, 1350 + self.offset)
-                self.sync_values = []
+                self.sync_values.clear()
                 self.sync_frequency = f
             self.sync_values.append(f)
             if self.search_offset:
-                self.sync_frequency=float(np.median(self.sync_values[-5:]))
+                self.sync_frequency=float(np.median(list(self.sync_values)[-5:]))
         elif self.sync_start is not None:
             duration = (start-self.sync_start) / self.rate
             if .002 <= duration <= .023:
@@ -151,5 +158,5 @@ class ProtocolDetector:
                 end = self._edge(start, 1350+measured_offset, rising=True)
                 self.sync_callback(end-nominal*self.rate, duration, measured_offset, confidence)
             self.sync_start = None
-            self.sync_values = []
+            self.sync_values.clear()
             self.sync_frequency = None

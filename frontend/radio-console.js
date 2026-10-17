@@ -83,8 +83,14 @@
         </div>
       </div>
     </section>
-    <div class="rc-deck">${pathPanel('MAIN', 'TX')}<button type="button" id="rc-swap" class="rc-button rc-swap"
-      data-action="swap-bands" title="Exchange the MAIN and SUB bands, the same operation as the radio's front-panel M&lt;&gt;S button">M&lt;-&gt;S</button>${pathPanel('SUB', 'RX')}</div>
+    <div class="rc-deck">${pathPanel('MAIN', 'TX')}<div class="rc-center-controls" role="group" aria-label="Radio and tracking actions">
+      <button type="button" id="rc-swap" class="rc-button rc-swap"
+        data-action="swap-bands" title="Exchange the MAIN and SUB bands, the same operation as the radio's front-panel M&lt;&gt;S button">M&lt;-&gt;S</button>
+      <button type="button" id="rc-reset-offset" class="rc-button rc-center-action" data-action="reset-offset"
+        aria-label="Reset Offset" title="Reset tracking offsets, the same action as Reset Offset on the front page">Reset<br>Offset</button>
+      <button type="button" id="rc-tuning-tone" class="rc-button rc-center-action" data-action="tuning-tone"
+        aria-label="Tuning Tone" aria-pressed="false" title="Click to transmit a steady 600 Hz tone in USB/LSB; click again to stop">Tuning<br>Tone</button>
+    </div>${pathPanel('SUB', 'RX')}</div>
     <footer class="rc-audio rc-panel"><div class="rc-volume"><label for="rc-volume">MONITOR VOLUME</label><input id="rc-volume" type="range" min="0" max="100" value="70"><output id="rc-volume-value">70%</output></div>
       <span id="radio-audio-status" role="status">Audio off · starts with Connect</span>
       <span class="rc-persistent">Audio follows you across tabs</span></footer>
@@ -458,6 +464,17 @@
       $('rc-dualwatch').disabled ||= state.dualwatch == null;
       // The radio refuses to exchange bands while keyed, so do not offer it.
       $('rc-swap').disabled = !connected || !streamHealthy || transmitting;
+      $('rc-reset-offset').disabled = busy || !$('reset-rx-offset') || $('reset-rx-offset').disabled;
+      const tuningToneActive = state.tuning_tone === true;
+      const tuningToneSupported = ['USB', 'LSB'].includes(state.main?.mode);
+      const toneButton = $('rc-tuning-tone');
+      toneButton.disabled = busy || (!tuningToneActive && (!connected || !streamHealthy || transmitting || !tuningToneSupported || !audioAvailable));
+      toneButton.setAttribute('aria-pressed', String(tuningToneActive));
+      toneButton.classList.toggle('is-transmitting', tuningToneActive);
+      toneButton.title = tuningToneActive ? 'Transmitting 600 Hz tone; click to stop. SUB RIT remains available.'
+        : tuningToneSupported ? 'Click to transmit a steady 600 Hz tone; click again to stop'
+          : 'Tuning Tone requires MAIN USB or LSB mode';
+      if (state.tuning_tone_error) consoleApi.error(state.tuning_tone_error);
       $('rc-dualwatch').setAttribute('aria-pressed', String(state.dualwatch === true));
       const rit = state.sub_rit;
       $('rc-rit-toggle').textContent = rit?.enabled == null ? 'RIT —' : rit.enabled ? 'RIT ON' : 'RIT OFF';
@@ -593,6 +610,28 @@
       return result;
     } finally { busy = false; consoleApi.render({}); }
   }
+  async function resetTrackingOffset() {
+    if (busy || $('reset-rx-offset')?.disabled) return;
+    busy = true;
+    consoleApi.error('');
+    consoleApi.render({});
+    try {
+      const result = await postTrackingAction('/api/tracking/rx/reset-offset', 'Resetting RX offset...');
+      if (!result) consoleApi.error('Tracking offset reset failed. See Monitor for details.');
+    } finally { busy = false; consoleApi.render({}); }
+  }
+  async function tuningTone() {
+    if (busy) return;
+    const enabled = state.tuning_tone !== true;
+    if (enabled && (!state.connected || !streamHealthy)) return;
+    busy = true;
+    consoleApi.error('');
+    consoleApi.render({});
+    try {
+      // A stale state stream must still allow an explicit request to stop TX.
+      await radioAction('/api/radio/tuning-tone', { enabled });
+    } finally { busy = false; consoleApi.render({}); }
+  }
   async function power() {
     if (busy) return;
     busy = true;
@@ -645,6 +684,8 @@
     }
     if (action === 'audio-transport') setAudioTransport(value);
     if (action === 'swap-bands') await command('swap-main-sub', {});
+    if (action === 'reset-offset') await resetTrackingOffset();
+    if (action === 'tuning-tone') await tuningTone();
     if (action === 'mic-refresh') await refreshRadioMicrophones();
     if (action === 'mic-mode') {
       const result = await command('microphone-config', { source: value });

@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Pi-Sat Controller</title>
     <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
-    <link rel="stylesheet" href="/style.css?v=20261002-sstv-debug1">
-    <link rel="stylesheet" href="/radio-console.css?v=20261005-tracking-strip1">
+    <link rel="stylesheet" href="/style.css?v=20261008-wsjtx-tx1">
+    <link rel="stylesheet" href="/radio-console.css?v=20261009-tuning-tone1">
   </head>
   <body>
     <main class="container-fluid py-3 app-shell">
@@ -275,6 +275,14 @@
                     <span class="form-check-label monitor-label-general">General debug</span>
                   </label>
                   <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-wsjtx-debug">
+                    <span class="form-check-label monitor-label-wsjtx">FT4 / FT8 logs</span>
+                  </label>
+                  <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-sstv-debug">
+                    <span class="form-check-label monitor-label-sstv">SSTV logs</span>
+                  </label>
+                  <label class="form-check form-switch mb-0">
                     <input class="form-check-input" type="checkbox" role="switch" id="monitor-rx-cat-debug">
                     <span class="form-check-label monitor-label-rx">RX CAT debug logging</span>
                   </label>
@@ -292,6 +300,11 @@
                   </label>
                 </div>
                 <p id="monitor-status" class="command-status mb-0"></p>
+                <div class="mt-3 d-flex flex-wrap gap-2" aria-label="SSTV diagnostic downloads">
+                  <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/source-audio" download="sstv-sub-source.wav" title="SUB audio before decoder gain, captured since Enable">SSTV SUB audio</a>
+                  <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/decoder-audio" download="sstv-decoder-input.wav" title="Audio supplied to the decoder after gain, captured since Enable">SSTV decoder audio</a>
+                  <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/audio-diagnostics" download="sstv-audio-diagnostics.jsonl" title="Audio packet, gain, and discontinuity diagnostics">SSTV audio diagnostics</a>
+                </div>
               </div>
             </div>
           </section>
@@ -410,6 +423,74 @@
                     <div id="selected-my-satellite-passes" class="satellite-pass-list"></div>
                   </section>
                 </div>
+                <details id="custom-transponder-section" class="mt-3" hidden>
+                  <summary class="h6">Add Custom Transponder</summary>
+                  <p class="text-body-secondary small mt-2 mb-2">Add a frequency profile for the selected satellite. Custom profiles are preserved when updating from SatNOGS. For a single frequency, leave the upper limit blank.</p>
+                  <form id="custom-transponder-form">
+                    <fieldset id="custom-transponder-fields" disabled>
+                      <legend class="visually-hidden">Custom transponder details</legend>
+                      <div class="row g-2">
+                        <div class="col-12 col-md-8">
+                          <label class="form-label" for="custom-transponder-name">Profile name</label>
+                          <input id="custom-transponder-name" class="form-control" maxlength="120" required>
+                        </div>
+                        <div class="col-12 col-md-4">
+                          <label class="form-label" for="custom-transponder-type">Profile type</label>
+                          <select id="custom-transponder-type" class="form-select">
+                            <option value="fm">FM repeater</option>
+                            <option value="linear">Linear transponder</option>
+                            <option value="rx_only">Receive only</option>
+                          </select>
+                        </div>
+                        <div class="col-6 col-md-4">
+                          <label class="form-label" for="custom-transponder-downlink-low">Downlink / lower (MHz)</label>
+                          <input id="custom-transponder-downlink-low" class="form-control" type="number" min="0.000001" step="0.000001" required>
+                        </div>
+                        <div class="col-6 col-md-4">
+                          <label class="form-label" for="custom-transponder-downlink-high">Upper limit (MHz)</label>
+                          <input id="custom-transponder-downlink-high" class="form-control" type="number" min="0.000001" step="0.000001" placeholder="Optional">
+                        </div>
+                        <div class="col-12 col-md-4">
+                          <label class="form-label" for="custom-transponder-downlink-mode">Downlink mode</label>
+                          <select id="custom-transponder-downlink-mode" class="form-select">
+                            <option>FM</option><option>USB</option><option>LSB</option><option>CW</option><option>CW-R</option><option>AM</option><option>DV</option><option>DD</option><option>FM-DATA</option><option>USB-DATA</option><option>LSB-DATA</option>
+                          </select>
+                        </div>
+                      </div>
+                      <fieldset id="custom-transponder-uplink-fields" class="mt-2">
+                        <legend class="visually-hidden">Uplink details</legend>
+                        <div class="row g-2">
+                          <div class="col-6 col-md-4">
+                            <label class="form-label" for="custom-transponder-uplink-low">Uplink / lower (MHz)</label>
+                            <input id="custom-transponder-uplink-low" class="form-control" type="number" min="0.000001" step="0.000001" required>
+                          </div>
+                          <div class="col-6 col-md-4">
+                            <label class="form-label" for="custom-transponder-uplink-high">Upper limit (MHz)</label>
+                            <input id="custom-transponder-uplink-high" class="form-control" type="number" min="0.000001" step="0.000001" placeholder="Optional">
+                          </div>
+                          <div class="col-12 col-md-4">
+                            <label class="form-label" for="custom-transponder-uplink-mode">Uplink mode</label>
+                            <select id="custom-transponder-uplink-mode" class="form-select">
+                              <option>FM</option><option>USB</option><option>LSB</option><option>CW</option><option>CW-R</option><option>AM</option><option>DV</option><option>DD</option><option>FM-DATA</option><option>USB-DATA</option><option>LSB-DATA</option>
+                            </select>
+                          </div>
+                          <div class="col-12 col-md-4">
+                            <label class="form-label" for="custom-transponder-tone">Uplink CTCSS (Hz)</label>
+                            <input id="custom-transponder-tone" class="form-control" type="number" min="50" max="300" step="0.1" placeholder="Optional">
+                          </div>
+                          <div class="col-12 col-md-8 d-flex align-items-end">
+                            <div class="form-check mb-2">
+                              <input id="custom-transponder-inverted" class="form-check-input" type="checkbox">
+                              <label class="form-check-label" for="custom-transponder-inverted">Inverting transponder</label>
+                            </div>
+                          </div>
+                        </div>
+                      </fieldset>
+                      <button id="custom-transponder-save-btn" class="btn btn-primary mt-3" type="submit">Add Custom Transponder</button>
+                    </fieldset>
+                    <p id="custom-transponder-status" class="command-status mb-0 mt-2" role="status" aria-live="polite"></p>
+                  </form>
+                </details>
               </div>
             </div>
           </section>
@@ -571,9 +652,16 @@
                     <h2 class="h5 mb-0">External DATA Decode</h2>
                     <span id="audio-stream-state" class="audio-stream-state-badge">Disabled</span>
                   </div>
-                  <button type="button" id="audio-stream-enable" class="btn btn-primary" aria-pressed="false" disabled>Enable</button>
+                  <div class="d-flex flex-wrap align-items-center gap-2">
+                    <label for="audio-stream-demodulation" class="small">Demodulation</label>
+                    <select id="audio-stream-demodulation" class="form-select form-select-sm w-auto" disabled>
+                      <option value="FM">FM</option>
+                      <option value="USB">USB (Upper Sideband)</option>
+                    </select>
+                    <button type="button" id="audio-stream-enable" class="btn btn-primary" aria-pressed="false" disabled>Enable</button>
+                  </div>
                 </div>
-                <p class="small text-body-secondary mt-3 mb-2">External DATA Decode uses the IC-9700's wide IF output instead of its normal filtered AF audio. While enabled, Pi-Sat switches the radio to FM-DATA/FIL1, software-demodulates the IF stream, and sends 48 kHz audio to the external Windows client for satellite telemetry, packet, GMSK/FSK, SSDV, and similar digital signals.</p>
+                <p class="small text-body-secondary mt-3 mb-2">External DATA Decode uses the IC-9700's IF output instead of its normal filtered AF audio. Select FM or USB (upper sideband) to match the transmission. While enabled, Pi-Sat selects SUB FM-DATA/FIL1 or USB-DATA/FIL1, software-demodulates the IF stream, and sends 48 kHz mono audio to the external Windows client. Disable streaming before changing demodulation.</p>
                 <p class="small text-body-secondary mb-2">Normal Pi-Sat receive audio is temporarily replaced by this data path. Disabling External DATA Decode restores normal AF audio operation.</p>
                 <p id="audio-stream-detail" class="text-body-secondary small mb-0">External DATA Decode is disabled.</p>
               </div>
@@ -630,7 +718,7 @@
                 </div></div>
               </section>
               <section class="col-12 col-xl-4"><div class="card h-100"><div class="card-header"><h3 class="h6 mb-0">Decoder Status</h3></div><div class="card-body"><dl class="sstv-readouts mb-0">
-                <div><dt>Mode</dt><dd id="sstv-mode">--</dd></div><div><dt>Line</dt><dd id="sstv-line">--</dd></div><div><dt>Quality</dt><dd id="sstv-quality">--</dd></div><div><dt>Audio losses</dt><dd id="sstv-losses">0</dd></div><div><dt>Queued audio</dt><dd id="sstv-queued-audio">0.0 s</dd></div><div><dt>Audio source</dt><dd id="sstv-source">Native IC-9700 SUB/RX PCM</dd></div><div><dt>Engine</dt><dd id="sstv-engine">SSTVFlow 0.1.1</dd></div><div><dt>Decoder level</dt><dd id="sstv-decoder-level">silent</dd></div><div><dt>Clipped samples</dt><dd id="sstv-clipped-samples">0</dd></div><div><dt>Audio capture</dt><dd id="sstv-capture-status">No errors</dd></div>
+                <div><dt>Mode</dt><dd id="sstv-mode">--</dd></div><div><dt>Line</dt><dd id="sstv-line">--</dd></div><div><dt>Quality</dt><dd id="sstv-quality">--</dd></div><div><dt>Audio losses</dt><dd id="sstv-losses">0</dd></div><div><dt>Queued audio</dt><dd id="sstv-queued-audio">0.0 s</dd></div><div><dt>Audio source</dt><dd id="sstv-source">Native IC-9700 SUB/RX PCM</dd></div><div><dt>Engine</dt><dd id="sstv-engine">SSTVFlow 0.2.0</dd></div><div><dt>Decoder level</dt><dd id="sstv-decoder-level">silent</dd></div><div><dt>Clipped samples</dt><dd id="sstv-clipped-samples">0</dd></div><div><dt>Audio capture</dt><dd id="sstv-capture-status">No errors</dd></div>
               </dl><p class="small text-body-secondary mt-3 mb-0">SSTVFlow decodes Robot24/36/72, Martin M1/M2, and PD120/180 from SUB/RX audio.</p></div></div></section>
             </div>
             <section class="card sstv-upload-card"><div class="card-header"><h3 class="h6 mb-0">Decode a recording</h3></div><div class="card-body">
@@ -641,16 +729,6 @@
               <p id="sstv-upload-status" class="small text-body-secondary mb-0 mt-2" role="status" aria-live="polite">The audio file is temporary and is deleted after processing.</p>
             </div></section>
             <section class="card"><div class="card-header d-flex justify-content-between gap-2"><h3 class="h6 mb-0">Recent Images</h3><span class="small text-body-secondary">Latest 25 captures</span></div><div class="card-body"><div id="sstv-gallery" class="sstv-gallery"><p class="text-body-secondary mb-0">No SSTV images yet.</p></div></div></section>
-            <section class="card sstv-debug-card"><div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
-              <h3 class="h6 mb-0">Decoder Console</h3>
-              <div class="d-flex flex-wrap align-items-center gap-3">
-                <label class="small text-body-secondary d-flex align-items-center gap-2 mb-0"><input id="sstv-debug-follow" type="checkbox" checked> Follow</label>
-                <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/source-audio" download="sstv-sub-source.wav" title="SUB audio before decoder gain, captured since Enable">Download SUB audio</a>
-                <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/decoder-audio" download="sstv-decoder-input.wav" title="Audio supplied to the decoder after gain, captured since Enable">Download decoder audio</a>
-                <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/audio-diagnostics" download="sstv-audio-diagnostics.jsonl" title="Audio packet, gain, and discontinuity diagnostics">Download audio diagnostics</a>
-                <button type="button" id="sstv-debug-clear" class="btn btn-sm btn-outline-secondary">Clear</button>
-              </div>
-            </div><div class="card-body p-0"><div id="sstv-debug-output" class="sstv-debug-output" role="log" aria-label="Live SSTV decoder debug log" aria-live="off" tabindex="0"></div></div></section>
             <dialog id="sstv-image-dialog" class="sstv-image-dialog"><form method="dialog" class="d-flex justify-content-end"><button class="btn btn-sm btn-outline-light" aria-label="Close image">Close</button></form><img id="sstv-large-image" alt="Completed SSTV decode"><div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3"><p id="sstv-large-meta" class="small text-body-secondary mb-0"></p><a id="sstv-large-download" class="btn btn-sm btn-outline-info" href="#" download>Download</a></div></dialog>
           </section>
 
@@ -733,6 +811,46 @@
               </div>
             </section>
           </section>
+
+          <section class="module-view wsjtx-view" id="wsjtx-page" data-module-view="ft4-ft8" role="tabpanel" aria-labelledby="modules-nav-ft4-ft8" hidden>
+            <div class="card wsjtx-pass-strip" aria-label="Satellite pass context">
+              <div><span id="wsjtx-tracking-label" class="text-body-secondary">Currently tracking:</span> <strong id="wsjtx-tracking-name">None</strong></div>
+              <div class="wsjtx-pass-metrics"><span>Az <b id="wsjtx-tracking-az">—</b></span><span>El <b id="wsjtx-tracking-el">—</b></span><span>LOS <b id="wsjtx-tracking-los">—</b></span></div>
+            </div>
+            <div class="card wsjtx-toolbar">
+              <div class="card-body">
+                <div class="wsjtx-toolbar-main">
+                  <div class="d-flex flex-wrap align-items-center gap-2"><h2 class="h5 mb-0">FT4 / FT8</h2><span id="wsjtx-mode" class="wsjtx-badge">—</span><span id="wsjtx-state" class="wsjtx-badge" role="status">Loading</span></div>
+                  <div class="wsjtx-listener-controls"><label for="wsjtx-engine" class="small text-body-secondary">Engine</label><select id="wsjtx-engine" class="form-select form-select-sm" aria-label="WSJT-X engine" disabled><option value="">No engine</option></select><button id="wsjtx-enable" class="btn btn-primary" type="button" aria-pressed="false" disabled>Start RX</button><button id="wsjtx-reset" class="btn btn-outline-warning" type="button" disabled>Reset</button></div>
+                </div>
+                <p id="wsjtx-detail" class="small text-body-secondary mt-2 mb-0">Loading WSJT-X listener status.</p>
+              </div>
+            </div>
+            <section class="card wsjtx-spectrum-panel" aria-label="Digital audio passband">
+              <div class="card-header wsjtx-spectrum-controls"><div><h3 class="h6 mb-0">Digital audio</h3><span id="wsjtx-spectrum-span" class="small text-body-secondary">0–3000 Hz · estimated SSB width</span></div><div class="d-flex align-items-center gap-2"><label for="wsjtx-offset" class="small">Hold TX offset</label><input id="wsjtx-offset" class="form-control form-control-sm" type="number" min="200" max="2950" step="1" value="1500" disabled><span class="small">Hz</span></div></div>
+              <div id="wsjtx-spectrum-hit" class="wsjtx-spectrum-hit" role="slider" tabindex="0" aria-label="Held transmit audio offset" aria-valuemin="200" aria-valuemax="2950" aria-valuenow="1500" aria-disabled="true">
+                <canvas id="wsjtx-spectrum" class="wsjtx-spectrum" width="1200" height="130" aria-hidden="true"></canvas><canvas id="wsjtx-waterfall" class="wsjtx-waterfall" width="1200" height="80" aria-hidden="true"></canvas>
+                <span id="wsjtx-rx-marker" class="wsjtx-offset-marker wsjtx-rx-marker"><b>RX</b></span><span id="wsjtx-tx-marker" class="wsjtx-offset-marker wsjtx-tx-marker"><b>TX</b></span>
+              </div><p id="wsjtx-spectrum-detail" class="small text-body-secondary px-3 py-2 mb-0">Waiting for receive audio. Click the passband to set your held TX offset.</p>
+            </section>
+            <div class="wsjtx-split">
+              <section class="card wsjtx-activity-panel">
+                <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h3 class="h6 mb-0">Band Activity</h3><div class="d-flex align-items-center gap-2"><span id="wsjtx-count" class="small text-body-secondary">0 messages</span><button id="wsjtx-clear" type="button" class="btn btn-sm btn-outline-secondary">Clear view</button></div></div>
+                <div class="wsjtx-decode-head" aria-hidden="true"><span>UTC</span><span>SNR</span><span>DT</span><span>Hz</span><span>Mode</span><span>Message</span></div>
+                <div id="wsjtx-decodes" class="wsjtx-decodes" aria-label="Received decodes"><p class="text-body-secondary p-3 mb-0">Loading received activity.</p></div>
+              </section>
+              <div class="wsjtx-operating-column">
+                <section class="card wsjtx-qso-panel"><div class="card-header d-flex justify-content-between align-items-center"><h3 class="h6 mb-0">QSO / Transmit</h3><span id="wsjtx-tx-state" class="wsjtx-badge" role="status">TX off</span></div><div class="card-body">
+                  <div class="wsjtx-calls"><div><span class="small text-body-secondary">My call</span><strong id="wsjtx-my-call">—</strong><small id="wsjtx-my-grid" class="text-body-secondary">—</small></div><div><span class="small text-body-secondary">Target call</span><strong id="wsjtx-target-call">—</strong><small id="wsjtx-target-grid" class="text-body-secondary">Double-click a decode</small></div></div>
+                  <div class="wsjtx-tx-controls"><button id="wsjtx-tx-enable" class="btn btn-primary" type="button" aria-pressed="false" disabled>Enable TX</button><button id="wsjtx-halt" class="btn btn-outline-danger" type="button" disabled>Halt TX</button><button id="wsjtx-cq" class="btn btn-outline-secondary" type="button" disabled>Call CQ</button></div>
+                  <div class="d-flex justify-content-between align-items-center gap-2 mb-2"><label class="form-check-label"><input id="wsjtx-auto" class="form-check-input me-2" type="checkbox" checked disabled>Auto sequence</label><span id="wsjtx-retries" class="small text-body-secondary">Retries 0 / 3</span></div>
+                  <fieldset id="wsjtx-messages" class="wsjtx-messages" disabled><legend class="visually-hidden">Transmit message</legend></fieldset>
+                  <p id="wsjtx-qso-detail" class="small text-body-secondary mt-2 mb-0" role="status">Start RX to begin a QSO.</p><p id="wsjtx-next-slot" class="small text-body-secondary mt-1 mb-0"></p>
+                </div></section>
+                <section class="card"><div class="card-header d-flex justify-content-between align-items-center"><h3 class="h6 mb-0">QSO Log</h3><a id="wsjtx-adif" class="small" href="/api/wsjtx/qso/adif" download>Export ADIF</a></div><div id="wsjtx-contacts" class="wsjtx-contacts" aria-label="Completed contacts"><p class="text-body-secondary p-3 mb-0">No completed contacts yet.</p></div></section>
+              </div>
+            </div>
+          </section>
         </div>
       </section>
 
@@ -769,10 +887,11 @@
       <a href="https://github.com/w9ksb" target="_blank" rel="noopener noreferrer">github.com/w9ksb</a>
     </footer>
     <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
-  <script src="/app.js?v=20261007-orbital-json1"></script>
-    <script src="/radio-console.js?v=20261005-tracking-strip1"></script>
+    <script src="/app.js?v=20261009-custom-transponder1"></script>
+    <script src="/radio-console.js?v=20261009-tuning-tone1"></script>
     <script src="/audio-stream.js?v=20260928-external-data1"></script>
-    <script src="/sstv.js?v=20261008-sstvflow-modes1"></script>
+    <script src="/sstv.js?v=20261008-wsjtx-tx1"></script>
     <script src="/aprs.js?v=20260914-aprs4"></script>
+    <script src="/wsjtx.js?v=20261016-wsjtx-reset1"></script>
   </body>
 </html>

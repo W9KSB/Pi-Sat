@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "SSTVFlow"
-version = "0.1.1+pisat.20261008"
+version = "0.2.0+pisat.20261014"
 description = "SSTVFlow: an automatic streaming Robot, Martin, and PD SSTV decoder"
 readme = "README.md"
 license = {file = "LICENSE"}

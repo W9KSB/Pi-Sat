@@ -30,6 +30,7 @@ from pi_sat_controller.backend.radio.audio_stream_protocol import (
 
 if TYPE_CHECKING:
     from pi_sat_controller.backend.radio.wide_fm import WideFmDemodulator
+    from pi_sat_controller.backend.radio.usb_demod import UsbDemodulator
 
 LOGGER = logging.getLogger(__name__)
 
@@ -134,6 +135,7 @@ class RxAudioStreamServer:
         channels: int = 2,
         max_clients: int = MAX_CLIENTS,
         external_decode: bool = False,
+        demodulation: str = "FM",
     ) -> None:
         self.host = host
         self.port = port
@@ -145,6 +147,9 @@ class RxAudioStreamServer:
         self.channels = int(channels)
         self.max_clients = max(1, int(max_clients))
         self.external_decode = external_decode
+        if demodulation not in {"FM", "USB"}:
+            raise ValueError("demodulation must be FM or USB")
+        self.demodulation = demodulation
         if external_decode and self.sample_rate != 48000:
             raise ValueError(f"External DATA Decode requires 48 kHz receive audio; configured rate is {self.sample_rate} Hz")
         self._stop = Event()
@@ -165,7 +170,7 @@ class RxAudioStreamServer:
         self.last_error: str | None = None
         self._decode_allowed = external_decode
         self._decode_active = False
-        self._demodulator: WideFmDemodulator | None = None
+        self._demodulator: WideFmDemodulator | UsbDemodulator | None = None
         self._session_controller: Any = None
         self._session_generation: int | None = None
         self._previous_mode: tuple[str, int | None] | None = None
@@ -234,6 +239,7 @@ class RxAudioStreamServer:
             "source_dropped": self._source_dropped,
             "last_error": self.last_error,
             "active": self._decode_active,
+            "demodulation": self.demodulation,
         }
 
     # -- internals ---------------------------------------------------------
@@ -400,9 +406,14 @@ class RxAudioStreamServer:
             self._end_decode_session()
 
     def _begin_decode_session(self, controller: Any) -> None:
-        from pi_sat_controller.backend.radio.wide_fm import WideFmDemodulator
+        if self.demodulation == "USB":
+            from pi_sat_controller.backend.radio.usb_demod import UsbDemodulator
 
-        demodulator = WideFmDemodulator(sample_rate=self.sample_rate)
+            demodulator = UsbDemodulator(sample_rate=self.sample_rate)
+        else:
+            from pi_sat_controller.backend.radio.wide_fm import WideFmDemodulator
+
+            demodulator = WideFmDemodulator(sample_rate=self.sample_rate)
         side = "SUB"
         state = controller.snapshot()[side.lower()]
         mode = state.get("mode")
@@ -411,12 +422,12 @@ class RxAudioStreamServer:
         self._session_controller = controller
         self._session_generation = controller.connection_generation()
         self._previous_mode = (mode, state.get("filter")) if mode else None
-        controller.set_mode(side, "FM-DATA")
+        controller.set_mode(side, f"{self.demodulation}-DATA")
         controller.set_lan_audio_output("IF")
         self._demodulator = demodulator
         self._decode_active = True
         self.last_error = None
-        LOGGER.info("External DATA Decode active on IC-9700 %s", side)
+        LOGGER.info("External DATA Decode active on IC-9700 %s (%s)", side, self.demodulation)
 
     def _end_decode_session(self) -> None:
         controller = self._session_controller
@@ -442,7 +453,7 @@ class RxAudioStreamServer:
             try:
                 side = "SUB"
                 current = controller.snapshot()[side.lower()]
-                if current.get("mode") == "FM" and current.get("data_mode") and current.get("filter") == 1:
+                if current.get("mode") == self.demodulation and current.get("data_mode") and current.get("filter") == 1:
                     controller.set_mode(side, previous[0])
                     if previous[1] in (1, 2, 3):
                         controller.set_filter(side, previous[1])

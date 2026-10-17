@@ -117,6 +117,18 @@ def register_radio_api(
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    @app.post("/api/radio/tuning-tone")
+    def set_tuning_tone(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        controller = get_controller()
+        if controller is None:
+            raise HTTPException(status_code=409, detail="Advanced Icom control is disabled.")
+        try:
+            return {"ok": True, **controller.set_tuning_tone(payload.get("enabled"))}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @app.post("/api/radio/filter")
     def set_filter(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
         controller = get_controller()

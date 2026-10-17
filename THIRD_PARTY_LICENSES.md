@@ -1,5 +1,20 @@
 # Third-Party Licenses
 
+## WSJT-X
+
+Pi-Sat optionally runs a separately installed, unmodified WSJT-X application
+for FT4 and FT8 encoding and decoding. The integration uses local UDP messages,
+isolated audio devices, and the managed application's Linux accessibility
+controls and verified button activation on its private display.
+Pi-Sat does not bundle WSJT-X source or binaries.
+
+WSJT-X is licensed under the GNU General Public License, version 3.
+
+Project and license:
+
+- <https://wsjt.sourceforge.io/wsjtx.html>
+- <https://github.com/WSJTX/wsjtx/blob/v3.0.2/COPYING>
+
 ## SSTVFlow
 
 Pi-Sat bundles SSTVFlow as a separate Python package under `vendor/sstvflow`

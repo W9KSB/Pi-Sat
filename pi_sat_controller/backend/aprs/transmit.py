@@ -389,6 +389,8 @@ class AprsTransmitter:
         if not self._lock.acquire(blocking=False):
             self._fail("An APRS transmission is already in progress.")
             raise ValueError(self._fail_message())
+        transmit_token: str | None = None
+        transmit_options: dict[str, str] = {}
         try:
             controller = self.get_controller()
             if controller is None:
@@ -411,6 +413,14 @@ class AprsTransmitter:
             if sample_rate <= 0:
                 self._fail("The radio TX audio sample rate is unknown.")
                 raise ValueError(self._fail_message())
+            claim = getattr(controller, "claim_transmit_stream", None)
+            if claim is not None:
+                try:
+                    transmit_token = claim("aprs")
+                    transmit_options = {"transmit_token": transmit_token}
+                except Exception as exc:
+                    self._fail(str(exc))
+                    raise ValueError(self._fail_message()) from exc
             problem = self._transmit_audio_problem(controller)
             if problem is not None:
                 self._fail(problem)
@@ -435,32 +445,33 @@ class AprsTransmitter:
             self._mark_transmitting()
             failure: str | None = None
             paced = getattr(controller, "set_transmit_stream_paced", None)
-            if paced is not None:
-                # Claim the transmit buffer before the key reaches the radio. The
-                # browser streams microphone audio for the whole session, so a
-                # claim made after key-up would let microphone frames prepend this
-                # modulated burst. It also tells the core not to insert silence
-                # frames into a real-time modulated stream.
-                paced(True)
             try:
-                controller.set_ptt(True)
+                if paced is not None:
+                    # Paced streams exclude browser samples and automatic silence fill.
+                    paced(True, **transmit_options)
+                controller.set_ptt(True, **transmit_options)
                 self._delay_ms(int(getattr(aprs, "tx_delay_ms", 0) or 0))
-                self._stream(controller, pcm, sample_rate)
-                controller.flush_audio()
+                self._stream(controller, pcm, sample_rate, transmit_token=transmit_token)
+                controller.flush_audio(**transmit_options)
                 LOGGER.info("APRS LAN audio submitted to transport: bytes=%d", len(pcm))
                 self._delay_ms(int(getattr(aprs, "tx_tail_ms", 0) or 0))
             except Exception as exc:
                 LOGGER.exception("APRS transmit failed while keyed")
                 failure = f"APRS transmit failed: {exc}"
             finally:
-                if paced is not None:
-                    paced(False)
                 # Always release PTT, including when key-up or readback failed
                 # part way; an unkey against an already-idle radio is harmless.
                 # A release problem is a safety warning, not a failed frame: the
                 # audio may already have been transmitted, so it must not be
                 # reported as a failure or dropped from the transmit count.
-                release_warning = self._release_ptt(controller)
+                release_warning = self._release_ptt(controller, transmit_token=transmit_token)
+                if paced is not None:
+                    try:
+                        paced(False, **transmit_options)
+                    except Exception:
+                        # Emergency unkey or disconnect may have invalidated our claim.
+                        if transmit_token is None:
+                            raise
             if failure:
                 self._fail(failure)
                 raise ValueError(self._fail_message())
@@ -472,10 +483,15 @@ class AprsTransmitter:
                 )
             return self.snapshot()
         finally:
+            if transmit_token is not None:
+                try:
+                    controller.release_transmit_stream(transmit_token)
+                except Exception as exc:
+                    LOGGER.warning("Could not release APRS transmit stream ownership: %s", exc)
             self._lock.release()
 
     @staticmethod
-    def _release_ptt(controller: Any) -> str | None:
+    def _release_ptt(controller: Any, *, transmit_token: str | None = None) -> str | None:
         """Unkey the radio, returning a warning when the release is unconfirmed.
 
         A frame that already reached the radio is not failed by a release
@@ -487,7 +503,7 @@ class AprsTransmitter:
         last_error: str | None = None
         for attempt in range(_PTT_RELEASE_ATTEMPTS):
             try:
-                controller.set_ptt(False)
+                controller.set_ptt(False, **({"transmit_token": transmit_token} if transmit_token is not None else {}))
             except Exception as exc:
                 last_error = str(exc) or exc.__class__.__name__
                 LOGGER.warning(
@@ -563,7 +579,7 @@ class AprsTransmitter:
             sleep(milliseconds / 1000.0)
 
     @staticmethod
-    def _stream(controller: Any, pcm: bytes, sample_rate: int) -> None:
+    def _stream(controller: Any, pcm: bytes, sample_rate: int, *, transmit_token: str | None = None) -> None:
         """Send the burst at real time so the radio sees a normal audio stream."""
         chunk_bytes = max(
             _PCM_BYTES_PER_SAMPLE,
@@ -576,7 +592,10 @@ class AprsTransmitter:
             remaining = target - monotonic()
             if remaining > 0:
                 sleep(remaining)
-            controller.send_audio(pcm[start:start + chunk_bytes])
+            controller.send_audio(
+                pcm[start:start + chunk_bytes],
+                **({"transmit_token": transmit_token} if transmit_token is not None else {}),
+            )
 
     def _state_locked(self) -> str:
         if self._transmitting:

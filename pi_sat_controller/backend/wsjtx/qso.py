@@ -1,0 +1,519 @@
+"""Backend-owned standard-message QSO sequencing for the managed engine."""
+
+from __future__ import annotations
+
+import logging
+import copy
+import math
+import re
+import threading
+import time
+import uuid
+from collections import deque
+from collections.abc import Callable
+from datetime import datetime, timezone
+from typing import Any
+
+from .contacts import WsjtxContactStore, utc_time
+
+LOGGER = logging.getLogger(__name__)
+_CALL = re.compile(r"(?:[A-Z][A-Z0-9]?|[0-9][A-Z])[0-9][A-Z]{1,3}(?:/[PR])?")
+_GRID = re.compile(r"[A-R]{2}[0-9]{2}")
+_REPORT = re.compile(r"([+-][0-9]{2})")
+_MAX_RETRIES = 3
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_standard_message(message: str) -> dict[str, str]:
+    """Identify explicit sender and recipient without resolving hashed calls."""
+    if not isinstance(message, str) or len(message) > 80 or any(char in message for char in "<>;"):
+        raise ValueError("Decode is not an unambiguous standard message")
+    words = message.strip().upper().split()
+    if words and words[0] in ("CQ", "QRZ", "DE"):
+        if len(words) == 4 and words[0] == "CQ" and re.fullmatch(r"[A-Z]{1,4}|[0-9]{3}", words[1]):
+            words = [words[0], *words[2:]]
+        if len(words) != 3 or not _CALL.fullmatch(words[1]) or not _GRID.fullmatch(words[2]):
+            raise ValueError("Decode does not contain an explicit standard call and grid")
+        return {"recipient": words[0], "sender": words[1], "payload": words[2], "grid": words[2], "report": ""}
+    if len(words) != 3 or not _CALL.fullmatch(words[0]) or not _CALL.fullmatch(words[1]) or words[0] == words[1]:
+        raise ValueError("Decode does not contain two distinct standard calls")
+    payload = words[2]
+    report = payload[1:] if payload.startswith("R") and _REPORT.fullmatch(payload[1:]) else payload if _REPORT.fullmatch(payload) else ""
+    if report and not -50 <= int(report) <= 49:
+        raise ValueError("Decode report is outside the standard range")
+    grid = payload if payload not in ("RRR", "RR73", "73") and _GRID.fullmatch(payload) else ""
+    if not grid and not report and payload not in ("RRR", "RR73", "73"):
+        raise ValueError("Decode is not a supported standard exchange")
+    return {"recipient": words[0], "sender": words[1], "payload": payload, "grid": grid, "report": report}
+
+
+class WsjtxQso:
+    def __init__(
+        self, *, get_settings: Callable[[], dict[str, Any]],
+        get_manager: Callable[[], Any], get_engine: Callable[[], Any],
+        get_controller: Callable[[], Any], contacts: WsjtxContactStore,
+        get_satellite: Callable[[], str] = lambda: "",
+    ) -> None:
+        self._get_settings, self._get_manager = get_settings, get_manager
+        self._get_engine, self._get_controller = get_engine, get_controller
+        self._get_satellite, self.contacts = get_satellite, contacts
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._my_call = self._my_grid = self._target_call = self._target_grid = ""
+        self._mode = "FT8"
+        self._report = "-10"
+        self._tx_offset = 1500
+        self._rx_offset = 0
+        self._selected = 6
+        self._enabled = False
+        self._auto = True
+        self._transmitting = self._tx_available = False
+        self._detail = "Select a live standard decode or call CQ"
+        self._tx_even = True
+        self._attempts = 0
+        self._engine = self._controller = None
+        self._radio_cache_controller = None
+        self._radio_cache: dict[str, Any] | None = None
+        self._radio_cache_at = 0.0
+        self._engine_generation = self._controller_generation = None
+        self._client_key = ""
+        self._attempt_id = ""
+        self._seen: set[str] = set()
+        self._seen_order: deque[str] = deque()
+        self._was_transmitting = False
+        self._inflight: dict[str, Any] | None = None
+        self._time_on = self._report_sent = self._report_received = ""
+        self._acknowledged = False
+        self._logged = False
+        self._transmissions: deque[dict[str, Any]] = deque(maxlen=100)
+        try:
+            self._read_station()
+        except Exception as error:
+            self._detail = str(error)
+        if contacts.error:
+            self._detail = contacts.error
+
+    def _read_station(self) -> None:
+        settings = self._get_settings()
+        call = str(settings.get("callsign", "")).upper().strip()
+        grid = str(settings.get("grid_locator", "")).upper().strip()
+        mode = str(settings.get("mode", "FT8")).upper()
+        if not _CALL.fullmatch(call) or not re.fullmatch(r"[A-R]{2}[0-9]{2}(?:[A-X]{2}(?:[0-9]{2})?)?", grid):
+            raise ValueError("Configure a standard station callsign and valid grid before transmitting")
+        if mode not in ("FT8", "FT4"):
+            raise ValueError("QSO sequencing supports FT8 and FT4")
+        self._my_call, self._my_grid, self._mode = call, grid[:4], mode
+
+    def _messages(self) -> list[dict[str, Any]]:
+        pair = f"{self._target_call} {self._my_call}" if self._target_call else ""
+        return [{"number": number, "text": text} for number, text in (
+            (1, f"{pair} {self._my_grid}" if pair else ""),
+            (2, f"{pair} {self._report}" if pair else ""),
+            (3, f"{pair} R{self._report}" if pair else ""),
+            (4, f"{pair} RR73" if pair else ""), (5, f"{pair} 73" if pair else ""),
+            (6, f"CQ {self._my_call} {self._my_grid}" if self._my_call else ""),
+        )]
+
+    def _period_ms(self) -> int:
+        return 7500 if self._mode == "FT4" else 15000
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            next_slot = ""
+            if self._enabled:
+                period = self._period_ms() / 1000
+                slot = math.floor(_now().timestamp() / period) + 1
+                if (slot % 2 == 0) != self._tx_even:
+                    slot += 1
+                next_slot = datetime.fromtimestamp(slot * period, timezone.utc).isoformat(timespec="milliseconds")
+            return {
+                "my_call": self._my_call, "my_grid": self._my_grid,
+                "target_call": self._target_call, "target_grid": self._target_grid,
+                "report": self._report, "tx_offset_hz": self._tx_offset,
+                "rx_offset_hz": self._rx_offset, "selected_message": self._selected,
+                "messages": self._messages(), "enabled": self._enabled,
+                "auto_sequence": self._auto, "transmitting": self._transmitting,
+                "tx_available": self._tx_available, "retries": max(0, self._attempts - 1),
+                "max_retries": _MAX_RETRIES, "detail": self._detail,
+                "next_slot_utc": next_slot, "contacts": self.contacts.list(),
+                "transmissions": copy.deepcopy(list(self._transmissions)),
+            }
+
+    def _radio(self, controller: Any) -> dict[str, Any]:
+        if controller is None:
+            raise RuntimeError("Native radio is unavailable")
+        reader = getattr(controller, "try_snapshot", None)
+        radio = reader() if reader is not None else controller.snapshot()
+        if radio is None and controller is self._radio_cache_controller and self._radio_cache is not None and time.monotonic() - self._radio_cache_at <= 2:
+            return self._radio_cache
+        if radio is None:
+            self._radio_cache = None
+            raise RuntimeError("A fresh native radio snapshot is unavailable")
+        if not isinstance(radio, dict) or not radio.get("connected"):
+            self._radio_cache = None
+            raise RuntimeError("Native radio is disconnected")
+        if radio.get("main", {}).get("mode") not in ("USB", "USB-DATA", "LSB", "LSB-DATA") or radio.get("sub", {}).get("mode") not in ("USB", "USB-DATA"):
+            self._radio_cache = None
+            raise RuntimeError("Native MAIN must use USB/LSB and SUB must use USB, with optional DATA")
+        self._radio_cache_controller, self._radio_cache = controller, radio
+        self._radio_cache_at = time.monotonic()
+        return radio
+
+    @staticmethod
+    def _radio_generation(controller: Any) -> int | None:
+        reader = getattr(controller, "connection_generation", None)
+        value = reader() if callable(reader) else reader
+        return value if type(value) is int else None
+
+    def _context(self) -> tuple[Any, dict[str, Any], dict[str, Any], Any, dict[str, Any]]:
+        if self.contacts.error:
+            raise RuntimeError(self.contacts.error)
+        engine = self._get_engine()
+        status = engine.snapshot()
+        tx = status.get("tx", {})
+        self._tx_available = bool(tx.get("available"))
+        self._transmitting = bool(tx.get("transmitting"))
+        if (not status.get("running") or not tx.get("available") or not tx.get("connected") or
+                tx.get("mode") != self._mode or type(tx.get("generation")) is not int or
+                type(tx.get("transmitting")) is not bool or type(tx.get("enabled")) is not bool or
+                not isinstance(tx.get("message"), str)):
+            raise RuntimeError("Managed WSJT-X transmit controls and fresh receive source are unavailable")
+        manager = self._get_manager().snapshot()
+        if not manager.get("running") or not manager.get("enabled"):
+            raise RuntimeError("WSJT-X listener is unavailable")
+        controller = self._get_controller()
+        return engine, tx, manager, controller, self._radio(controller)
+
+    def _owned_client(self, manager: dict[str, Any], tx: dict[str, Any]) -> str:
+        clients = [client for client in manager.get("clients", []) if client.get("connected") and client.get("id") == "WSJT-X - PiSat-RX" and client.get("host") in ("127.0.0.1", "::1") and client.get("status", {}).get("mode") == self._mode]
+        if tx.get("client_key"):
+            clients = [client for client in clients if client.get("key") == tx["client_key"]]
+        if len(clients) != 1:
+            raise RuntimeError("A unique fresh managed WSJT-X client is required")
+        seen = utc_time(clients[0]["last_seen_utc"])
+        if not -2 <= (_now() - seen).total_seconds() <= 45:
+            raise RuntimeError("Managed WSJT-X client status is stale")
+        return clients[0]["key"]
+
+    def _live_decode(self, decode: dict[str, Any], client_key: str) -> dict[str, str]:
+        if decode.get("client_key") != client_key or decode.get("mode") != self._mode:
+            raise ValueError("Decode is not from the active managed mode and client")
+        if decode.get("low_confidence") or decode.get("off_air"):
+            raise ValueError("Off-air or low-confidence decodes cannot select or advance a QSO")
+        if type(decode.get("time_ms")) is not int or not 0 <= decode["time_ms"] < 86400000 or type(decode.get("frequency_hz")) is not int or decode["frequency_hz"] < 0:
+            raise ValueError("Decode has no valid native time and frequency")
+        for field in ("received_at_utc", "time_utc"):
+            try:
+                age = (_now() - utc_time(decode[field])).total_seconds()
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("Decode has no valid live timestamp") from error
+            if not -2 <= age <= self._period_ms() / 500:
+                raise ValueError("Decode is stale")
+        return parse_standard_message(decode.get("message", ""))
+
+    def _offset_valid(self, hz: int, radio: dict[str, Any]) -> None:
+        bandwidth = radio.get("sub", {}).get("bandwidth_hz")
+        bandwidth = bandwidth if type(bandwidth) is int and bandwidth > 0 else 3000
+        width = 90 if self._mode == "FT4" else 50
+        if type(hz) is not int or not 200 <= hz <= bandwidth - width:
+            raise ValueError(f"TX offset must keep all {self._mode} tones inside the {bandwidth} Hz audio span")
+
+    def _remember(self, key: str) -> None:
+        if key not in self._seen:
+            self._seen.add(key)
+            self._seen_order.append(key)
+        while len(self._seen_order) > 5000:
+            self._seen.discard(self._seen_order.popleft())
+
+    def _new_attempt(self, engine: Any, tx: dict[str, Any], manager: dict[str, Any], controller: Any) -> None:
+        self._engine, self._controller = engine, controller
+        self._engine_generation = tx.get("generation")
+        self._controller_generation = self._radio_generation(controller)
+        self._client_key = self._owned_client(manager, tx)
+        self._attempt_id = uuid.uuid4().hex
+        self._time_on = self._report_sent = self._report_received = ""
+        self._acknowledged = self._logged = False
+        self._attempts = 0
+        self._inflight = None
+        self._was_transmitting = bool(tx.get("transmitting"))
+        self._seen.clear()
+        self._seen_order.clear()
+        for decode in manager.get("decodes", []):
+            self._remember(decode["key"])
+
+    def _configure(self) -> None:
+        message = self._messages()[self._selected - 1]["text"]
+        if not message:
+            raise ValueError("Select a target before choosing a directed message")
+        self._engine.configure_tx(message=message, offset_hz=self._tx_offset, tx_even=self._tx_even)
+        LOGGER.info("QSO stage %d configured for %s at %d Hz", self._selected, self._target_call or "CQ", self._tx_offset)
+
+    def _halt(self, detail: str) -> None:
+        self._enabled = False
+        self._detail = detail
+        self._inflight = None
+        try:
+            (self._engine or self._get_engine()).halt_tx()
+        except Exception as error:
+            self._detail += f"; transmit halt failed: {error}"
+        LOGGER.info("QSO transmit disabled: %s", self._detail)
+
+    def _arm(self, engine: Any, radio: dict[str, Any]) -> None:
+        self._offset_valid(self._tx_offset, radio)
+        try:
+            self._configure()
+            engine.set_tx_enabled(True)
+            self._enabled = True
+            self._detail = "Waiting for the next transmit slot"
+        except Exception as error:
+            self._halt(f"Could not configure or enable managed transmission: {error}")
+            raise
+
+    def select_target(self, decode_key: str) -> dict[str, Any]:
+        if not isinstance(decode_key, str) or not decode_key or len(decode_key) > 128:
+            raise ValueError("A decode key is required")
+        with self._lock:
+            self._read_station()
+            engine, tx, manager, controller, radio = self._context()
+            client = self._owned_client(manager, tx)
+            decode = next((item for item in manager.get("decodes", []) if item.get("key") == decode_key), None)
+            if decode is None:
+                raise ValueError("Selected decode is no longer available")
+            parsed = self._live_decode(decode, client)
+            if parsed["sender"] == self._my_call:
+                raise ValueError("Cannot select the station's own decode")
+            snr = decode.get("snr_db")
+            if type(snr) is not int or not -50 <= snr <= 49:
+                raise ValueError("Decode has no standard signal report")
+            self._target_call, self._target_grid = parsed["sender"], parsed["grid"]
+            self._report = f"{snr:+03d}"
+            self._rx_offset = decode.get("frequency_hz", 0)
+            self._tx_even = (decode["time_ms"] // self._period_ms()) % 2 == 1
+            self._selected = 1
+            self._new_attempt(engine, tx, manager, controller)
+            if parsed["recipient"] == self._my_call:
+                self._apply_reply(parsed)
+            self._arm(engine, radio)
+            LOGGER.info("QSO selected sender %s from live %s decode", self._target_call, self._mode)
+            return self.snapshot()
+
+    def call_cq(self) -> dict[str, Any]:
+        with self._lock:
+            self._read_station()
+            engine, tx, manager, controller, radio = self._context()
+            self._target_call = self._target_grid = ""
+            self._selected, self._tx_even = 6, True
+            self._new_attempt(engine, tx, manager, controller)
+            self._arm(engine, radio)
+            return self.snapshot()
+
+    def select_message(self, number: int) -> dict[str, Any]:
+        if type(number) is not int or not 1 <= number <= 6:
+            raise ValueError("Message number must be from 1 to 6")
+        with self._lock:
+            if not self._messages()[number - 1]["text"]:
+                raise ValueError("Select a target before choosing a directed message")
+            self._selected, self._attempts = number, 0
+            if self._enabled:
+                try:
+                    self._configure()
+                except Exception as error:
+                    self._halt(f"Could not change the managed transmit message: {error}")
+                    raise
+            self._detail = f"Message {number} selected; auto sequence {'enabled' if self._auto else 'disabled'}"
+            return self.snapshot()
+
+    def set_offset(self, hz: int) -> dict[str, Any]:
+        with self._lock:
+            radio = self._radio(self._get_controller())
+            self._offset_valid(hz, radio)
+            self._tx_offset = hz
+            if self._enabled:
+                try:
+                    self._configure()
+                except Exception as error:
+                    self._halt(f"Could not change the managed transmit offset: {error}")
+                    raise
+            self._detail = "TX offset applies to the next burst" if self._transmitting else "TX offset updated"
+            return self.snapshot()
+
+    def set_enabled(self, enabled: bool) -> dict[str, Any]:
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        with self._lock:
+            if not enabled:
+                self._halt("Transmit disabled by the operator")
+            elif not self._enabled:
+                self._read_station()
+                engine, tx, manager, controller, radio = self._context()
+                self._new_attempt(engine, tx, manager, controller)
+                self._arm(engine, radio)
+            return self.snapshot()
+
+    def set_auto_sequence(self, enabled: bool) -> dict[str, Any]:
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        with self._lock:
+            self._auto = enabled
+            return self.snapshot()
+
+    def _apply_reply(self, parsed: dict[str, str], *, advance: bool = True) -> bool:
+        if parsed["recipient"] != self._my_call or parsed["sender"] != self._target_call:
+            return False
+        if parsed["grid"]:
+            self._target_grid = parsed["grid"]
+            stage = 2
+        elif parsed["report"]:
+            self._report_received = parsed["report"]
+            if parsed["payload"].startswith("R"):
+                self._acknowledged = True
+                stage = 4
+            else:
+                stage = 3
+        elif parsed["payload"] in ("RR73", "RRR", "73"):
+            self._acknowledged = True
+            stage = 5
+        else:
+            return False
+        if advance and (self._selected == 6 or stage > self._selected):
+            self._selected, self._attempts = stage, 0
+            return True
+        return False
+
+    def _log_contact(self, radio: dict[str, Any]) -> None:
+        if self._logged or not self._time_on or not self._report_sent or not self._report_received or not self._acknowledged:
+            return
+        rx, tx = radio.get("sub", {}).get("frequency_hz"), radio.get("main", {}).get("frequency_hz")
+        if type(rx) is not int or type(tx) is not int or rx <= 0 or tx <= 0:
+            raise RuntimeError("Confirmed native frequencies are required to log the completed contact")
+        satellite = self._get_satellite()
+        self.contacts.append({
+            "id": self._attempt_id, "time_on_utc": self._time_on, "time_off_utc": _now().isoformat(),
+            "call": self._target_call, "grid": self._target_grid, "mode": self._mode,
+            "report_sent": self._report_sent, "report_received": self._report_received,
+            "satellite": satellite if isinstance(satellite, str) else "",
+            "rx_frequency_hz": rx + self._rx_offset,
+            "tx_frequency_hz": tx - self._tx_offset if str(radio.get("main", {}).get("mode", "")).startswith("LSB") else tx + self._tx_offset,
+        })
+        self._logged = True
+        LOGGER.info("QSO contact logged: %s %s", self._target_call, self._mode)
+        self._halt(f"Contact with {self._target_call} completed and logged")
+
+    def _poll_once(self) -> None:
+        with self._lock:
+            engine = self._get_engine()
+            status = engine.snapshot()
+            tx = status.get("tx", {})
+            self._transmitting = bool(tx.get("transmitting"))
+            self._tx_available = bool(tx.get("available"))
+            if not self._enabled:
+                self._was_transmitting = self._transmitting
+                return
+            settings = self._get_settings()
+            controller = self._get_controller()
+            if (engine is not self._engine or controller is not self._controller or
+                    not status.get("running") or not tx.get("available") or not tx.get("connected") or
+                    type(tx.get("enabled")) is not bool or type(tx.get("transmitting")) is not bool or not isinstance(tx.get("message"), str) or
+                    tx.get("generation") != self._engine_generation or tx.get("mode") != self._mode or
+                    str(settings.get("mode", "FT8")).upper() != self._mode or
+                    self._radio_generation(controller) != self._controller_generation):
+                self._halt("Engine, native source, mode, or control session changed; transmit is disarmed")
+                return
+            radio = self._radio(controller)
+            manager = self._get_manager().snapshot()
+            if not manager.get("running") or not manager.get("enabled") or self._owned_client(manager, tx) != self._client_key:
+                self._halt("Managed receive client changed; transmit is disarmed")
+                return
+            self._offset_valid(self._tx_offset, radio)
+            if self._transmitting and not self._was_transmitting:
+                actual = str(tx.get("message", "")).strip().upper()
+                transmission = {
+                    "key": uuid.uuid4().hex, "time_utc": _now().isoformat(timespec="milliseconds"),
+                    "mode": tx.get("mode"), "message": actual, "frequency_hz": tx.get("offset_hz"),
+                    "client_key": self._client_key, "generation": tx.get("generation"),
+                    "direction": "tx", "transmitted": True, "completed": False,
+                }
+                self._transmissions.appendleft(transmission)
+                expected = self._messages()[self._selected - 1]["text"]
+                if actual != expected:
+                    self._halt("Observed transmission does not match the selected standard message")
+                    return
+                self._attempts += 1
+                self._time_on = self._time_on or _now().isoformat()
+                self._inflight = {"number": self._selected, "attempt": self._attempt_id, "message": actual, "history_key": transmission["key"]}
+                LOGGER.info("QSO actual TX started: stage %d attempt %d", self._selected, self._attempts)
+                if self._selected in (2, 3):
+                    self._report_sent = actual.split()[-1].removeprefix("R")
+            if not self._transmitting and self._was_transmitting and self._inflight is not None:
+                finished = self._inflight
+                self._inflight = None
+                for transmission in self._transmissions:
+                    if transmission["key"] == finished["history_key"]:
+                        transmission.update(completed=True, time_off_utc=_now().isoformat(timespec="milliseconds"))
+                        break
+                LOGGER.info("QSO actual TX completed: stage %d", finished["number"])
+                if finished["attempt"] == self._attempt_id and finished["number"] in (4, 5):
+                    self._log_contact(radio)
+                    if not self._enabled:
+                        self._was_transmitting = False
+                        return
+                if finished["number"] == self._selected and self._attempts >= _MAX_RETRIES + 1:
+                    self._halt("Initial transmission and three unanswered repeats completed")
+                    self._was_transmitting = False
+                    return
+            self._was_transmitting = self._transmitting
+            for decode in reversed(manager.get("decodes", [])):
+                key = decode.get("key", "")
+                if not key or key in self._seen:
+                    continue
+                self._remember(key)
+                try:
+                    parsed = self._live_decode(decode, self._client_key)
+                except ValueError:
+                    continue
+                if self._auto and not self._target_call and self._selected == 6 and parsed["recipient"] == self._my_call and parsed["sender"] != self._my_call:
+                    snr = decode.get("snr_db")
+                    if type(snr) is not int or not -50 <= snr <= 49:
+                        continue
+                    self._target_call, self._target_grid = parsed["sender"], parsed["grid"]
+                    self._report = f"{snr:+03d}"
+                    self._rx_offset = decode.get("frequency_hz", 0)
+                if self._apply_reply(parsed, advance=self._auto):
+                    self._configure()
+                    self._detail = f"Addressed reply from {self._target_call}; advancing to message {self._selected}"
+                    LOGGER.info("QSO addressed RX advanced %s to stage %d", self._target_call, self._selected)
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, name="wsjtx-qso", daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.1):
+            try:
+                self._poll_once()
+            except Exception as error:
+                with self._lock:
+                    previous = self._detail
+                    if self._enabled:
+                        self._halt(f"QSO sequencing stopped: {error}")
+                    else:
+                        self._tx_available = False
+                        self._detail = f"QSO controls unavailable: {error}"
+                if self._detail != previous:
+                    LOGGER.warning("QSO poll failed: %s", error)
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        with self._lock:
+            self._halt("QSO sequencing stopped")
+            worker = self._thread
+        if worker is not None:
+            worker.join(timeout=1.0)

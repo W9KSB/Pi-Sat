@@ -81,6 +81,10 @@ min_elevation_deg = 0.0
 home_azimuth_deg = 0.0
 home_elevation_deg = 0.0
 return_home_after_pass = false
+# Minimum change, in degrees, before a tracking target is sent again. 0 sends every update.
+tracking_threshold_deg = 0.0
+# Move to the home position when the target falls below min_elevation_deg.
+home_below_min_elevation = false
 
 [automation]
 aos_script =
@@ -143,10 +147,23 @@ rx_gain_db = -6
 # Optional Discord incoming webhook used to post each newly decoded image.
 discord_webhook_url =
 
+[wsjtx]
+# Stock WSJT-X runs beside Pi-Sat. Pi-Sat owns the radio and supplies SUB AF audio.
+# Enter your callsign and use the station grid configured in Pi-Sat Settings.
+executable = wsjtx
+callsign =
+mode = FT8
+# Local UDP reporting endpoint used by the managed engine.
+udp_host = 127.0.0.1
+udp_port = 2237
+client_timeout_seconds = 45
+max_decodes = 300
+
 [audio_stream]
 # External DATA Decode sends demodulated SUB/RX IF audio to the external client.
 # Enable from the module page after configuring [icom] sample_rate = 48000.
 enabled = false
+demodulation = FM
 bind_host = 0.0.0.0
 port = 8765
 # External DATA Decode always selects the SUB/RX (right) channel from stereo RX.

@@ -39,12 +39,11 @@ class ImageState:
 
     def finish(self, reason, status):
         if not self.rows:
-            kind = "image_partial"
-            actual_height = 0
-        else:
-            actual_height = max(self.rows) + 1
-            kind = "image_complete" if self.beginning_known and len(self.rows) == self.height else "image_partial"
-        canvas = np.zeros((max(1, actual_height), self.width, 3), np.uint8)
+            # There is no picture to encode; avoid a height-0 / height-1 PNG mismatch.
+            return
+        actual_height = max(self.rows) + 1
+        kind = "image_complete" if self.beginning_known and len(self.rows) == self.height else "image_partial"
+        canvas = np.zeros((actual_height, self.width, 3), np.uint8)
         for y, pixels in self.rows.items():
             canvas[y] = pixels
         data = io.BytesIO()
@@ -52,6 +51,8 @@ class ImageState:
         missing = sum("missing" in self.flags[i] for i in self.rows)
         recovered = sum("timing_recovered" in self.flags[i] for i in self.rows)
         self.emit(dict(status, type=kind, image_id=self.id, mode=self.mode, completion_reason=reason,
+                       beginning_known=self.beginning_known,
+                       transmitter_row_numbering_known=self.beginning_known,
                        decoded_row_count=len(self.rows)-missing, output_row_count=len(self.rows),
                        missing_row_count=missing, recovered_row_count=recovered,
                        unknown_tail_rows=self.height-actual_height if self.beginning_known else None,

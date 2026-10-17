@@ -26,6 +26,7 @@ def serialize_transponder(transponder) -> dict[str, object]:
         "preferred_uplink": transponder.preferred_uplink,
         "preferred_downlink": transponder.preferred_downlink,
         "tone": transponder.tone,
+        "custom": transponder.custom,
     }
 
 

@@ -16,6 +16,8 @@ let syncRxTx = true;
 let nativeIcomRxActive = false;
 let frontendLogMessages = [];
 let backendLogMessages = [];
+const moduleMonitorLogMessages = { wsjtx: [], sstv: [] };
+let moduleMonitorRenderPending = false;
 let hamlibRadioModels = [];
 let hamlibRotatorModels = [];
 let serialDevices = [];
@@ -51,6 +53,7 @@ const MODULE_NAV = [
   { id: 'qso-finder', label: 'QSO Finder' },
   { id: 'map', label: 'Map' },
   { id: 'aprs', label: 'APRS' },
+  { id: 'ft4-ft8', label: 'FT4 / FT8' },
 ];
 const SETTINGS_NAV = [
   { id: 'application', label: 'Application Settings' },
@@ -63,6 +66,10 @@ let activeSettingsSection = SETTINGS_NAV[0].id;
 let activePrimaryPageName = '';
 const MAP_REFRESH_TIMEOUT_MS = 5000;
 const MONITOR_GENERAL_DEBUG_STORAGE_KEY = 'pi-sat.monitor.general-debug';
+const MONITOR_MODULE_DEBUG_STORAGE_KEYS = {
+  wsjtx: 'pi-sat.monitor.wsjtx-debug',
+  sstv: 'pi-sat.monitor.sstv-debug',
+};
 const DASHBOARD_MOBILE_MAX_WIDTH = 1100;
 const NATIVE_ICOM_DEVICE_ID = 'native-ic9700';
 let currentDashboardMode = '';
@@ -118,6 +125,10 @@ const ADVANCED_SETTING_DESCRIPTIONS = {
   tracking_update_interval_ms: 'How often the tracking loop recalculates satellite position, Doppler, and control targets.',
   device_offline_failure_threshold: 'How many consecutive device failures must happen before RX, TX, SDR, or rotator is marked offline.',
   manual_offset_readback_active_pass_only: 'When enabled, physical radio tuning is adopted as an offset only during a live pass. When disabled, it is adopted whenever tracking is active.',
+};
+const SETTING_HELP_TEXT = {
+  tracking_threshold_deg: '0 = send every update',
+  home_below_min_elevation: 'Homes the rotator when the target drops below minimum elevation',
 };
 const STANDARD_PAGE_NAV = PAGE_NAMES.map((page) => {
   const labelByPage = {
@@ -182,6 +193,32 @@ function logErrorState(source, message) {
   addLog(normalized);
 }
 
+function appendModuleMonitorLog(kind, entry = {}) {
+  if (!Object.hasOwn(moduleMonitorLogMessages, kind)) return;
+  const messages = moduleMonitorLogMessages[kind];
+  if (!messages || typeof entry.message !== 'string' || !entry.message.trim()) return;
+  const key = entry.key === undefined || entry.key === null ? '' : String(entry.key);
+  if (key && messages.some(previous => previous.key === key)) return;
+  const level = String(entry.level || 'INFO').toUpperCase();
+  messages.unshift({
+    key,
+    timestampMs: Date.now(),
+    message: entry.message.slice(0, 8192),
+    level: ['DEBUG', 'INFO', 'WARN', 'WARNING', 'ERROR'].includes(level) ? level : 'INFO',
+    source: `module.${kind}`,
+  });
+  messages.length = Math.min(messages.length, 100);
+  if (!moduleMonitorRenderPending) {
+    moduleMonitorRenderPending = true;
+    window.requestAnimationFrame(() => {
+      moduleMonitorRenderPending = false;
+      if (pageFromHash() === 'monitor') renderLogs();
+    });
+  }
+}
+
+window.appendModuleMonitorLog = appendModuleMonitorLog;
+
 function renderLogs() {
   const list = document.getElementById('log-list');
   if (!list) {
@@ -189,7 +226,8 @@ function renderLogs() {
   }
   list.replaceChildren();
   const filters = getMonitorLogFilters();
-  const entries = [...backendLogMessages, ...frontendLogMessages]
+  const entries = [...backendLogMessages, ...frontendLogMessages,
+    ...moduleMonitorLogMessages.wsjtx, ...moduleMonitorLogMessages.sstv]
     .sort((left, right) => (right.timestampMs || 0) - (left.timestampMs || 0))
     .filter((entry) => shouldDisplayLogEntry(entry, filters))
     .slice(0, 100);
@@ -241,19 +279,22 @@ function renderIcomLogs() {
 function getMonitorLogFilters() {
   return {
     general: document.getElementById('monitor-general-debug')?.checked ?? true,
+    wsjtx: document.getElementById('monitor-wsjtx-debug')?.checked ?? false,
+    sstv: document.getElementById('monitor-sstv-debug')?.checked ?? false,
   };
 }
 
 function loadMonitorPreferences() {
   try {
-    const stored = window.localStorage.getItem(MONITOR_GENERAL_DEBUG_STORAGE_KEY);
-    if (stored === null) {
-      return;
-    }
-    const toggle = document.getElementById('monitor-general-debug');
-    if (toggle) {
-      toggle.checked = stored === 'true';
-    }
+    const preferences = {
+      general: MONITOR_GENERAL_DEBUG_STORAGE_KEY,
+      ...MONITOR_MODULE_DEBUG_STORAGE_KEYS,
+    };
+    Object.entries(preferences).forEach(([kind, storageKey]) => {
+      const stored = window.localStorage.getItem(storageKey);
+      const toggle = document.getElementById(`monitor-${kind}-debug`);
+      if (stored !== null && toggle) toggle.checked = stored === 'true';
+    });
   } catch (error) {
     // Ignore local storage failures and keep defaults.
   }
@@ -277,6 +318,8 @@ function persistGeneralMonitorDebugPreference() {
 function classifyLogEntry(entry) {
   const message = String(entry?.message || '').toLowerCase();
   const source = String(entry?.source || '').toLowerCase();
+  if (source === 'module.wsjtx' || source.includes('.wsjtx.')) return 'wsjtx';
+  if (source === 'module.sstv' || source.includes('.sstv.')) return 'sstv';
   if (message.includes('role=rotator') || message.includes('rotator') || message.includes('rotctld')) {
     return 'rotator';
   }
@@ -291,8 +334,8 @@ function classifyLogEntry(entry) {
 
 function shouldDisplayLogEntry(entry, filters) {
   const category = classifyLogEntry(entry);
-  if (category === 'general') {
-    return Boolean(filters.general);
+  if (['general', 'wsjtx', 'sstv'].includes(category)) {
+    return Boolean(filters[category]);
   }
   return true;
 }
@@ -311,7 +354,9 @@ function formatLogTime(timestampMs) {
 
 function formatLogMessage(entry) {
   const level = entry.level ? `[${entry.level}] ` : '';
-  return `${level}${entry.message || ''}`;
+  const category = classifyLogEntry(entry);
+  const moduleLabel = category === 'wsjtx' ? '[FT4/FT8] ' : category === 'sstv' ? '[SSTV] ' : '';
+  return `${moduleLabel}${level}${entry.message || ''}`;
 }
 
 async function fetchJson(url, fallback) {
@@ -2375,8 +2420,11 @@ function drawQsoLegend(ctx, width, height, opportunity) {
 }
 
 function renderRotator(result) {
-  document.getElementById('rotator-state-label').textContent =
-    result.state_label || 'Rotator control is off';
+  const stateLabel = document.getElementById('rotator-state-label');
+  stateLabel.textContent = result.tracking_message
+    || result.state_label
+    || 'Rotator control is off';
+  stateLabel.dataset.trackingStatus = result.tracking_status || '';
   document.getElementById('rotator-connected').innerHTML = result.connected
     ? '<span class="badge text-bg-success">Yes</span>'
     : '<span class="badge text-bg-secondary">No</span>';
@@ -2482,13 +2530,14 @@ async function loadSettings() {
       rotator: 'devices',
       automation: 'application',
       aprs: 'other',
+      wsjtx: 'other',
       sstv: 'other',
       safety: 'other',
     };
     const appendToSettingsPanel = (source, element) => {
       panels.get(settingsPanelBySource[source] || 'other').appendChild(element);
     };
-    const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'aprs', 'sstv', 'safety'];
+    const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'aprs', 'wsjtx', 'sstv', 'safety'];
     orderedSections.forEach((section) => {
       if (section === 'device_roles') {
         appendToSettingsPanel(section,
@@ -3104,6 +3153,7 @@ function renderManagedSatelliteDetail() {
   const satellite = managedSatellitesCache.find(
     (item) => Number(item.norad_id) === Number(selectedManagedSatelliteNorad)
   );
+  renderCustomTransponderForm(satellite);
 
   if (!satellite) {
     title.textContent = 'Select a satellite to view its profiles.';
@@ -3346,6 +3396,9 @@ function buildFrequencyProfileList(profiles) {
     }
     if (profile.inverted) {
       tags.appendChild(buildProfileTag('Inverting'));
+    }
+    if (profile.custom) {
+      tags.appendChild(buildProfileTag('Custom'));
     }
     const details = document.createElement('span');
     details.className = 'profile-frequency-line';
@@ -3887,6 +3940,120 @@ function buildProfileTag(text) {
   return tag;
 }
 
+function renderCustomTransponderForm(satellite) {
+  const section = document.getElementById('custom-transponder-section');
+  const form = document.getElementById('custom-transponder-form');
+  if (!section || !form) return;
+  const noradId = satellite ? String(satellite.norad_id) : '';
+  if (form.dataset.noradId !== noradId) {
+    form.reset();
+    form.dataset.noradId = noradId;
+    document.getElementById('custom-transponder-status').textContent = '';
+    updateCustomTransponderType();
+  }
+  section.hidden = !satellite;
+  document.getElementById('custom-transponder-fields').disabled =
+    !satellite || form.dataset.saving === 'true';
+}
+
+function updateCustomTransponderType() {
+  const type = document.getElementById('custom-transponder-type').value;
+  const rxOnly = type === 'rx_only';
+  const uplinkFields = document.getElementById('custom-transponder-uplink-fields');
+  uplinkFields.hidden = rxOnly;
+  uplinkFields.disabled = rxOnly;
+  document.getElementById('custom-transponder-uplink-low').required = !rxOnly;
+  document.getElementById('custom-transponder-uplink-mode').value = type === 'linear' ? 'LSB' : 'FM';
+  document.getElementById('custom-transponder-downlink-mode').value = type === 'linear' ? 'USB' : 'FM';
+  document.getElementById('custom-transponder-inverted').checked = type === 'linear';
+  updateCustomTransponderTone();
+}
+
+function updateCustomTransponderTone() {
+  const mode = document.getElementById('custom-transponder-uplink-mode').value;
+  const tone = document.getElementById('custom-transponder-tone');
+  tone.disabled = document.getElementById('custom-transponder-type').value === 'rx_only'
+    || !['FM', 'FM-DATA'].includes(mode);
+}
+
+function customTransponderPayload() {
+  const field = name => document.getElementById(`custom-transponder-${name}`);
+  const frequencyHz = (name, fallback) => {
+    const raw = field(name).value.trim();
+    if (!raw && fallback !== undefined) return fallback;
+    const hz = Math.round(Number(raw) * 1000000);
+    if (!raw || !Number.isSafeInteger(hz) || hz <= 0) {
+      throw new Error('Enter a positive frequency in MHz.');
+    }
+    return hz;
+  };
+  const name = field('name').value.trim();
+  if (!name) throw new Error('Enter a profile name.');
+  const type = field('type').value;
+  const rxOnly = type === 'rx_only';
+  const downlinkLow = frequencyHz('downlink-low');
+  const downlinkHigh = frequencyHz('downlink-high', downlinkLow);
+  const uplinkLow = rxOnly ? 0 : frequencyHz('uplink-low');
+  const uplinkHigh = rxOnly ? 0 : frequencyHz('uplink-high', uplinkLow);
+  if (downlinkHigh < downlinkLow || uplinkHigh < uplinkLow) {
+    throw new Error('The upper frequency limit must be at least the lower frequency.');
+  }
+  const rawTone = rxOnly || field('tone').disabled ? '' : field('tone').value.trim();
+  const tone = rawTone ? Number(rawTone) : null;
+  if (tone !== null && (!Number.isFinite(tone) || tone < 50 || tone > 300)) {
+    throw new Error('CTCSS must be between 50 and 300 Hz.');
+  }
+  return {
+    name, type,
+    downlink_low: downlinkLow, downlink_high: downlinkHigh,
+    uplink_low: uplinkLow, uplink_high: uplinkHigh,
+    downlink_mode: field('downlink-mode').value,
+    uplink_mode: rxOnly ? field('downlink-mode').value : field('uplink-mode').value,
+    inverted: !rxOnly && field('inverted').checked,
+    tone,
+  };
+}
+
+async function addCustomTransponder(event) {
+  event.preventDefault();
+  const form = document.getElementById('custom-transponder-form');
+  const status = document.getElementById('custom-transponder-status');
+  const noradId = Number(form.dataset.noradId);
+  if (form.dataset.saving === 'true') return;
+  if (!noradId || !managedSatellitesCache.some(satellite => Number(satellite.norad_id) === noradId)) {
+    status.textContent = 'Select a tracked satellite first.';
+    return;
+  }
+  if (!form.reportValidity()) return;
+  try {
+    const payload = customTransponderPayload();
+    form.dataset.saving = 'true';
+    document.getElementById('custom-transponder-fields').disabled = true;
+    status.textContent = 'Saving custom transponder...';
+    const response = await fetch(`/api/frequency-profiles/${noradId}/custom`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || 'Custom transponder could not be saved.');
+    if (Number(form.dataset.noradId) === noradId) {
+      form.reset();
+      updateCustomTransponderType();
+      status.textContent = `Added custom transponder: ${payload.name}`;
+    }
+    await loadSatellites();
+    await loadMySatellites();
+  } catch (error) {
+    if (Number(form.dataset.noradId) === noradId) {
+      status.textContent = error.message || 'Custom transponder could not be saved.';
+    }
+  } finally {
+    delete form.dataset.saving;
+    document.getElementById('custom-transponder-fields').disabled = !form.dataset.noradId;
+  }
+}
+
 async function updateFrequencyProfiles(noradId) {
   const status = document.getElementById('my-satellite-status');
   status.textContent = 'Updating frequency profiles...';
@@ -4003,6 +4170,17 @@ function buildSettingControl(section, key, value) {
     ? 'Icom CI-V UDP Port'
     : formatSettingLabel(key);
 
+  const appendHelpText = () => {
+    const helpText = settingHelpText(key);
+    if (!helpText) {
+      return;
+    }
+    const help = document.createElement('span');
+    help.className = 'settings-row-help';
+    help.textContent = helpText;
+    row.appendChild(help);
+  };
+
   const fieldName = `${section}.${key}`;
   let control;
 
@@ -4025,6 +4203,7 @@ function buildSettingControl(section, key, value) {
     switchWrap.className = 'form-check form-switch mb-0';
     switchWrap.appendChild(control);
     row.append(labelText, hidden, switchWrap);
+    appendHelpText();
     return row;
   }
 
@@ -4055,6 +4234,16 @@ function buildSettingControl(section, key, value) {
       control.appendChild(option);
     });
     control.value = value || 'network';
+  } else if (section === 'wsjtx' && key === 'mode') {
+    control = document.createElement('select');
+    control.className = 'form-select';
+    ['FT8', 'FT4'].forEach((mode) => {
+      const option = document.createElement('option');
+      option.value = mode;
+      option.textContent = mode;
+      control.appendChild(option);
+    });
+    control.value = value || 'FT8';
   } else if (section === 'aprs' && key === 'channel') {
     control = document.createElement('select');
     control.className = 'form-select';
@@ -4132,6 +4321,7 @@ function buildSettingControl(section, key, value) {
 
   control.name = fieldName;
   row.append(labelText, control);
+  appendHelpText();
   if (
     (key === 'serial_port' && section === 'rotator')
     && control.dataset.deviceMissing === 'true'
@@ -4625,6 +4815,7 @@ function isBooleanSetting(key) {
     || key === 'debug_logging'
     || key === 'cat_debug_logging'
     || key === 'return_home_after_pass'
+    || key === 'home_below_min_elevation'
     || key === 'manual_offset_readback_active_pass_only'
     || key === 'full_duplex'
     || key === 'scope_enabled'
@@ -4643,6 +4834,7 @@ function isNumericSetting(key) {
     || key === 'tracking_update_interval_ms'
     || key === 'device_offline_failure_threshold'
     || key === 'min_elevation_deg'
+    || key === 'tracking_threshold_deg'
     || key === 'control_port'
     || key === 'serial_port'
     || key === 'audio_port'
@@ -4696,6 +4888,8 @@ function formatSettingLabel(key) {
     home_azimuth_deg: 'Home Azimuth (deg)',
     home_elevation_deg: 'Home Elevation (deg)',
     return_home_after_pass: 'Return Home When Pass Ends',
+    tracking_threshold_deg: 'Tracking Update Threshold (deg)',
+    home_below_min_elevation: 'Return Home Below Min Elevation',
     cat_debug_logging: 'CAT Debug Logging',
     target_vfo: 'Target VFO',
     tracking_update_interval_ms: 'Tracking Update Interval (ms)',
@@ -4737,6 +4931,10 @@ function formatSettingLabel(key) {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ');
+}
+
+function settingHelpText(key) {
+  return SETTING_HELP_TEXT[key] || '';
 }
 
 function rememberTrackingProfile(result) {
@@ -5730,6 +5928,15 @@ document
   .getElementById('my-satellite-form')
   .addEventListener('submit', addMySatellite);
 document
+  .getElementById('custom-transponder-form')
+  .addEventListener('submit', addCustomTransponder);
+document
+  .getElementById('custom-transponder-type')
+  .addEventListener('change', updateCustomTransponderType);
+document
+  .getElementById('custom-transponder-uplink-mode')
+  .addEventListener('change', updateCustomTransponderTone);
+document
   .getElementById('my-satellite-options')
   .addEventListener('submit', saveMySatelliteOptions);
 document
@@ -5747,6 +5954,17 @@ document
     persistGeneralMonitorDebugPreference();
     renderLogs();
   });
+Object.entries(MONITOR_MODULE_DEBUG_STORAGE_KEYS).forEach(([kind, storageKey]) => {
+  document.getElementById(`monitor-${kind}-debug`).addEventListener('change', event => {
+    try {
+      window.localStorage.setItem(storageKey, event.target.checked ? 'true' : 'false');
+    } catch (_) {
+      // Display filtering still works when browser storage is unavailable.
+    }
+    renderLogs();
+  });
+});
+loadMonitorPreferences();
 document
   .getElementById('monitor-rx-cat-debug')
   .addEventListener('change', updateMonitorDebug);

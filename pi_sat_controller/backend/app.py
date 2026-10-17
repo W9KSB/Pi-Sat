@@ -12,6 +12,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, time, timedelta, timezone
+from functools import lru_cache
 import logging
 import math
 from pathlib import Path
@@ -24,6 +25,7 @@ from starlette.responses import Response
 from fastapi.staticfiles import StaticFiles
 
 from pi_sat_controller.backend.api_qso import register_qso_api
+from pi_sat_controller.backend.api_dashboard import register_dashboard_api
 from pi_sat_controller.backend.api_satellites import register_satellites_api
 from pi_sat_controller.backend.api_settings import register_settings_api
 from pi_sat_controller.backend.api_system import register_system_api
@@ -34,6 +36,7 @@ from pi_sat_controller.backend.automation_scripts import (
     run_automation_script,
 )
 from pi_sat_controller.backend.config import (
+    DEFAULT_CONFIG_PATH,
     NATIVE_ICOM_DEVICE_ID,
     PROJECT_ROOT,
     SETTINGS_SCHEMA,
@@ -94,6 +97,7 @@ from pi_sat_controller.backend.radio.native_icom_tracking import NativeIcomTrack
 from pi_sat_controller.backend.api_radio import register_radio_api
 from pi_sat_controller.backend.api_sstv import register_sstv_api
 from pi_sat_controller.backend.api_aprs import register_aprs_api
+from pi_sat_controller.backend.api_wsjtx import register_wsjtx_api
 from pi_sat_controller.backend.runtime_fallbacks import (
     DisabledTrackingSdrManager,
     FailedRadioManager,
@@ -117,6 +121,10 @@ from pi_sat_controller.backend.sdr.polling_sdr import (
 from pi_sat_controller.backend.aprs.manager import AprsManager
 from pi_sat_controller.backend.aprs.transmit import AprsTransmitter
 from pi_sat_controller.backend.sstv.manager import SstvManager
+from pi_sat_controller.backend.wsjtx.manager import WsjtxManager
+from pi_sat_controller.backend.wsjtx.engine import WsjtxEngine
+from pi_sat_controller.backend.wsjtx.qso import WsjtxQso
+from pi_sat_controller.backend.wsjtx.contacts import WsjtxContactStore
 from pi_sat_controller.backend.sstv.discord_webhook import DiscordWebhookNotifier
 from pi_sat_controller.backend.models import (SatellitePass, SatelliteProfile)
 
@@ -243,6 +251,54 @@ aprs_manager = AprsManager(
     rx_gain_db=configured_rx_gain_db("aprs"),
 )
 
+
+def _wsjtx_settings() -> dict[str, object]:
+    config = load_config().wsjtx
+    return {
+        "executable": config.executable,
+        "callsign": config.callsign,
+        "mode": config.mode,
+        "grid_locator": load_settings()["station"]["grid_locator"],
+        "udp_host": config.udp_host,
+        "udp_port": config.udp_port,
+        "client_timeout_seconds": config.client_timeout_seconds,
+        "max_decodes": config.max_decodes,
+    }
+
+
+wsjtx_manager = WsjtxManager(get_settings=_wsjtx_settings)
+
+
+@lru_cache(maxsize=1)
+def _wsjtx_if_source_enabled(config_signature: tuple[int, int, int]) -> bool:
+    # Audio checks run per packet; reparse configuration only when the file changes.
+    return load_config().audio_stream.enabled
+
+
+def _wsjtx_block_reason() -> str:
+    config_stat = DEFAULT_CONFIG_PATH.stat()
+    if _wsjtx_if_source_enabled((config_stat.st_mtime_ns, config_stat.st_size, config_stat.st_ino)):
+        return "Disable External DATA Decode before starting WSJT-X; WSJT-X requires normal SUB AF audio."
+    return ""
+
+
+wsjtx_engine = WsjtxEngine(
+    project_root=PROJECT_ROOT,
+    get_settings=_wsjtx_settings,
+    get_controller=lambda: icom_controller,
+    get_block_reason=_wsjtx_block_reason,
+    get_manager=lambda: wsjtx_manager,
+)
+
+
+wsjtx_qso = WsjtxQso(
+    get_settings=_wsjtx_settings, get_manager=lambda: wsjtx_manager,
+    get_engine=lambda: wsjtx_engine, get_controller=lambda: icom_controller,
+    contacts=WsjtxContactStore(PROJECT_ROOT / "data" / "wsjtx" / "contacts.json"),
+    get_satellite=lambda: rx_tracking_manager.snapshot().satellite_name if rx_tracking_manager is not None else "",
+)
+
+
 aprs_transmitter = AprsTransmitter(
     project_root=PROJECT_ROOT,
     data_dir=PROJECT_ROOT / "data" / "aprs",
@@ -254,6 +310,7 @@ aprs_transmitter = AprsTransmitter(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _reload_runtime_config()
+    wsjtx_qso.start()
     _start_pass_refresh_scheduler()
     _start_autotrack_scheduler()
     _start_transponder_refresh_scheduler()
@@ -271,6 +328,9 @@ async def lifespan(app: FastAPI):
         sstv_manager.shutdown()
         sstv_discord_notifier.shutdown()
         aprs_manager.shutdown()
+        wsjtx_qso.shutdown()
+        wsjtx_engine.stop()
+        wsjtx_manager.shutdown()
         aprs_transmitter.shutdown()
         if audio_stream_server is not None:
             audio_stream_server.shutdown()
@@ -773,6 +833,7 @@ def _reload_audio_stream_server(config, *, force: bool = False) -> None:
             and existing.channel == "right"
             and existing.sample_rate == config.icom.sample_rate
             and existing.channels == radio_channels(config.icom.rx_codec)
+            and existing.demodulation == desired.demodulation
         )
         if same and desired.enabled and not force:
             return
@@ -790,6 +851,7 @@ def _reload_audio_stream_server(config, *, force: bool = False) -> None:
             channels=radio_channels(config.icom.rx_codec),
             get_controller=lambda: icom_controller,
             external_decode=True,
+            demodulation=desired.demodulation,
         )
         server.start()
         audio_stream_server = server
@@ -819,9 +881,10 @@ def _audio_stream_status() -> dict[str, object]:
             "source_dropped": 0,
             "last_error": audio_stream_error,
             "active": False,
+            "demodulation": config.demodulation,
         }
     status["passive"] = False
-    status["source"] = "IC-9700 LAN IF, software FM demodulated to 48 kHz mono PCM"
+    status["source"] = f"IC-9700 LAN IF, software {status['demodulation']} demodulated to 48 kHz mono PCM"
     return status
 
 
@@ -846,6 +909,18 @@ def _set_audio_stream_enabled(enabled: bool) -> dict[str, object]:
                 save_settings({"audio_stream": {"enabled": "false"}})
                 raise RuntimeError(str(status["last_error"] or "External DATA Decode could not start"))
             return status
+
+
+def _set_audio_stream_demodulation(demodulation: str) -> dict[str, object]:
+    if demodulation not in {"FM", "USB"}:
+        raise ValueError("demodulation must be FM or USB")
+    with config_transaction():
+        with tracking_command_lock:
+            config = load_config()
+            if config.audio_stream.enabled or audio_stream_server is not None:
+                raise ValueError("Disable External DATA Decode before changing demodulation")
+            save_settings({"audio_stream": {"demodulation": demodulation}})
+            return _audio_stream_status()
 
 
 def _reload_runtime_config() -> list[str]:
@@ -1008,6 +1083,8 @@ def _reload_runtime_config_locked() -> list[str]:
                 home_azimuth_deg=config.rotator.home_azimuth_deg or 0.0,
                 home_elevation_deg=config.rotator.home_elevation_deg or 0.0,
                 return_home_after_pass=config.rotator.return_home_after_pass,
+                tracking_threshold_deg=config.rotator.tracking_threshold_deg,
+                home_below_min_elevation=config.rotator.home_below_min_elevation,
                 failure_threshold=failure_threshold,
             )
         except Exception as exc:
@@ -1089,6 +1166,8 @@ def _reload_rotator_config_only_locked() -> None:
                 home_azimuth_deg=config.rotator.home_azimuth_deg or 0.0,
                 home_elevation_deg=config.rotator.home_elevation_deg or 0.0,
                 return_home_after_pass=config.rotator.return_home_after_pass,
+                tracking_threshold_deg=config.rotator.tracking_threshold_deg,
+                home_below_min_elevation=config.rotator.home_below_min_elevation,
                 failure_threshold=failure_threshold,
             )
         except Exception as exc:
@@ -1781,7 +1860,12 @@ register_settings_api(
 )
 
 register_radio_api(app, get_controller=lambda: icom_controller)
-register_audio_stream_api(app, get_status=_audio_stream_status, set_enabled=_set_audio_stream_enabled)
+register_wsjtx_api(app, get_manager=lambda: wsjtx_manager, get_engine=lambda: wsjtx_engine,
+                   get_qso=lambda: wsjtx_qso, get_spectrum=wsjtx_engine.spectrum.snapshot)
+register_audio_stream_api(
+    app, get_status=_audio_stream_status, set_enabled=_set_audio_stream_enabled,
+    set_demodulation=_set_audio_stream_demodulation,
+)
 register_sstv_api(
     app,
     get_manager=lambda: sstv_manager,
@@ -1819,5 +1903,21 @@ register_qso_api(
 )
 
 frontend_dir = PROJECT_ROOT / "frontend"
+register_dashboard_api(
+    app,
+    frontend_dir=frontend_dir,
+    get_config=load_config,
+    load_my_satellites=load_my_satellites,
+    get_pass_cache=lambda: pass_cache,
+    pass_cache_lock=pass_cache_lock,
+    get_pass_cache_refreshed_at_utc=lambda: pass_cache_refreshed_at_utc,
+    pass_to_dict=_pass_to_dict,
+    qth_timezone_from_config=qth_timezone_from_config,
+    get_sdr_manager=lambda: sdr_manager,
+    get_tx_radio_manager=lambda: tx_radio_manager,
+    get_rx_tracking_manager=lambda: rx_tracking_manager,
+    get_rotator_manager=lambda: rotator_manager,
+    get_icom_controller=lambda: icom_controller,
+)
 if frontend_dir.exists():
     app.mount("/", ConfigurableStaticFiles(directory=frontend_dir, html=True), name="frontend")

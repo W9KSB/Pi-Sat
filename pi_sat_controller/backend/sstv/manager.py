@@ -78,6 +78,9 @@ class SstvManager:
         self._line = 0
         self._total_lines = 0
         self._frequency_offset_hz: float | None = None
+        # Decoder-reported bounded receive window while it holds through a fade.
+        self._holding_signal = False
+        self._receive_seconds_remaining: float | None = None
         self._input_samples = 0
         self._audio_capture = SstvAudioCapture(Path(data_dir))
         self._audio_queue = None
@@ -145,11 +148,13 @@ class SstvManager:
                 "capture_error": self._audio_capture.status()["error"],
                 "radio_audio_diagnostics": dict(self._radio_audio_diagnostics),
                 "image_quality": self._current.get("quality") if self._current else None,
+                "holding_signal": self._holding_signal,
+                "receive_seconds_remaining": self._receive_seconds_remaining,
                 "interference_packets": self._interference_packets,
                 "dropped_packets": self._dropped_packets,
                 "gallery_count": self._gallery_count,
                 "audio_source": "Native IC-9700 SUB/RX PCM",
-                "decoder": "SSTVFlow 0.1.1",
+                "decoder": "SSTVFlow 0.2.0",
                 "supported_modes": list(SSTV_MODE_DIMENSIONS),
                 "decoder_error": self._last_worker_error,
                 "current_image": current,
@@ -1064,9 +1069,20 @@ class SstvManager:
             return
         if event_type in {"status", "quality", "acquisition"}:
             offset = event.get("frequency_offset_hz")
-            if isinstance(offset, (int, float)) and math.isfinite(offset):
-                with self._lock:
+            holding = event.get("holding_signal")
+            remaining = event.get("receive_seconds_remaining")
+            with self._lock:
+                if isinstance(offset, (int, float)) and math.isfinite(offset):
                     self._frequency_offset_hz = float(offset)
+                if isinstance(holding, bool):
+                    self._holding_signal = holding
+                if "receive_seconds_remaining" in event:
+                    # The window ends when reception does; the decoder reports null then.
+                    self._receive_seconds_remaining = (
+                        float(remaining)
+                        if isinstance(remaining, (int, float)) and math.isfinite(remaining)
+                        else None
+                    )
             self._publish({"type": "decoder_status", "decoder_event": event})
             self._publish_status()
             return
@@ -1088,6 +1104,8 @@ class SstvManager:
                 self._line = 0
                 self._total_lines = height
                 self._frequency_offset_hz = float(event["frequency_offset_hz"])
+                self._holding_signal = False
+                self._receive_seconds_remaining = None
                 self._capture_context = dict(self.get_context())
                 self._current = {
                     "image_id": event.get("image_id"),
@@ -1204,6 +1222,8 @@ class SstvManager:
                 self._mode = mode
                 self._line = height
                 self._total_lines = height
+                self._holding_signal = False
+                self._receive_seconds_remaining = None
                 self._current = {
                     "mode": mode,
                     "width": width,

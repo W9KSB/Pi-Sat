@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Pi-Sat: Station Monitor</title>
+    <link rel="icon" href="/assets/pi-sat-satellite.png">
+    <link rel="stylesheet" href="/dashboard.css?v=20261010-3">
+    <script defer src="/dashboard.js?v=20261010-3"></script>
+  </head>
+  <body>
+    <header class="monitor-header">
+      <h1><span>Pi-Sat:</span> Station Monitor</h1>
+      <div class="refresh-controls">
+        <label for="refresh-minutes">Refresh (min)</label>
+        <input id="refresh-minutes" type="number" min="1" max="60" step="1" value="3" inputmode="numeric">
+        <span id="updated-at" role="status">Connecting…</span>
+      </div>
+    </header>
+    <main class="monitor-layout">
+      <section class="map-panel panel" aria-label="Selected satellites world map">
+        <div class="map-heading"><h2>Satellite Map <span id="map-satellite"></span></h2><span id="station-clock"></span></div>
+        <div class="map-view"><canvas id="world-map" width="1440" height="720" aria-label="World map showing My Satellites and station location"></canvas></div>
+        <p id="map-message" class="map-message">Loading selected satellites…</p>
+        <p id="map-position" class="map-position"></p>
+        <div id="map-legend" class="map-legend" aria-label="Satellite legend"></div>
+      </section>
+      <aside class="side-panels">
+        <section class="sstv-panel panel" aria-labelledby="sstv-title">
+          <div class="panel-heading"><h2 id="sstv-title">Last received image</h2><span id="sstv-state">Connecting…</span></div>
+          <div class="sstv-view"><canvas id="sstv-image" width="320" height="240" hidden aria-label="SSTV received image"></canvas><p id="sstv-empty">No received image yet</p></div>
+          <div class="sstv-meta"><span id="sstv-mode">—</span><span id="sstv-received">—</span></div>
+        </section>
+        <section class="passes-panel panel" aria-labelledby="passes-title">
+          <div class="panel-heading"><h2 id="passes-title">Next 24 hours</h2><span id="passes-zone"></span></div>
+          <div class="pass-columns" aria-hidden="true"><span>Satellite</span><span>AOS</span><span>LOS</span><span>Max El</span></div>
+          <div id="passes-window" class="passes-window"><div id="passes-track" class="passes-track"></div></div>
+          <p id="passes-empty" class="passes-empty">Loading passes…</p>
+        </section>
+      </aside>
+    </main>
+    <footer class="equipment-status" aria-label="Equipment status">
+      <div class="equipment radio-equipment"><span class="equipment-label">Radio</span><strong id="radio-name">—</strong><span id="radio-state" class="state">Unknown</span></div>
+      <div class="equipment"><span class="equipment-label">RX tracking</span><strong id="rx-state" class="state">Unknown</strong><span id="rx-frequency">—</span></div>
+      <div class="equipment"><span class="equipment-label">TX tracking</span><strong id="tx-state" class="state">Unknown</strong><span id="tx-frequency">—</span></div>
+      <div class="equipment"><span class="equipment-label">Rotator tracking</span><strong id="rotator-state" class="state">Unknown</strong><span id="rotator-position">Az — · El —</span></div>
+      <div class="equipment target-equipment"><span class="equipment-label">Target</span><strong id="tracking-target">—</strong><span id="target-detail">—</span></div>
+    </footer>
+  </body>
+</html>

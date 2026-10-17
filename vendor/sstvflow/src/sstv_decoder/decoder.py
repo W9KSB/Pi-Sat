@@ -38,6 +38,8 @@ class Decoder:
         self.draining = False
         self.image = None
         self.clock = None
+        self._receive_until = None
+        self._holding_signal = False
         self.forced = None
         self.auto_frequency = True
         self.manual_frequency = 0.0
@@ -99,6 +101,8 @@ class Decoder:
         self.robot_acquisition = RawRobotAcquisition(self.rate)
         self.robot_acquisition.next_scan = self.samples
         self.last_robot_search = self.samples
+        self._clear_martin()
+        self._martin_basis = None
 
     @property
     def applied_frequency(self):
@@ -144,15 +148,23 @@ class Decoder:
         self.impulses += int(np.sum(abs(pcm) > max(.5, self.level*5)))
         self.samples += len(pcm)
         self.history.append(positions, frequency, amplitude)
+        if not self.draining and (self.image is None or self.image.mode in ("MartinM1", "MartinM2")):
+            self._scan_martin()
         self.detector.consume()
         if not self.image:
             self.robot_acquisition.consume(self.raw_history)
             if self.samples-self.last_robot_search >= .05*self.rate:
                 self.last_robot_search = self.samples
                 self._raw_robot_acquisition()
+            if not self.image and not self.draining:
+                self._acquire_martin()
         self._rows()
         if self.image and self.silence_samples > self.rate * .6:
-            self._finish("lost_signal")
+            self._holding_signal = True
+        if (self.image and not self.draining and self._receive_until is not None
+                and self.samples >= self._receive_until):
+            self._fill_missing_rows()
+            self._finish("duration_elapsed")
         if self.samples - self.last_quality >= self.rate:
             self.last_quality = self.samples
             self.emit(dict(type="quality", signal_rms=self.level, clipping=self.clipped,
@@ -199,7 +211,7 @@ class Decoder:
                            .005 if known else reference_duration)
         self.pixel_history=self.history
         self.active_pixel_band=self.method
-        if self.protocol_dsp:
+        if self.protocol_dsp and self.method != "sharp":
             # Choose from protocol references, never from picture content.
             target=1900 if known else 1200
             try:
@@ -221,6 +233,9 @@ class Decoder:
         self.pixel_band_clean_lines = 0
         self.initial_pixel_band = self.active_pixel_band
         self.physical_lines = profile.height // 2 if profile.family == "pd" else profile.height
+        self._receive_until = self.samples + round(self.physical_lines * profile.period * self.rate)
+        self._holding_signal = False
+        self._clear_martin()
         self.clock = LineClock(self.rate, start, profile.period)
         self.clock.auto = self.auto_slant
         self.clock.manual_ppm = self.manual_ppm
@@ -352,6 +367,11 @@ class Decoder:
                 return
             detector_width = .004862 if duration < .006 else .009 if duration <= .013 else .020
             position += (detector_width-profile.sync)*self.rate
+            if self.image.mode in ("MartinM1", "MartinM2"):
+                # Defer approximate timestamps until the row has raw sync and
+                # complete RGB evidence; they cannot move the clock here.
+                self._martin_fm.append((line, position, confidence))
+                return
             observed = matched_sync(self.raw_history, self.rate, self.clock.predict(line),
                                     profile.sync, self.applied_frequency,
                                     self.clock.period/(profile.period*self.rate))
@@ -494,6 +514,153 @@ class Decoder:
                 self.observed_lines[index]=max(.6,value[2])
             return
 
+    def _clear_martin(self):
+        self._martin_points = deque(maxlen=64)
+        self._martin_fm = deque(maxlen=64)
+        self._martin_run = []
+        self._martin_long_run = False
+        self._martin_next_scan = float(self.samples)
+        self._martin_checked = {}
+
+    def _scan_martin(self):
+        history = self.raw_history
+        count = round(.004 * self.rate)
+        step = max(1, round(.0005 * self.rate))
+        earliest = history.origin + max(0, history.end - history.capacity)
+        self._martin_next_scan = max(self._martin_next_scan, np.ceil(earliest / step) * step)
+        starts = np.arange(self._martin_next_scan, history.latest - count - 1, step)
+        if not len(starts):
+            return
+        self._martin_next_scan = float(starts[-1] + step)
+        center = round(self.applied_frequency / 5) * 5
+        if self._martin_basis is None or self._martin_basis[0] != center:
+            # Retain the calibrated offset. Maximizing over many frequencies
+            # lets noisy picture transitions masquerade as shifted syncs.
+            tones = np.array([1200, 1500, 1900, 2300]) + center
+            n = np.arange(count) / self.rate
+            basis = np.stack((np.cos(2 * np.pi * tones[:, None] * n),
+                              np.sin(2 * np.pi * tones[:, None] * n)), axis=-1)
+            basis -= basis.mean(axis=1, keepdims=True)
+            self._martin_basis = center, tones, basis, np.linalg.pinv(basis)
+        _, tones, basis, inverse = self._martin_basis
+        windows = history.read(starts[:, None] + np.arange(count))
+        windows -= windows.mean(axis=1, keepdims=True)
+        energy = np.sum(windows ** 2, axis=1)
+        coefficients = np.einsum("fij,wj->wfi", inverse, windows)
+        projection = np.einsum("fji,wj->wfi", basis, windows)
+        powers = np.clip(np.sum(coefficients * projection, axis=-1)
+                         / np.maximum(energy[:, None], 1e-12), 0, 1)
+        strength = powers[:, 0]
+        competing = np.max(powers[:, 1:], axis=1)
+        level = np.sqrt(energy / count)
+        active = ((strength >= .35) & (strength >= 1.5 * competing)
+                  & (level > .0015))
+        for start, good, score, competitor in zip(starts, active, strength, competing):
+            if good:
+                if not self._martin_long_run:
+                    self._martin_run.append((float(start + count / 2), float(score),
+                                             float(score - .5 * competitor), float(center)))
+                    if len(self._martin_run) * step > .0065 * self.rate:
+                        self._martin_run.clear()
+                        self._martin_long_run = True
+            else:
+                run = self._martin_run
+                if not self._martin_long_run and len(run) >= 2:
+                    values = np.array(run)
+                    position = float(np.average(values[:, 0], weights=values[:, 2] ** 4))
+                    # The reference's position is its center minus half the known
+                    # pulse. Boundary tests below reject a longer mode's sync.
+                    point = (position - MODES["MartinM1"].sync * self.rate / 2,
+                             float(np.max(values[:, 1])), float(np.median(values[:, 3])))
+                    self._martin_points.append(point)
+                self._martin_run = []
+                self._martin_long_run = False
+
+    def _boundary_valid(self, position, offset):
+        # Separate fits allow a transmitter's phase to change at the porch. A
+        # continuous carrier or a longer Robot/PD sync must still be rejected.
+        n = np.arange(round(.002 * self.rate))
+        phase = 2 * np.pi * (1200 + offset) * n / self.rate
+        basis = np.stack((np.cos(phase), np.sin(phase), np.ones(len(n))), axis=1)
+        try:
+            for begin in (position - .0022 * self.rate,
+                          position + (.004862 + .0002) * self.rate):
+                samples = self.raw_history.read(begin + n)
+                energy = np.sum((samples - samples.mean()) ** 2)
+                if energy < 1e-10:
+                    continue
+                fit = basis @ np.linalg.lstsq(basis, samples, rcond=None)[0]
+                if 1 - np.sum((samples - fit) ** 2) / energy > .9:
+                    return False
+        except ValueError:
+            return False
+        return True
+
+    def _video_valid(self, position, mode, offset):
+        profile = MODES[mode]
+        try:
+            for _, begin, duration in profile.channels:
+                values = self.protocol_history.interval(
+                    position + (begin + .1 * duration) * self.rate,
+                    position + (begin + .9 * duration) * self.rate) - offset
+                if np.mean((values > 1400) & (values < 2400)) < .8:
+                    return False
+        except ValueError:
+            return False
+        return True
+
+    def _acquire_martin(self):
+        points = list(self._martin_points)
+        for mode in ("MartinM1", "MartinM2"):
+            if self.forced and self.forced != mode:
+                continue
+            profile = MODES[mode]
+            period = profile.period * self.rate
+            ready = [p for p in points if p[0] + period < self.protocol_history.latest]
+            for last in reversed(ready):
+                if last[0] <= self._martin_checked.get(mode, -1):
+                    break
+                self._martin_checked[mode] = last[0]
+                chain = [last]
+                for _ in range(3):
+                    previous = [p for p in ready if p[0] < chain[0][0]
+                                and abs(chain[0][0] - p[0] - period) < .0025 * self.rate]
+                    if not previous:
+                        break
+                    chain.insert(0, min(previous, key=lambda p: abs(chain[0][0] - p[0] - period)))
+                if len(chain) != 4 or np.median([p[1] for p in chain]) < .5:
+                    continue
+                positions = np.array([p[0] for p in chain])
+                fitted_period, origin = np.polyfit(np.arange(4), positions, 1)
+                residual = positions - (origin + fitted_period * np.arange(4))
+                # In particular reject Robot36's every-third-line 450 ms alias.
+                if (abs(fitted_period / period - 1) > .005
+                        or np.sqrt(np.mean(residual ** 2)) > .0008 * self.rate):
+                    continue
+                offset = (self.applied_frequency if self.frequency_confidence >= .7
+                          else float(np.median([p[2] for p in chain])))
+                if not all(self._boundary_valid(p[0], offset) for p in chain):
+                    continue
+                if not all(self._video_valid(p[0], mode, offset) for p in chain[:-1]):
+                    continue
+                confidence = float(min(.85, .6 + .25 * np.median([p[1] for p in chain])))
+                if self.auto_frequency and self.frequency_confidence < .7:
+                    self.measured_frequency = offset
+                    self.frequency_confidence = min(.65, confidence)
+                    self.frequency_source = "raw_martin_cadence"
+                self.emit(dict(type="acquisition", candidate_mode=mode,
+                               acquisition_source="raw_martin_cadence", confidence=confidence,
+                               frequency_offset_hz=self.applied_frequency, timing_confidence=.25,
+                               sample_position=float(origin), vis_code=None))
+                self._start(float(origin), "raw_martin_cadence", confidence, False, mode)
+                if self.clock.auto:
+                    self.clock.period = float(fitted_period)
+                for line, point in enumerate(chain):
+                    if self.clock.observe(line, point[0], confidence):
+                        self.observed_lines[line] = confidence
+                self._rows()
+                return
+
     def _pixels(self, start, duration, count, chroma=False):
         centers = start + (np.arange(count)+.5) * duration/count
         # Short pixel aperture (not a long tone window); fractional interpolation.
@@ -570,7 +737,7 @@ class Decoder:
     def _pixel_band_reference(self, start, scale):
         # An acquisition-selected narrow path remains the established image path.
         # Only images whose initial references support the wider path adapt later.
-        if self.protocol_dsp is None or self.initial_pixel_band == "narrow":
+        if self.protocol_dsp is None or self.initial_pixel_band == "narrow" or self.method == "sharp":
             return
         try:
             reference_begin,reference_duration = self._reference_window()
@@ -640,9 +807,7 @@ class Decoder:
             self._pixel_band_reference(start,scale)
             inferred = line not in self.observed_lines
             self.sync_gap = self.sync_gap + 1 if inferred else 0
-            if self.sync_gap > (32 if self.clock.confidence >= .7 else 8):
-                self._finish("unrecoverable_sync_loss")
-                break
+            self._check_sync_gap()
             phase = self.horizontal_ms * .001 * self.rate
             try:
                 y, yq = self._pixels(start + .012*self.rate*scale + phase, .088*self.rate*scale, 320)
@@ -650,8 +815,8 @@ class Decoder:
                 separator = float(np.median(self.protocol_history.interval(start+.101*self.rate*scale,
                                                                  start+.103*self.rate*scale))) - self.applied_frequency
             except ValueError:
-                self._finish("unrecoverable_sync_loss")
-                break
+                self._missing_scan_line(line)
+                continue
             chroma_phase=robot_chroma_phase(self.raw_history,self.rate,start,self.applied_frequency,scale)
             if chroma_phase is None:
                 chroma_phase = "Cr" if abs(separator-1500)<90 else "Cb" if abs(separator-2300)<90 else None
@@ -698,9 +863,7 @@ class Decoder:
             self._pixel_band_reference(start,scale)
             inferred = line not in self.observed_lines
             self.sync_gap = self.sync_gap+1 if inferred else 0
-            if self.sync_gap > (32 if self.clock.confidence >= .7 else 8):
-                self._finish("unrecoverable_sync_loss")
-                return
+            self._check_sync_gap()
             channels, qualities = {}, []
             try:
                 for name, begin, duration in profile.channels:
@@ -710,8 +873,8 @@ class Decoder:
                     channels[name] = pixels
                     qualities.append(quality)
             except ValueError:
-                self._finish("unrecoverable_sync_loss")
-                return
+                self._missing_scan_line(self.next_line)
+                continue
             if profile.family == "rgb":
                 rgb = np.rint(np.stack([channels[v] for v in ("r","g","b")],axis=1)).astype(np.uint8)
             else:
@@ -754,16 +917,14 @@ class Decoder:
                 self._pixel_band_reference(start,self.clock.period/(nominal*self.rate))
                 inferred=pair not in self.observed_lines
                 self.sync_gap=self.sync_gap+1 if inferred else 0
-                if self.sync_gap>(32 if self.clock.confidence>=.7 else 8):
-                    self._finish("unrecoverable_sync_loss")
-                    return
+                self._check_sync_gap()
                 try:
                     y,cr,cb,(yq,cq)=pd120.extract_first(
                         self._pixels,self.rate,start,self.clock.period,self.horizontal_ms,
                         chroma_reader=lambda a,b,c:self._pixels(a,b,c,True), separate_quality=True,mode=mode)
                 except ValueError:
-                    self._finish("unrecoverable_sync_loss")
-                    return
+                    self._missing_scan_line(pair)
+                    continue
                 rendered_cr,rendered_cb=self._chroma(cr,cb,[y])
                 self.pd_channels=dict(cr=cr,cb=cb,cq=cq,inferred=inferred,y=y,yq=yq,
                                       start=start,end=end,rendered_cr=rendered_cr,rendered_cb=rendered_cb)
@@ -777,8 +938,8 @@ class Decoder:
             try:
                 y,_,_,yq=pd120.extract_second(self._pixels,self.rate,start,self.clock.period,cr,cb,self.horizontal_ms,mode=mode)
             except ValueError:
-                self._finish("unrecoverable_sync_loss")
-                return
+                self._missing_scan_line(self.next_line)
+                continue
             cr,cb=self._chroma(cr,cb,[channels["y"],y])
             if (not np.array_equal(cr,channels["rendered_cr"])
                     or not np.array_equal(cb,channels["rendered_cb"])):
@@ -792,6 +953,7 @@ class Decoder:
 
     def _recover_sync(self,line,start,duration,scale):
         if line in self.observed_lines:
+            self._holding_signal = False
             return
         observed=(robot_sync_edge(self.raw_history,self.rate,start,self.applied_frequency,scale)
                   if self.raw_robot_tracking else
@@ -803,6 +965,68 @@ class Decoder:
             self._frequency_reference(observed[0], observed[1])
             if self.diagnostics:
                 self.diagnostics(dict(source="matched_sync",line=line,sample=observed[0],confidence=observed[1]))
+        if (self.image and self.image.mode in ("MartinM1", "MartinM2")
+                and line not in self.observed_lines):
+            candidates = [p for p in self._martin_points
+                          if abs(p[0] - start) <= .0025 * self.rate
+                          and self._boundary_valid(p[0], self.applied_frequency)]
+            if candidates:
+                point = max(candidates, key=lambda p: p[1])
+                if self._video_valid(point[0], self.image.mode, self.applied_frequency):
+                    confidence = float(min(.85, .6 + .25 * point[1]))
+                    # Half-millisecond raw windows establish sync presence,
+                    # not precise boundary timing. They may bootstrap a clock
+                    # but must not pull an already precise, stable fit.
+                    timing_confidence = min(.65, confidence)
+                    position = point[0]
+                    qualified_fm = [p for p in self._martin_fm if p[0] == line
+                                    and p[2] >= .7 and abs(p[1] - position) <= .0005 * self.rate
+                                    and self._boundary_valid(p[1], self.applied_frequency)
+                                    and self._video_valid(p[1], self.image.mode, self.applied_frequency)]
+                    if qualified_fm:
+                        reference = min(qualified_fm, key=lambda p: abs(p[1] - position))
+                        position = reference[1]
+                        timing_confidence = min(confidence, reference[2])
+                    if self.clock.observe(line, position, timing_confidence):
+                        self.observed_lines[line] = timing_confidence
+                        self.last_sync = position
+        if line in self.observed_lines:
+            self._holding_signal = False
+
+    def _check_sync_gap(self):
+        if self.sync_gap > (32 if self.clock.confidence >= .7 else 8):
+            self._holding_signal = True
+            # Retain the clock and quality evidence while disabling early abort.
+            self.sync_gap = 0
+
+    def _missing_row(self, row):
+        if row in self.image.rows:
+            return
+        profile = MODES[self.image.mode]
+        line = row // 2 if profile.family == "pd" else row
+        start = self.clock.predict(line)
+        self.image.row(row, np.zeros((profile.width, 3), dtype=np.uint8), 0.0,
+                       ["missing", "timing_recovered"],
+                       received_row_sequence=row, physical_scan_line=line,
+                       protocol_row_index=row if self.image.beginning_known else None,
+                       original_position_known=self.image.beginning_known,
+                       line_start_sample=start, row_audio_end_sample=start+self.clock.period,
+                       emitted_at_sample=self.samples)
+
+    def _missing_scan_line(self, line):
+        profile = MODES[self.image.mode]
+        rows_per_scan = 2 if profile.family == "pd" else 1
+        for row in range(line * rows_per_scan, (line + 1) * rows_per_scan):
+            self._missing_row(row)
+        self.pd_channels = None
+        self._holding_signal = True
+        self.next_line += 1
+        if self.next_line == self.physical_lines:
+            self._finish("normal_end")
+
+    def _fill_missing_rows(self):
+        for row in range(self.image.height):
+            self._missing_row(row)
 
     def _frequency_reference(self, start, confidence):
         if not self.auto_frequency or confidence < .6:
@@ -898,7 +1122,17 @@ class Decoder:
                        row_audio_end_sample=comp["start"]+self.clock.period)
 
     def status(self):
+        output = len(self.image.rows) if self.image else 0
+        missing = sum("missing" in flags for flags in self.image.flags.values()) if self.image else 0
+        recovered = sum("timing_recovered" in flags for flags in self.image.flags.values()) if self.image else 0
         value = dict(sample_position=self.samples, mode=self.image.mode if self.image else None,
+                     decoding=self.image is not None, image_id=self.image.id if self.image else None,
+                     transmitter_row_numbering_known=self.image.beginning_known if self.image else None,
+                     holding_signal=self._holding_signal,
+                     receive_seconds_remaining=None if self._receive_until is None else
+                     max(0.0, (self._receive_until - self.samples) / self.rate),
+                     decoded_row_count=output-missing, output_row_count=output,
+                     missing_row_count=missing, recovered_row_count=recovered,
                      frequency_offset_hz=self.measured_frequency, applied_frequency_correction_hz=self.applied_frequency,
                      frequency_confidence=self.frequency_confidence, frequency_locked=self.frequency_confidence>=.7,
                      frequency_reference_source=self.frequency_source, auto_frequency=self.auto_frequency,
@@ -919,14 +1153,17 @@ class Decoder:
         return value
 
     def _finish(self, reason):
+        self._receive_until = None
+        self._holding_signal = False
         if self.image:
-            self.image.finish(reason, self.status())
+            self.image.finish(reason, dict(self.status(), decoding=False))
         self.image = None
         self.clock = None
         self.components = {}
         self.observed_lines = {}
         self.candidates.clear()
         self.extended_candidates.clear()
+        self._clear_martin()
         self.robot_acquisition = RawRobotAcquisition(self.rate)
         self.robot_acquisition.next_scan = self.samples
         self.last_robot_search = self.samples
@@ -938,6 +1175,19 @@ class Decoder:
         if not isinstance(command, dict):
             raise ValueError("command must be a JSON object")
         name = command.get("command")
+        if name == "stop_current":
+            expected = command.get("image_id")
+            if not isinstance(expected, str) or not expected:
+                raise ValueError("stop_current image_id must be a nonempty string")
+            stopped = self.image is not None and self.image.id == expected
+            if stopped:
+                self._finish("manual_stop")
+                self.pending.clear()
+                self.silence_samples = 0
+                self._pipeline()
+            self.emit(dict(type="status", command=name, request_id=command.get("request_id"),
+                           stopped=stopped, **self.status()))
+            return
         if name == "status":
             pass
         elif name == "reset":

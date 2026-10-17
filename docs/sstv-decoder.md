@@ -1,6 +1,6 @@
 # SSTV Decoder
 
-Pi-Sat's optional SSTV module uses SSTVFlow 0.1.1 to decode **Robot24**,
+Pi-Sat's optional SSTV module uses SSTVFlow 0.2.0 to decode **Robot24**,
 **Robot36**, **Robot72**, **Martin M1/M2**, and **PD120/PD180** from a dedicated
 copy of the native IC-9700 audio stream. The module never opens a radio socket,
 starts a second Icom session, or sends a CI-V command. The browser Radio audio subscriber
@@ -74,10 +74,14 @@ every possible radio-to-Pi network loss. Buffering cannot recover UDP packets
 lost before Pi-Sat receives them.
 
 Protocol timing follows received sample positions. A pause in packet delivery
-does not itself represent RF silence or end a transmission. Signal loss in
-the received audio, a new transmission, a discontinuity, or end of input can
-finish a recoverable partial image. Disabling allows the worker to process its
-remaining input and return an end-of-input result before shutdown.
+does not itself represent RF silence or end a transmission. Losing the signal
+does not immediately end an acquired reception either: the decoder holds the
+image, its line clock, and its frequency correction for a bounded,
+mode-specific receive window, and positions it never received stay flagged as
+missing rather than disappearing. A new transmission, a radio discontinuity,
+or end of input can still finish a recoverable partial image sooner. Disabling
+allows the worker to process its remaining input and return an end-of-input
+result before shutdown.
 
 ## Decode a recording
 
@@ -168,8 +172,8 @@ with NumPy, SciPy, and Pillow. Python 3.11 or newer is required. Pi-Sat's Python
 subprocess bridge imports the installed decoder and adapts its streaming
 events to Pi-Sat's API. No Rust worker or Cargo build is required.
 
-The bundled wheel version is `0.1.1+pisat.20261008`; the decoder reports
-SSTVFlow 0.1.1. SSTVFlow's PolyForm Noncommercial License 1.0.0 and required
+The bundled wheel version is `0.2.0+pisat.20261014`; the decoder reports
+SSTVFlow 0.2.0. SSTVFlow's PolyForm Noncommercial License 1.0.0 and required
 copyright notice are included in `vendor/sstvflow/LICENSE` and the wheel.
 
 Dependencies must be installed into the Python environment running the

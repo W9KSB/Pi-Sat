@@ -129,6 +129,7 @@ class FailedRotatorManager:
         self.write_enabled = write_enabled
         self.client = None
         self._pass_active = False
+        self._tracking_active = False
 
     def _snapshot(self):
         return {
@@ -139,6 +140,8 @@ class FailedRotatorManager:
             "manual_controls_enabled": False,
             "state_label": "Rotator unavailable",
             "error": self.error,
+            "tracking_status": "unavailable",
+            "tracking_message": "Rotator unavailable",
         }
 
     def snapshot(self):
@@ -157,6 +160,20 @@ class FailedRotatorManager:
         return self.snapshot()
 
     def track_position(self, azimuth_deg: float, elevation_deg: float):
+        return self.snapshot()
+
+    def update_tracking(
+        self,
+        azimuth_deg: float,
+        elevation_deg: float,
+        *,
+        write: bool = True,
+        tracking_active: bool = True,
+    ):
+        # Tracking cycles report pass state even while the rotator is
+        # unavailable, so the snapshot keeps the live pass indication.
+        self._pass_active = bool(elevation_deg >= 0.0)
+        self._tracking_active = bool(tracking_active)
         return self.snapshot()
 
     def manual_position(self, azimuth_deg: float, elevation_deg: float):

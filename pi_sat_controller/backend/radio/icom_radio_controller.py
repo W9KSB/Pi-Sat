@@ -12,10 +12,12 @@ from collections import deque
 from copy import deepcopy
 from contextlib import contextmanager
 import logging
+import math
 import struct
 from threading import Event, Lock, RLock, Thread, current_thread
 from time import monotonic, sleep
 from typing import Any, Callable
+from uuid import uuid4
 
 from pi_sat_controller.backend.radio.audio_buffer import AudioBuffer
 from pi_sat_controller.backend.radio.icom_connectivity import IcomConnectivity, IcomError
@@ -247,6 +249,13 @@ class IcomRadioController:
         # Set by a caller that feeds its own real-time paced stream (the APRS
         # modulator). Silence fill must never insert frames into that stream.
         self._transmit_paced = False
+        self._transmit_stream_claim: tuple[str, str] | None = None
+        self._tuning_tone_token: str | None = None
+        self._tuning_tone_stop: Event | None = None
+        self._tuning_tone_thread: Thread | None = None
+        self._tuning_tone_routes: tuple[int, int] | None = None
+        self._tuning_tone_generation = 0
+        self._tuning_tone_error: str | None = None
         # --- Transport diagnostics: bounded counters, never per-packet logging.
         self._civ_counts: dict[str, int] = {}
         self._transceive_counts: dict[str, int] = {}
@@ -305,6 +314,12 @@ class IcomRadioController:
                         "retry_in_s": self._retry_in_s})
         payload.update(self.connectivity.snapshot())
         payload["transport_diagnostics"] = self._transport_diagnostics_locked()
+        payload["tuning_tone"] = bool(
+            self._tuning_tone_token and self._tuning_tone_stop is not None
+            and not self._tuning_tone_stop.is_set() and self._ptt_commanded
+            and self._transmit_stream_claim == ("tuning-tone", self._tuning_tone_token)
+        )
+        payload["tuning_tone_error"] = self._tuning_tone_error
         return payload
 
     def _publish_snapshot_locked(self) -> dict[str, Any]:
@@ -383,6 +398,7 @@ class IcomRadioController:
             # command can be delivered, and leaving the radio transmitting is
             # the one failure mode the operator cannot recover remotely.
             with self._lock:
+                self._invalidate_transmit_stream_locked()
                 self._release_ptt_best_effort("shutdown")
             self._stop.set()
             if self._thread and self._thread.is_alive():
@@ -611,11 +627,218 @@ class IcomRadioController:
                 self._select_locked(previous_side, None)
             return self._state.to_dict()
 
-    def set_ptt(self, enabled: bool) -> dict[str, Any]:
+    def claim_transmit_stream(self, owner: str) -> str:
+        """Reserve digital TX audio and PTT until its token is released."""
+        if not isinstance(owner, str) or not owner.strip():
+            raise ValueError("Transmit stream owner must be a nonempty name")
+        with self._operator_operation():
+            self._ensure_connected_locked()
+            if self._transmit_stream_claim is not None:
+                raise IcomRadioError(f"Transmit stream is owned by {self._transmit_stream_claim[0]}")
+            if self.transmit_active or self._state.ptt_pending is not None:
+                raise IcomRadioError("Release PTT before claiming a transmit stream")
+            token = uuid4().hex
+            with self._tx_audio_lock:
+                self._transmit_stream_claim = (owner.strip(), token)
+                self._bump_tx_audio_epoch_locked()
+            self._discard_transmit_audio()
+            return token
+
+    def release_transmit_stream(self, token: str) -> None:
+        """Release an idle claim; emergency unkey/disconnect may have cleared it."""
+        with self._lock:
+            if self._transmit_stream_claim is None:
+                return
+            self._check_transmit_stream_token(token)
+            if self._ptt_commanded:
+                raise IcomRadioError("Release PTT before releasing a transmit stream")
+            self._invalidate_transmit_stream_locked()
+
+    def _check_transmit_stream_token(self, token: str | None) -> None:
+        claim = self._transmit_stream_claim
+        if claim is not None:
+            if token != claim[1]:
+                raise IcomRadioError(f"Transmit stream is owned by {claim[0]}")
+        elif token is not None:
+            raise IcomRadioError("Transmit stream token is no longer active")
+
+    def _invalidate_transmit_stream_locked(self) -> None:
+        if self._tuning_tone_stop is not None:
+            self._tuning_tone_stop.set()
+        with self._tx_audio_lock:
+            self._transmit_stream_claim = None
+            self._transmit_paced = False
+            self._bump_tx_audio_epoch_locked()
+        if self._tuning_tone_token is not None:
+            with self._snapshot_lock:
+                self._snapshot_cache["tuning_tone"] = False
+                self._snapshot_cache["tuning_tone_error"] = self._tuning_tone_error
+
+    @staticmethod
+    def _tuning_tone_pcm(sample_rate: int, sample_offset: int, samples: int) -> bytes:
+        """Mono S16_LE note at 6.25% peak, with continuous phase and a 5 ms attack."""
+        ramp_samples = max(1, sample_rate // 200)
+        return b"".join(struct.pack("<h", round(
+            2048 * min(1.0, (sample_offset + index) / ramp_samples) * math.sin(
+                2 * math.pi * 600 * (sample_offset + index) / sample_rate
+            )
+        )) for index in range(samples))
+
+    def set_tuning_tone(self, enabled: bool) -> dict[str, Any]:
+        """Toggle a continuous audio note using the shared transmit owner."""
+        if type(enabled) is not bool:
+            raise ValueError("Tuning tone enabled must be a boolean")
+        with self._operator_operation():
+            active = self._snapshot_payload_locked()["tuning_tone"]
+            if enabled and active:
+                return self.snapshot()
+            if self._tuning_tone_token is not None:
+                self._finish_tuning_tone_locked(self._tuning_tone_token)
+            if not enabled:
+                return self.snapshot()
+            self._ensure_connected_locked()
+            if self.config.tx_codec not in ("lpcm16_mono", "lpcm16_stereo"):
+                raise IcomRadioError("Tuning tone requires 16-bit LPCM transmit audio")
+            rate = self.config.sample_rate
+            if type(rate) is not int or not 8000 <= rate <= 192000:
+                raise IcomRadioError("Tuning tone requires a valid transmit sample rate")
+            token = self.claim_transmit_stream("tuning-tone")
+            stop = Event()
+            self._tuning_tone_token = token
+            self._tuning_tone_stop = stop
+            self._tuning_tone_routes = None
+            self._tuning_tone_generation = self._connection_generation
+            self._tuning_tone_error = None
+            try:
+                previous_side = self._read_side_locked()
+                try:
+                    self._select_locked("MAIN", None)
+                    mode, _ = self._read_mode_state_locked("MAIN")
+                    if mode not in ("USB", "LSB"):
+                        raise IcomRadioError("Tuning tone requires MAIN USB or LSB mode")
+                finally:
+                    self._select_locked(previous_side, None)
+                self._read_microphone_config_locked()
+                if not self._state.lan_mod_level:
+                    raise IcomRadioError("Radio LAN modulation level is zero or unavailable")
+                self._tuning_tone_routes = (self._state.data_off_mod, self._state.data_mod)
+                self._configure_microphone_locked(source=5)
+                self.set_transmit_stream_paced(True, transmit_token=token)
+                self.set_ptt(True, transmit_token=token)
+                self._tuning_tone_thread = Thread(
+                    target=self._run_tuning_tone, args=(token, stop, rate),
+                    name="icom-tuning-tone", daemon=True,
+                )
+                self._tuning_tone_thread.start()
+            except Exception as exc:
+                self._tuning_tone_error = str(exc)
+                self._finish_tuning_tone_locked(token)
+                raise
+            return self.snapshot()
+
+    def _run_tuning_tone(self, token: str, stop: Event, sample_rate: int) -> None:
+        samples = max(1, sample_rate // 50)
+        sample_offset = 0
+        deadline = monotonic()
+        try:
+            # An integral number of tone cycles can repeat without a phase
+            # jump, avoiding waveform calculations for every frame on the Pi.
+            steady_pcm = (self._tuning_tone_pcm(sample_rate, samples, samples)
+                          if 600 * samples % sample_rate == 0 else None)
+            while not stop.is_set():
+                if self.config.sample_rate != sample_rate or self._stop.is_set():
+                    raise IcomRadioError("Radio audio session changed; tuning tone stopped")
+                pcm = (steady_pcm if sample_offset and steady_pcm is not None
+                       else self._tuning_tone_pcm(sample_rate, sample_offset, samples))
+                if stop.is_set():
+                    break
+                self.send_audio(pcm, transmit_token=token)
+                sample_offset += samples
+                # Never catch up by sending an accumulated burst after a stall.
+                deadline = max(deadline + samples / sample_rate, monotonic())
+                if stop.wait(max(0.0, deadline - monotonic())):
+                    break
+        except Exception as exc:
+            with self._lock:
+                if self._tuning_tone_token == token and not stop.is_set():
+                    self._tuning_tone_error = str(exc)
+                    LOGGER.warning("Tuning tone stopped: %s", exc)
+        finally:
+            with self._lock:
+                self._finish_tuning_tone_locked(token)
+
+    def _finish_tuning_tone_locked(self, token: str) -> None:
+        """Cancel one run; stale workers cannot touch a later transmit owner."""
+        if self._tuning_tone_token != token:
+            return
+        if self._tuning_tone_stop is not None:
+            self._tuning_tone_stop.set()
+        with self._snapshot_lock:
+            self._snapshot_cache["tuning_tone"] = False
+            self._snapshot_cache["tuning_tone_error"] = self._tuning_tone_error
+        owned = self._transmit_stream_claim == ("tuning-tone", token)
+        same_session = self._tuning_tone_generation == self._connection_generation
+        available = self._state.connected and not self._stop.is_set() and same_session
+        try:
+            may_restore = owned or self._transmit_stream_claim is None
+            if available and may_restore and self._ptt_commanded:
+                try:
+                    if owned:
+                        self.set_ptt(False, transmit_token=token)
+                    elif self._release_ptt_best_effort("tuning tone cancellation"):
+                        self._begin_ptt_release_locked()
+                    else:
+                        self._tuning_tone_error = "Could not release tuning tone PTT; confirm the radio stopped transmitting"
+                except Exception as exc:
+                    self._tuning_tone_error = f"Could not release tuning tone PTT: {exc}"
+                    if self._release_ptt_best_effort("tuning tone"):
+                        self._begin_ptt_release_locked()
+            # Emergency unkey may have invalidated this claim already. Restore
+            # only while idle and with no competing owner in the same session.
+            if available and may_restore and not self._ptt_commanded and self._tuning_tone_routes:
+                if not self.wait_for_ptt(False, 0.8):
+                    self._tuning_tone_error = "Tuning tone stopped, but radio PTT OFF was not confirmed"
+                else:
+                    self._restore_tuning_tone_routes_locked()
+        except Exception as exc:
+            self._tuning_tone_error = f"Could not restore tuning tone audio routing: {exc}"
+            LOGGER.warning("%s", self._tuning_tone_error)
+        finally:
+            # If unkey failed, retain ownership so microphone audio cannot
+            # take over a transmitter that may still be keyed.
+            if self._transmit_stream_claim == ("tuning-tone", token) and not self._ptt_commanded:
+                self._invalidate_transmit_stream_locked()
+            self._tuning_tone_token = None
+            self._tuning_tone_routes = None
+            with self._snapshot_lock:
+                self._snapshot_cache["tuning_tone_error"] = self._tuning_tone_error
+
+    def _restore_tuning_tone_routes_locked(self) -> None:
+        self._read_microphone_config_locked()
+        if self._read_ptt_state_locked():
+            raise IcomRadioError("Release PTT before restoring tuning tone audio routing")
+        restored = {}
+        for key, setting, previous in zip(
+            ("data_off_mod", "data_mod"), (0x15, 0x16), self._tuning_tone_routes,
+        ):
+            # Preserve a routing change the operator made at the front panel.
+            if getattr(self._state, key) == 5 and previous != 5:
+                self._civ_transaction_locked(self._frame(0x1A, bytes([5, 1, setting, previous])))
+                restored[key] = previous
+        self._read_microphone_config_locked()
+        if any(getattr(self._state, key) != value for key, value in restored.items()):
+            raise IcomRadioError("Tuning tone audio routing restoration readback did not match")
+
+    def set_ptt(self, enabled: bool, *, transmit_token: str | None = None) -> dict[str, Any]:
         if type(enabled) is not bool:
             raise ValueError("PTT enabled must be a boolean")
         with self._operator_operation():
             self._ensure_connected_locked()
+            if not enabled and transmit_token is None:
+                # Operator unkey cancels digital work even if the radio command fails.
+                self._invalidate_transmit_stream_locked()
+            else:
+                self._check_transmit_stream_token(transmit_token)
             if enabled:
                 # Claim the transmit band before the key reaches the radio: the
                 # retune guard reads this flag, and the radio is keyed the moment
@@ -756,15 +979,15 @@ class IcomRadioController:
 
         The microphone only reaches the radio through that session, so leaving
         the radio keyed would transmit a bare carrier with nothing on it.
+        A digital stream has its own lifetime and does not depend on the browser.
         """
         with self._lock:
-            if not self._ptt_commanded:
+            if not self._ptt_commanded or self._transmit_stream_claim is not None:
                 return
-        try:
-            self.set_ptt(False)
-        except Exception as exc:
-            LOGGER.warning("Could not release PTT after the audio session ended: %s", exc)
-            with self._lock:
+            try:
+                self.set_ptt(False)
+            except Exception as exc:
+                LOGGER.warning("Could not release PTT after the audio session ended: %s", exc)
                 self._state.tx_unconfirmed = True
 
     def _read_ptt_state_locked(self) -> bool:
@@ -1192,9 +1415,9 @@ class IcomRadioController:
             return {"sequence": self._state.scope_lines,
                     "packet": self._latest_scope.hex() if self._latest_scope else None}
 
-    def send_audio(self, pcm: bytes) -> None:
+    def send_audio(self, pcm: bytes, *, transmit_token: str | None = None) -> None:
         """Feed a transmit stream this server paces itself (the APRS modulator)."""
-        self._send_transmit_audio(pcm, browser_source=False)
+        self._send_transmit_audio(pcm, browser_source=False, transmit_token=transmit_token)
 
     def send_microphone_audio(self, pcm: bytes) -> None:
         """Transmit browser microphone PCM.
@@ -1208,7 +1431,9 @@ class IcomRadioController:
         """
         self._send_transmit_audio(pcm, browser_source=True)
 
-    def _send_transmit_audio(self, pcm: bytes, *, browser_source: bool) -> None:
+    def _send_transmit_audio(
+        self, pcm: bytes, *, browser_source: bool, transmit_token: str | None = None,
+    ) -> None:
         """Hand PCM to the transport without taking the CI-V controller lock.
 
         The commanded key, the paced flag and the connection flag are single
@@ -1224,6 +1449,8 @@ class IcomRadioController:
             raise IcomRadioError("Only LPCM 16-bit mono microphone TX is supported")
         if not self._state.connected:
             raise IcomRadioError("Icom audio session is not connected")
+        if not browser_source:
+            self._check_transmit_stream_token(transmit_token)
         if not self._ptt_commanded:
             # Nothing is keyed, so transmit PCM has nowhere to go. A browser that
             # streams continuously depends on this being a quiet no-op.
@@ -1235,6 +1462,9 @@ class IcomRadioController:
             return
         epoch = self._tx_audio_epoch
         with self._tx_audio_lock:
+            if browser_source and self._transmit_stream_claim is not None:
+                return
+            self._check_transmit_stream_token(transmit_token)
             # A release may have landed while this frame waited for the send
             # lock; stale PCM must never reach the next transmission.
             if epoch != self._tx_audio_epoch or not self._state.connected:
@@ -1260,7 +1490,7 @@ class IcomRadioController:
         """
         return self._ptt_commanded
 
-    def set_transmit_stream_paced(self, paced: bool) -> None:
+    def set_transmit_stream_paced(self, paced: bool, *, transmit_token: str | None = None) -> None:
         """Tell the core that this caller feeds its own paced transmit stream.
 
         The silence fill exists to keep the radio's transmit buffer fed when the
@@ -1269,6 +1499,7 @@ class IcomRadioController:
         audio corrupts the modulation and the frame will not decode.
         """
         with self._lock:
+            self._check_transmit_stream_token(transmit_token)
             self._transmit_paced = bool(paced)
 
     def _transmit_frame_bytes(self) -> int:
@@ -1322,9 +1553,10 @@ class IcomRadioController:
         except Exception as exc:
             LOGGER.debug("Discarding buffered transmit audio failed: %s", exc)
 
-    def flush_audio(self) -> None:
+    def flush_audio(self, *, transmit_token: str | None = None) -> None:
         with self._operator_operation():
             self._ensure_connected_locked()
+            self._check_transmit_stream_token(transmit_token)
             with self._tx_audio_lock:
                 self._state.tx_audio_packets += self.connectivity.flush_audio()
 
@@ -2246,7 +2478,7 @@ class IcomRadioController:
         self._state.ptt = None
         self._state.ptt_pending = None
         self._ptt_commanded = False
-        self._transmit_paced = False
+        self._invalidate_transmit_stream_locked()
         self._ptt_idle_since = None
         self._ptt_release_deadline = None
         self._state.tx_meter_updated = None

@@ -19,7 +19,8 @@ External DATA Decode disabled and use normal AF receive audio.
 ## Setup
 
 1. Connect the native IC-9700 radio in Pi-Sat with a 48 kHz receive sample rate.
-   Tune SUB to the transmission and enable **External DATA Decode** in Pi-Sat.
+   Tune SUB to the transmission, select **FM** or **USB (Upper Sideband)** on
+   the **External DATA Decode** page, and enable the module in Pi-Sat.
 2. Run `external-streamer.exe`. Enter the Pi-Sat server's LAN address or hostname
    and the configured TCP port, which defaults to `8765`.
 3. Select a Windows **Output device**. For an external decoder, use the playback
@@ -33,10 +34,12 @@ External DATA Decode disabled and use normal AF receive audio.
    before returning to normal AF reception or built-in SSTV decoding.
 
 The connector itself sends no radio-control commands. Enabling the server module
-does change the shared radio path: Pi-Sat selects SUB FM-DATA/FIL1 and LAN IF
+does change the shared radio path: Pi-Sat selects SUB FM-DATA/FIL1 or
+USB-DATA/FIL1 according to the page's demodulation selection, and LAN IF
 output, then software-demodulates that input to 48 kHz mono signed 16-bit PCM.
-The IF path provides wider bandwidth for data signals than normal filtered AF
-audio. **Do not use External DATA Decode and built-in SSTV at the same time.**
+Disable the module before changing demodulation. The connector supports both
+choices without a software update.
+**Do not use External DATA Decode and built-in SSTV at the same time.**
 The connector receives this demodulated audio, not raw IF, I/Q, packets, or SSDV
 images. Normal AF consumers, including the built-in SSTV decoder, cannot use
 that shared input normally while the IF path is active. See

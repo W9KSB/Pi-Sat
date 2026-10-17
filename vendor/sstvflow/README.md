@@ -1,13 +1,15 @@
 # SSTVFlow
 
-SSTVFlow 0.1.1 is an independent Python streaming SSTV decoder supporting
+SSTVFlow 0.2.0 is an independent Python streaming SSTV decoder supporting
 Robot24, Robot36, Robot72, Martin M1/M2, and PD120/PD180.
 This directory contains the source snapshot distributed
 with Pi-Sat. Its Python import name is `sstv_decoder`.
 
-The bundled distribution version is `0.1.1+pisat.20261008`, identifying this
-snapshot separately from earlier 0.1.1 wheels. The decoder reports upstream
-version 0.1.1. SSTVFlow is licensed under the PolyForm Noncommercial License
+The bundled distribution version is `0.2.0+pisat.20261014`, identifying this
+snapshot separately from earlier wheels. It is SSTVFlow commit `4a0583e` with
+one comment-only difference: the mode-timing citation in
+`src/sstv_decoder/modes.py` is omitted here. The decoder reports upstream
+version 0.2.0. SSTVFlow is licensed under the PolyForm Noncommercial License
 1.0.0; see [LICENSE](LICENSE).
 
 Install it through Pi-Sat's `requirements.txt`. The bundled `wheels/` artifact
@@ -33,6 +35,11 @@ Images acquired with the wider pixel filter can select the narrower filter
 during interference and restore the wider path after sustained clean sync
 references. The line clock and input sample timeline remain unchanged. An
 acquisition-selected narrow filter remains in effect for the image.
+
+An acquired reception survives signal loss for a bounded, mode-specific receive
+window. Positions that were never received stay flagged as missing instead of
+ending the image, and `stop_current` closes one displayed reception and resumes
+automatic searching.
 
 For Pi-Sat operation, see `docs/sstv-decoder.md` in the repository root. Pi-Sat
 owns radio connectivity, SUB audio extraction, process transport, UI, and image

@@ -19,6 +19,7 @@ class TransponderProfile:
     preferred_uplink: int
     preferred_downlink: int
     tone: float | None = None
+    custom: bool = False
 
 
 @dataclass(frozen=True)

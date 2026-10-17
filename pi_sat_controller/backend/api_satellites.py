@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+import math
 from threading import Lock
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query
 
 from pi_sat_controller.backend.config import config_transaction, load_config
-from pi_sat_controller.backend.models import MySatellite, SatelliteProfile
+from pi_sat_controller.backend.models import MySatellite, SatelliteProfile, TransponderProfile
 from pi_sat_controller.backend.satellites.satellite_profiles import (
+    add_custom_transponder,
     load_satellite_profiles,
     upsert_satellite_transponders,
 )
@@ -17,6 +19,65 @@ from pi_sat_controller.backend.satellites.tle_manager import TleManager
 from pi_sat_controller.backend.satellites.transponder_source_client import (
     TransponderSourceClient,
 )
+
+
+_CUSTOM_TRANSPONDER_MODES = {
+    "FM", "USB", "LSB", "CW", "CW-R", "AM", "DV", "DD",
+    "FM-DATA", "USB-DATA", "LSB-DATA",
+}
+
+
+def _custom_transponder_from_payload(payload: dict[str, Any]) -> TransponderProfile:
+    name = payload.get("name")
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 120:
+        raise HTTPException(status_code=400, detail="Name must contain 1 to 120 characters")
+    profile_type = payload.get("type")
+    if profile_type not in ("fm", "linear", "rx_only"):
+        raise HTTPException(status_code=400, detail="Type must be fm, linear, or rx_only")
+
+    frequencies: dict[str, int] = {}
+    for side in ("uplink", "downlink"):
+        low = payload.get(f"{side}_low", 0 if side == "uplink" and profile_type == "rx_only" else None)
+        high = payload.get(f"{side}_high", low)
+        if type(low) is not int or type(high) is not int:
+            raise HTTPException(status_code=400, detail=f"{side.capitalize()} frequencies must be integer Hz")
+        minimum = 0 if side == "uplink" and profile_type == "rx_only" else 1
+        if not minimum <= low <= high <= 9_999_999_999:
+            raise HTTPException(status_code=400, detail=f"{side.capitalize()} frequency range is invalid")
+        if side == "uplink" and profile_type == "rx_only" and (low != 0 or high != 0):
+            raise HTTPException(status_code=400, detail="Receive-only profiles must have zero uplink frequencies")
+        frequencies[f"{side}_low"] = low
+        frequencies[f"{side}_high"] = high
+
+    modes: dict[str, str] = {}
+    for side in ("downlink", "uplink"):
+        mode = payload.get(f"{side}_mode", modes.get("downlink_mode") if profile_type == "rx_only" else None)
+        if not isinstance(mode, str) or mode not in _CUSTOM_TRANSPONDER_MODES:
+            raise HTTPException(status_code=400, detail=f"{side.capitalize()} mode is unsupported")
+        modes[f"{side}_mode"] = mode
+    inverted = payload.get("inverted", False)
+    if type(inverted) is not bool:
+        raise HTTPException(status_code=400, detail="inverted must be a boolean")
+    if inverted and profile_type == "rx_only":
+        raise HTTPException(status_code=400, detail="Receive-only profiles cannot be inverted")
+    tone = payload.get("tone")
+    if tone is not None:
+        if type(tone) not in (int, float) or not 50 <= tone <= 300 or not math.isfinite(tone):
+            raise HTTPException(status_code=400, detail="CTCSS tone must be between 50 and 300 Hz")
+        if profile_type == "rx_only" or modes["uplink_mode"] not in ("FM", "FM-DATA"):
+            raise HTTPException(status_code=400, detail="CTCSS tone requires an FM uplink")
+    return TransponderProfile(
+        name=name.strip(),
+        type=profile_type,
+        **frequencies,
+        **modes,
+        inverted=inverted,
+        ratio=1.0,
+        preferred_uplink=round((frequencies["uplink_low"] + frequencies["uplink_high"]) / 2),
+        preferred_downlink=round((frequencies["downlink_low"] + frequencies["downlink_high"]) / 2),
+        tone=tone,
+        custom=True,
+    )
 
 
 def _parse_boolean(value: Any, field_name: str) -> bool:
@@ -98,6 +159,30 @@ def register_satellites_api(
             ),
         }
 
+    @app.post("/api/frequency-profiles/{norad_id}/custom")
+    def create_custom_transponder(
+        norad_id: int, payload: dict[str, Any] = Body(...)
+    ) -> dict[str, object]:
+        config = load_config()
+        my_satellites, _, _, _ = load_my_satellites()
+        managed = next((item for item in my_satellites if item.norad_id == norad_id), None)
+        if managed is None:
+            raise HTTPException(status_code=404, detail=f"NORAD {norad_id} is not in My Satellites")
+        transponder = _custom_transponder_from_payload(payload)
+        try:
+            profile = add_custom_transponder(
+                config.profiles.satellites_file,
+                SatelliteProfile(managed.name, norad_id, True, []),
+                transponder,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "norad_id": norad_id,
+            "name": profile.name,
+            "frequency_profiles": serialize_frequency_profiles(profile.transponders),
+        }
+
     @app.post("/api/frequency-profiles/{norad_id}/update")
     def update_frequency_profiles(norad_id: int) -> dict[str, object]:
         config = load_config()
@@ -153,12 +238,12 @@ def register_satellites_api(
             "Manual transponder refresh updated %s (%s) with %s profile(s)",
             profile.name,
             profile.norad_id,
-            len(profile.transponders),
+            len(transponders),
         )
         return {
             "norad_id": profile.norad_id,
             "name": profile.name,
-            "imported": len(profile.transponders),
+            "imported": len(transponders),
             "frequency_profiles": [
                 {"name": transponder["name"]}
                 for transponder in serialize_frequency_profiles(profile.transponders)

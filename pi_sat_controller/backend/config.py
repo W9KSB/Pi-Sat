@@ -11,6 +11,7 @@ from configparser import ConfigParser
 from contextlib import contextmanager
 from dataclasses import dataclass
 import logging
+import math
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -120,6 +121,9 @@ class DeviceConfig:
     home_azimuth_deg: float | None = None
     home_elevation_deg: float | None = None
     return_home_after_pass: bool = False
+    # 0 disables the threshold and sends every tracking update.
+    tracking_threshold_deg: float = 0.0
+    home_below_min_elevation: bool = False
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,18 @@ class AudioStreamConfig:
     bind_host: str
     port: int
     channel: str
+    demodulation: str = "FM"
+
+
+@dataclass(frozen=True)
+class WsjtxConfig:
+    executable: str = "wsjtx"
+    callsign: str = ""
+    mode: str = "FT8"
+    udp_host: str = "127.0.0.1"
+    udp_port: int = 2237
+    client_timeout_seconds: int = 45
+    max_decodes: int = 300
 
 
 @dataclass(frozen=True)
@@ -196,6 +212,7 @@ class AppConfig:
     aprs: AprsConfig
     sstv: SstvConfig
     audio_stream: AudioStreamConfig
+    wsjtx: WsjtxConfig = WsjtxConfig()
 
 
 def _decode_source_url(value: str) -> str:
@@ -334,8 +351,33 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             bind_host=_get_text(parser, "audio_stream", "bind_host", AUDIO_STREAM_DEFAULT_HOST),
             port=_get_int(parser, "audio_stream", "port", AUDIO_STREAM_DEFAULT_PORT),
             channel=_get_audio_stream_channel(parser),
+            demodulation=_get_audio_stream_demodulation(parser),
         ),
+        wsjtx=_load_wsjtx_config(parser),
     )
+
+
+def _load_wsjtx_config(parser: ConfigParser) -> WsjtxConfig:
+    config = WsjtxConfig(
+        executable=_get_text(parser, "wsjtx", "executable", "wsjtx"),
+        callsign=_get_text(parser, "wsjtx", "callsign", "").upper(),
+        mode=_get_text(parser, "wsjtx", "mode", "FT8").upper(),
+        udp_host=_get_text(parser, "wsjtx", "udp_host", "127.0.0.1"),
+        udp_port=_get_int(parser, "wsjtx", "udp_port", 2237),
+        client_timeout_seconds=_get_int(parser, "wsjtx", "client_timeout_seconds", 45),
+        max_decodes=_get_int(parser, "wsjtx", "max_decodes", 300),
+    )
+    if not config.udp_host:
+        raise ValueError("[wsjtx] udp_host must be a nonempty address")
+    if config.mode not in ("FT4", "FT8"):
+        raise ValueError("[wsjtx] mode must be FT4 or FT8")
+    if not 1 <= config.udp_port <= 65535:
+        raise ValueError("[wsjtx] udp_port must be between 1 and 65535")
+    if not 1 <= config.client_timeout_seconds <= 3600:
+        raise ValueError("[wsjtx] client_timeout_seconds must be between 1 and 3600")
+    if not 1 <= config.max_decodes <= 5000:
+        raise ValueError("[wsjtx] max_decodes must be between 1 and 5000")
+    return config
 
 
 def _load_device(
@@ -408,6 +450,13 @@ def _load_device(
             "return_home_after_pass",
             False,
         ),
+        tracking_threshold_deg=_get_tracking_threshold_deg(parser, section),
+        home_below_min_elevation=_get_bool(
+            parser,
+            section,
+            "home_below_min_elevation",
+            False,
+        ),
     )
 
 
@@ -454,6 +503,36 @@ def _get_optional_float(
     if not value:
         return None
     return float(value)
+
+
+def validate_tracking_threshold_deg(value: float | None) -> float:
+    """Returns the rotator tracking threshold in degrees.
+
+    Zero disables the threshold so every tracking update is sent. Negative and
+    non-finite values are rejected rather than coerced: a NaN or infinity would
+    make every threshold comparison false and silently stop tracking commands.
+    """
+
+    if value is None:
+        return 0.0
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0.0:
+        raise ValueError(
+            "tracking_threshold_deg must be a non-negative finite number of degrees"
+        )
+    return numeric
+
+
+def _get_tracking_threshold_deg(parser: ConfigParser, section: str) -> float:
+    """Reads the rotator tracking threshold from an INI section.
+
+    Validation happens during config load, so an invalid value is rejected
+    before the saved config file is replaced.
+    """
+
+    return validate_tracking_threshold_deg(
+        _get_optional_float(parser, section, "tracking_threshold_deg")
+    )
 
 
 def _get_float(
@@ -547,6 +626,13 @@ def _get_audio_stream_channel(parser: ConfigParser) -> str:
     return value
 
 
+def _get_audio_stream_demodulation(parser: ConfigParser) -> str:
+    value = parser.get("audio_stream", "demodulation", fallback="FM").strip().upper()
+    if value not in {"FM", "USB"}:
+        raise ValueError("[audio_stream] demodulation must be FM or USB")
+    return value
+
+
 CAT_DEVICE_FIELDS = [
     "name",
     "connectivity",
@@ -606,6 +692,8 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "home_azimuth_deg",
         "home_elevation_deg",
         "return_home_after_pass",
+        "tracking_threshold_deg",
+        "home_below_min_elevation",
     ],
     "automation": ["aos_script", "los_script"],
     "safety": [
@@ -650,8 +738,18 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "rx_gain_db",
         "discord_webhook_url",
     ],
+    "wsjtx": [
+        "executable",
+        "callsign",
+        "mode",
+        "udp_host",
+        "udp_port",
+        "client_timeout_seconds",
+        "max_decodes",
+    ],
     "audio_stream": [
         "enabled",
+        "demodulation",
         "bind_host",
         "port",
         "channel",
@@ -766,6 +864,13 @@ def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str,
     }.items():
         if not settings["server"].get(key, "").strip():
             settings["server"][key] = default
+    if "rotator" in settings:
+        for key, default in {
+            "tracking_threshold_deg": "0.0",
+            "home_below_min_elevation": "false",
+        }.items():
+            if not str(settings["rotator"].get(key, "")).strip():
+                settings["rotator"][key] = default
     if "icom" in settings:
         icom_defaults = {
             "enabled": "false",
@@ -807,9 +912,18 @@ def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str,
                 settings["aprs"][key] = default
     if "sstv" in settings and not str(settings["sstv"].get("rx_gain_db", "")).strip():
         settings["sstv"]["rx_gain_db"] = f"{RX_GAIN_DEFAULT_DB:g}"
+    for key, default in {
+        "executable": "wsjtx",
+        "mode": "FT8",
+        "udp_host": "127.0.0.1", "udp_port": "2237",
+        "client_timeout_seconds": "45", "max_decodes": "300",
+    }.items():
+        if not settings["wsjtx"].get(key, "").strip():
+            settings["wsjtx"][key] = default
     if "audio_stream" in settings:
         audio_stream_defaults = {
             "enabled": "false",
+            "demodulation": "FM",
             "bind_host": AUDIO_STREAM_DEFAULT_HOST,
             "port": str(AUDIO_STREAM_DEFAULT_PORT),
             "channel": "right",
@@ -1062,6 +1176,14 @@ def _render_settings(
     lines.append(f"home_azimuth_deg = {values['home_azimuth_deg']}")
     lines.append(f"home_elevation_deg = {values['home_elevation_deg']}")
     lines.append(f"return_home_after_pass = {values['return_home_after_pass']}")
+    lines.append(
+        "# Minimum change, in degrees, before a tracking target is sent again. 0 sends every update."
+    )
+    lines.append(f"tracking_threshold_deg = {values['tracking_threshold_deg']}")
+    lines.append(
+        "# Move to the home position when the target falls below min_elevation_deg."
+    )
+    lines.append(f"home_below_min_elevation = {values['home_below_min_elevation']}")
 
     lines.append("")
     values = section("automation")
@@ -1085,6 +1207,10 @@ def _render_settings(
     lines.append("# Level trim in dB for the copy of receive audio handed to the SSTV decoder.")
     lines.append("# It never changes the radio or browser audio.")
     _append_keys(lines, values, SETTINGS_SCHEMA["sstv"])
+    lines.append("")
+    values = section("wsjtx")
+    lines.append("# Managed stock WSJT-X receive engine; Pi-Sat supplies SUB AF audio and owns radio control.")
+    _append_keys(lines, values, SETTINGS_SCHEMA["wsjtx"])
     lines.append("")
     values = section("audio_stream")
     lines.append("# External DATA Decode streams demodulated 48 kHz IF audio; bind settings remain manual.")

@@ -13,7 +13,8 @@ def main():
     parser.add_argument("sample_rate_hz", type=int)
     parser.add_argument("--control-fd", type=int, help="inherited read descriptor >=3, newline JSON")
     parser.add_argument("--diagnostics", action="store_true")
-    parser.add_argument("--demodulator", choices=("hilbert", "quadrature", "narrow"), default="quadrature")
+    parser.add_argument("--demodulator", choices=("hilbert", "quadrature", "narrow", "sharp"), default="quadrature",
+                        help="quadrature selects width automatically; narrow/sharp force receive filtering")
     parser.add_argument("--pixel-estimator",choices=("adaptive","phase","sinefit"),default="adaptive")
     parser.add_argument("--noise-reduction",type=float,default=None,help="override automatic noise reduction with a manual blend, 0..1; zero disables it")
     args = parser.parse_args()

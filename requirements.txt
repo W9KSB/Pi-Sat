@@ -7,4 +7,4 @@ aiortc==1.15.0
 numpy>=1.26,<3
 scipy>=1.12,<2
 Pillow>=10,<13
-./vendor/sstvflow/wheels/sstvflow-0.1.1+pisat.20261008-py3-none-any.whl
+./vendor/sstvflow/wheels/sstvflow-0.2.0+pisat.20261014-py3-none-any.whl

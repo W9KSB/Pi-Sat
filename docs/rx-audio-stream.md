@@ -15,7 +15,9 @@ provide universal SSDV or satellite telemetry decoding.
 
 The module requires the native IC-9700 receive connection with
 `[icom] sample_rate = 48000`. It uses the existing radio connection and fixed
-SUB/RX channel. Enabling it selects SUB **FM-DATA/FIL1** and switches the radio's
+SUB/RX channel. Choose **FM** or **USB (Upper Sideband)** on the module page to
+match the transmission. Enabling it selects SUB **FM-DATA/FIL1** or
+**USB-DATA/FIL1**, respectively, and switches the radio's
 LAN output from normal AF to IF. Pi-Sat software-demodulates this input and sends
 framed **48 kHz, mono, signed 16-bit little-endian PCM** over TCP. The client does
 not receive raw IF or I/Q samples, decoded packets, or image files.
@@ -36,14 +38,18 @@ not by the connector.
 ## Configuration
 
 The module page's **Enable** and **Disable** controls save the
-`[audio_stream] enabled` setting, so the selection persists across service
-restarts. Connect the radio before enabling the module.
+`[audio_stream] enabled` setting. The **Demodulation** selector saves
+`[audio_stream] demodulation`; FM is the default for existing configurations.
+Both selections persist across service restarts. Disable the module before
+changing demodulation, then enable it again. Connect the radio before enabling
+the module.
 
 Example configuration, initially disabled:
 
 ```ini
 [audio_stream]
 enabled = false
+demodulation = FM
 bind_host = 0.0.0.0
 port = 8765
 ```
@@ -60,7 +66,8 @@ port to the public Internet.
 
 ## Using an external decoder
 
-1. Tune SUB to the transmission and enable **External DATA Decode** in Pi-Sat.
+1. Tune SUB to the transmission, select **FM** or **USB** demodulation, and
+   enable **External DATA Decode** in Pi-Sat.
 2. Open the Windows connector, enter the server address and port, and select an
    installed Windows output device.
 3. To feed another application, select a virtual audio device's playback endpoint
@@ -77,7 +84,7 @@ For executable usage and buffering details, see the
 
 Disabling the module while the radio is connected attempts to restore LAN AF
 output. Pi-Sat also restores the previous SUB mode and filter if the radio still
-has the FM-DATA/FIL1 settings selected by this module; intervening operator mode
+has the FM-DATA/FIL1 or USB-DATA/FIL1 settings selected by this module; intervening operator mode
 changes are preserved. When the last external client disconnects, the current
 decode session ends. If the module remains enabled, a later client can activate
 the IF path again, so explicitly disable it before using normal AF reception.

@@ -36,6 +36,9 @@ compatibility problems or hardware-specific behavior in
 - Optional live Robot24/36/72, Martin M1/M2, and PD120/180 SSTV decoding from the existing native IC-9700 SUB/RX audio stream using SSTVFlow
 - Optional APRS decoding from a selectable side of the native IC-9700 RX audio
   stream, plus manual APRS transmit of a beacon, status line, or message
+- Optional [FT4 / FT8 module](docs/ft4-ft8-module.md) using stock WSJT-X on the
+  same host, with native SUB receive audio, Pi-Sat-controlled transmit,
+  automatic QSO sequencing, an audio passband display, and ADIF contact export
 - Systemd-based Pi service install and update flow
 
 In Settings, **Orbital Data Source URLs** accepts named TLE or CelesTrak JSON
@@ -88,6 +91,16 @@ it on subsequent starts. Browser certificate acceptance/trust and microphone
 permission are still required. See
 [HTTPS setup](https://github.com/W9KSB/Pi-Sat/wiki/HTTPS-Setup) for certificates,
 custom ports, and the explicit HTTP option for reverse proxies.
+
+### Station Monitor
+
+Open `https://<PI-IP>/dashboard` for **Pi-Sat: Station Monitor**, a read-only
+display suited to a full-screen TV. It uses the checked satellites from the Home
+page and cycles their world-map positions one at a time every five seconds. It
+also shows continuously scrolling passes for the next 24 hours, live SSTV or the last
+saved image, and radio/tracking/rotator status. The refresh interval defaults to
+three minutes and can be adjusted in the top-right corner; SSTV updates live.
+Select satellites and operate the devices and decoder from the main interface.
 
 ### Useful Service Commands
 

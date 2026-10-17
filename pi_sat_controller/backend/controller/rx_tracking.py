@@ -851,20 +851,20 @@ class RxTrackingManager:
 
         if self.rotator_manager is None:
             return
-        pass_active = bool(position.elevation_deg >= 0.0)
-        self.rotator_manager.set_pass_active(
-            pass_active,
-            _python_float(position.azimuth_deg),
-            _python_float(position.elevation_deg),
-        )
-        if write_devices and pass_active:
-            try:
-                self.rotator_manager.track_position(
-                    _python_float(position.azimuth_deg),
-                    _python_float(position.elevation_deg),
-                )
-            except Exception as exc:
-                errors.append(str(exc))
+        with self._lock:
+            tracking_active = bool(self._active)
+        try:
+            # One call per cycle at every elevation: the manager owns the pass
+            # state, the elevation cutoff, and the update threshold. Read-only
+            # refreshes pass write=False so they never command motion.
+            self.rotator_manager.update_tracking(
+                _python_float(position.azimuth_deg),
+                _python_float(position.elevation_deg),
+                write=bool(write_devices),
+                tracking_active=tracking_active,
+            )
+        except Exception as exc:
+            errors.append(str(exc))
 
     def _read_rx_frequency_for_reconciliation(
         self,
