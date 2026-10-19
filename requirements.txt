@@ -1,3 +1,5 @@
+# HTTPS certificate generation requires the OS package openssl.
+# The installer and updater install it through apt, separately from pip.
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 requests==2.32.3

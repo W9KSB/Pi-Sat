@@ -62,6 +62,12 @@ fi
 PYTHON_BIN="$(pi_sat_service_python "${SERVICE_NAME}")"
 pi_sat_check_python "${PYTHON_BIN}"
 
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "Installing OpenSSL for HTTPS certificate generation."
+  sudo apt-get update
+  sudo apt-get install -y openssl
+fi
+
 sudo systemctl stop "${SERVICE_NAME}"
 service_stopped=1
 sudo usermod -aG dialout "$(id -un)"

@@ -40,7 +40,7 @@ log_step "Installing system packages"
 log_info "Running apt update"
 sudo apt update
 log_info "Installing host-level Python, Git, Hamlib, ffmpeg, and Dire Wolf"
-sudo apt install -y python3 python3-pip git ffmpeg libhamlib-utils direwolf
+sudo apt install -y python3 python3-pip git ffmpeg libhamlib-utils direwolf openssl
 log_info "Granting the service user serial-device access"
 sudo usermod -aG dialout "${RUN_USER}"
 
