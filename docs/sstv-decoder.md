@@ -177,10 +177,22 @@ SSTVFlow 0.2.0. SSTVFlow's PolyForm Noncommercial License 1.0.0 and required
 copyright notice are included in `vendor/sstvflow/LICENSE` and the wheel.
 
 Dependencies must be installed into the Python environment running the
-`pi-sat` service. If an existing installation uses `.venv/bin/python`, run
-`.venv/bin/python -m pip install -r requirements.txt` from the Pi-Sat directory.
-Installing into system Python does not update that virtual environment.
-The updater reads the service's configured Python executable and installs into
-that environment. Virtual-environment installs run as the invoking user;
-system-Python installs use the existing host-level installation path. The
-updater checks decoder imports before restarting the service.
+`pi-sat` service. New installations use `.venv/bin/python`; keep that
+environment at its created path so its interpreter and scripts remain valid.
+From the Pi-Sat directory, a manual refresh is:
+
+```sh
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip check
+```
+
+The updater reads the service's configured Python executable. Existing
+virtual-environment services continue to update that exact environment. A
+service still using system Python is migrated to the repository `.venv` only
+when its command is the standard
+`python -m pi_sat_controller.backend.run_server`. The updater installs and
+verifies the isolated environment first, preserves the other service settings,
+and only then switches and restarts the unit. A customized system-Python
+command is left untouched with instructions for a manual interpreter change.
+Debian packages are not uninstalled or repaired by this process. The dependency
+installer refuses to fall back to system Python.

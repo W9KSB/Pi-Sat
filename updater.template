@@ -6,6 +6,9 @@ REPO_ROOT="${SCRIPT_DIR}"
 SERVICE_NAME="pi-sat"
 LOCAL_UPDATER="${REPO_ROOT}/update_pi.sh"
 UPDATER_TEMPLATE="${REPO_ROOT}/updater.template"
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+PYTHON_OVERRIDE_DIR="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service.d"
+PYTHON_OVERRIDE="${PYTHON_OVERRIDE_DIR}/90-pi-sat-python.conf"
 
 if [ "$(id -u)" -eq 0 ]; then
   echo "Run this updater as the normal Pi user, not with sudo."
@@ -31,18 +34,6 @@ echo "Updating Pi-Sat Controller in: ${REPO_ROOT}"
 
 cd "${REPO_ROOT}"
 
-service_stopped=0
-restore_service_on_failure() {
-  status=$?
-  if [ "${status}" -ne 0 ] && [ "${service_stopped}" -eq 1 ]; then
-    echo "Update failed after stopping ${SERVICE_NAME}; attempting to restart it."
-    sudo systemctl start "${SERVICE_NAME}" || true
-  fi
-  trap - EXIT
-  exit "${status}"
-}
-trap restore_service_on_failure EXIT
-
 git fetch --all --prune
 git reset --hard origin/main
 
@@ -58,9 +49,85 @@ if [ "${PI_SAT_UPDATER_REEXEC:-0}" -eq 0 ] \
   exec "${LOCAL_UPDATER}"
 fi
 
+service_stopped=0
+override_active=0
+override_existed=0
+override_backup="$(mktemp)"
+dropin_temp="$(mktemp)"
+
+cleanup_temp_files() {
+  rm -f "${override_backup}" "${dropin_temp}"
+}
+
+restore_python_override() {
+  restore_status=0
+  echo "Restoring the previous Pi-Sat service interpreter configuration."
+  if [ "${override_existed}" -eq 1 ]; then
+    sudo install -m 0644 "${override_backup}" "${PYTHON_OVERRIDE}" || {
+      echo "Could not restore ${PYTHON_OVERRIDE} from its backup." >&2
+      restore_status=1
+    }
+  else
+    sudo rm -f "${PYTHON_OVERRIDE}" || {
+      echo "Could not remove the uncommitted ${PYTHON_OVERRIDE} override." >&2
+      restore_status=1
+    }
+  fi
+  sudo systemctl daemon-reload || {
+    echo "Could not reload systemd after restoring the service interpreter." >&2
+    restore_status=1
+  }
+  override_active=0
+  return "${restore_status}"
+}
+
+restore_service_on_failure() {
+  status=$?
+  trap - EXIT
+  if [ "${override_active}" -eq 1 ]; then
+    if ! restore_python_override; then
+      echo "The previous service interpreter configuration may need manual review." >&2
+    fi
+  fi
+  if [ "${service_stopped}" -eq 1 ]; then
+    echo "Update failed after stopping ${SERVICE_NAME}; restarting its previous configuration."
+    if sudo systemctl restart "${SERVICE_NAME}"; then
+      if ! pi_sat_wait_service_active "${SERVICE_NAME}"; then
+        echo "The previous ${SERVICE_NAME} process did not remain active." >&2
+      fi
+    else
+      echo "The previous ${SERVICE_NAME} process could not be restarted." >&2
+    fi
+  fi
+  cleanup_temp_files
+  exit "${status}"
+}
+trap restore_service_on_failure EXIT
+
 . "${REPO_ROOT}/install/python_environment.sh"
 PYTHON_BIN="$(pi_sat_service_python "${SERVICE_NAME}")"
 pi_sat_check_python "${PYTHON_BIN}"
+
+if pi_sat_is_virtual_environment "${PYTHON_BIN}"; then
+  dependency_mode="virtualenv"
+  VENV_PYTHON="${PYTHON_BIN}"
+else
+  dependency_mode="migrate"
+  VENV_DIR="${REPO_ROOT}/.venv"
+  VENV_PYTHON="${VENV_DIR}/bin/python"
+  pi_sat_check_migration_command "${PYTHON_BIN}" "${VENV_PYTHON}" "${SERVICE_NAME}"
+
+  if ! "${PYTHON_BIN}" -c 'import ensurepip, venv'; then
+    echo "Installing virtual-environment support for ${PYTHON_BIN}."
+    sudo apt-get update
+    sudo apt-get install -y python3-venv
+    "${PYTHON_BIN}" -c 'import ensurepip, venv'
+  fi
+
+  # The service remains on system Python until the isolated environment has
+  # installed and passed all dependency and import checks.
+  pi_sat_prepare_virtual_environment "${PYTHON_BIN}" "${VENV_DIR}"
+fi
 
 if ! command -v openssl >/dev/null 2>&1; then
   echo "Installing OpenSSL for HTTPS certificate generation."
@@ -68,10 +135,59 @@ if ! command -v openssl >/dev/null 2>&1; then
   sudo apt-get install -y openssl
 fi
 
-sudo systemctl stop "${SERVICE_NAME}"
-service_stopped=1
 sudo usermod -aG dialout "$(id -un)"
-pi_sat_install_dependencies "${PYTHON_BIN}"
+
+if [ "${dependency_mode}" = "migrate" ]; then
+  pi_sat_verify_environment "${VENV_PYTHON}"
+
+  if sudo test -f "${PYTHON_OVERRIDE}"; then
+    sudo cp "${PYTHON_OVERRIDE}" "${override_backup}"
+    override_existed=1
+  fi
+
+  replacement_execstart="$(pi_sat_replacement_execstart "${PYTHON_BIN}" "${VENV_PYTHON}" "${SERVICE_NAME}")"
+  {
+    printf '[Service]\n'
+    printf 'ExecStart=\n'
+    printf '%s\n' "${replacement_execstart}"
+  } > "${dropin_temp}"
+
+  sudo mkdir -p "${PYTHON_OVERRIDE_DIR}"
+  override_active=1
+  sudo install -m 0644 "${dropin_temp}" "${PYTHON_OVERRIDE}"
+  sudo systemctl daemon-reload
+
+  selected_python="$(pi_sat_service_python "${SERVICE_NAME}")"
+  if [ "${selected_python}" != "${VENV_PYTHON}" ]; then
+    echo "The Pi-Sat service still selects ${selected_python} after the interpreter migration." >&2
+    echo "Check service drop-ins for a higher-priority ExecStart override." >&2
+    exit 1
+  fi
+
+  sudo systemctl stop "${SERVICE_NAME}"
+  service_stopped=1
+  echo "Starting ${SERVICE_NAME} with ${VENV_PYTHON}"
+  sudo systemctl start "${SERVICE_NAME}"
+  if ! pi_sat_wait_service_active "${SERVICE_NAME}"; then
+    echo "${SERVICE_NAME} did not remain active with ${VENV_PYTHON}." >&2
+    exit 1
+  fi
+  service_stopped=0
+  override_active=0
+else
+  # Updating an existing environment can replace dependencies that the active
+  # service has loaded, so stop it before changing that exact environment.
+  sudo systemctl stop "${SERVICE_NAME}"
+  service_stopped=1
+  pi_sat_install_dependencies "${VENV_PYTHON}"
+  sudo systemctl start "${SERVICE_NAME}"
+  if ! pi_sat_wait_service_active "${SERVICE_NAME}"; then
+    echo "${SERVICE_NAME} did not remain active after the dependency update." >&2
+    exit 1
+  fi
+  service_stopped=0
+fi
+
 sudo systemctl daemon-reload
 # Pi-Sat no longer runs a local STUN service. Retire the unit an earlier
 # install added, and the coturn package it existed for, so the station stops
@@ -86,8 +202,8 @@ if dpkg -s coturn >/dev/null 2>&1; then
   echo "Removing coturn, which Pi-Sat installed only for that STUN service."
   sudo apt-get purge -y coturn >/dev/null 2>&1 || echo "coturn could not be removed automatically."
 fi
-sudo systemctl start "${SERVICE_NAME}"
-service_stopped=0
+
+cleanup_temp_files
 trap - EXIT
 
 echo ""

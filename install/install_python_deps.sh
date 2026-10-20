@@ -10,8 +10,12 @@ if [ "$#" -gt 0 ]; then
 elif command -v systemctl >/dev/null 2>&1 \
     && [ "$(systemctl show --property=LoadState --value pi-sat)" != "not-found" ]; then
   PYTHON_BIN="$(pi_sat_service_python pi-sat)"
+elif [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
+  PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
 else
-  PYTHON_BIN="$(command -v python3)"
+  echo "No Pi-Sat virtual environment is available." >&2
+  echo "Run install/install_pi.sh or update_pi.sh to prepare it." >&2
+  exit 1
 fi
 
 echo "Installing Python dependencies"

@@ -51,7 +51,7 @@ TLE and JSON sources can be combined; the newest epoch for each NORAD ID is kept
 
 - Raspberry Pi OS or another Debian-based Linux environment
 - Raspberry Pi 3B or newer
-- Host-level Python 3.11 or newer with `pip`
+- Python 3.11 or newer with `venv` support (`python3-venv`)
 - `git`
 - 64-bit Raspberry Pi OS (AArch64)
 - Dire Wolf for the optional APRS receiver and `gen_packets` transmit modulator
@@ -77,7 +77,7 @@ curl -fsSL https://raw.githubusercontent.com/W9KSB/Pi-Sat/main/install/install_p
 - clones or updates the repo into `~/pi-sat`
 - creates `pi-sat-controller.conf` from the example template if needed
 - creates `update_pi.sh` from `updater.template` if needed
-- installs Python dependencies from `requirements.txt` into the host Python
+- creates an isolated `.venv` and installs Python dependencies from `requirements.txt`
 - grants the service user serial-device access for local USB/serial radios and rotators
 - installs the bundled SSTVFlow Python decoder from `vendor/sstvflow`
 - installs Dire Wolf for the optional APRS receiver
@@ -126,6 +126,13 @@ cp updater.template update_pi.sh
 chmod +x update_pi.sh
 ./update_pi.sh
 ```
+
+Pi-Sat installs Python packages into `.venv`. The updater prepares and verifies
+that environment before changing the service. A standard run-server service
+that still uses system Python is migrated automatically without uninstalling
+Debian packages. Existing virtual-environment services are retained. A
+customized system-Python execution command requires a manual interpreter
+change.
 
 
 ## Credits

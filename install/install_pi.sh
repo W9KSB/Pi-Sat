@@ -5,9 +5,20 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 SERVICE_NAME="pi-sat"
 REPO_URL="${REPO_URL:-https://github.com/W9KSB/Pi-Sat.git}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/pi-sat}"
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
 RUN_USER="$(id -un)"
 STEP=0
 TOTAL_STEPS=7
+INSTALLER_SERVICE_STOPPED=0
+INSTALLER_SERVICE_EXISTED=0
+INSTALLER_SERVICE_WAS_ACTIVE=0
+INSTALLER_CONFIG_CHANGED=0
+SERVICE_FILE_EXISTED=0
+OVERRIDE_FILE_EXISTED=0
+TMP_SERVICE=""
+TMP_OVERRIDE=""
+SERVICE_BACKUP=""
+OVERRIDE_BACKUP=""
 
 log_step() {
   STEP=$((STEP + 1))
@@ -29,6 +40,54 @@ if ! command -v sudo >/dev/null 2>&1; then
   exit 1
 fi
 
+cleanup_temp_files() {
+  if [ -n "${TMP_SERVICE}" ]; then
+    rm -f "${TMP_SERVICE}"
+  fi
+  if [ -n "${TMP_OVERRIDE}" ]; then
+    rm -f "${TMP_OVERRIDE}"
+  fi
+  if [ -n "${SERVICE_BACKUP}" ]; then
+    rm -f "${SERVICE_BACKUP}"
+  fi
+  if [ -n "${OVERRIDE_BACKUP}" ]; then
+    rm -f "${OVERRIDE_BACKUP}"
+  fi
+}
+
+restore_service_on_failure() {
+  status=$?
+  trap - EXIT
+  restore_failed=0
+  if [ "${INSTALLER_CONFIG_CHANGED}" -eq 1 ]; then
+    echo "Restoring the previous ${SERVICE_NAME} unit configuration."
+    if [ "${SERVICE_FILE_EXISTED}" -eq 1 ]; then
+      sudo install -m 0644 "${SERVICE_BACKUP}" "${SERVICE_FILE}" || restore_failed=1
+    else
+      sudo rm -f "${SERVICE_FILE}" || restore_failed=1
+    fi
+    if [ "${OVERRIDE_FILE_EXISTED}" -eq 1 ]; then
+      sudo install -m 0644 "${OVERRIDE_BACKUP}" "${PYTHON_OVERRIDE}" || restore_failed=1
+    else
+      sudo rm -f "${PYTHON_OVERRIDE}" || restore_failed=1
+    fi
+    sudo systemctl daemon-reload || restore_failed=1
+  fi
+  if [ "${INSTALLER_SERVICE_STOPPED}" -eq 1 ] \
+      || { [ "${INSTALLER_CONFIG_CHANGED}" -eq 1 ] \
+        && [ "${INSTALLER_SERVICE_EXISTED}" -eq 1 ] \
+        && [ "${INSTALLER_SERVICE_WAS_ACTIVE}" -eq 1 ]; }; then
+    echo "Installation failed; restarting ${SERVICE_NAME} with its previous configuration."
+    sudo systemctl restart "${SERVICE_NAME}" || restore_failed=1
+  fi
+  if [ "${restore_failed}" -ne 0 ]; then
+    echo "The previous ${SERVICE_NAME} unit or process may need manual review." >&2
+  fi
+  cleanup_temp_files
+  exit "${status}"
+}
+trap restore_service_on_failure EXIT
+
 echo "Installing Pi-Sat Controller from: ${INSTALL_DIR}"
 echo "Service will run as user: ${RUN_USER}"
 echo "Repository: ${REPO_URL}"
@@ -40,7 +99,7 @@ log_step "Installing system packages"
 log_info "Running apt update"
 sudo apt update
 log_info "Installing host-level Python, Git, Hamlib, ffmpeg, and Dire Wolf"
-sudo apt install -y python3 python3-pip git ffmpeg libhamlib-utils direwolf openssl
+sudo apt install -y python3 python3-venv git ffmpeg libhamlib-utils direwolf openssl
 log_info "Granting the service user serial-device access"
 sudo usermod -aG dialout "${RUN_USER}"
 
@@ -98,12 +157,29 @@ if [ "${created_runtime_file}" -eq 0 ]; then
   log_info "Local runtime files already exist"
 fi
 
-log_step "Installing host-level Python dependencies"
-PYTHON_BIN="$(command -v python3)"
+log_step "Preparing the isolated Python environment"
 . "${INSTALL_DIR}/install/python_environment.sh"
-log_info "Using ${PYTHON_BIN}"
-log_info "Installing Python dependencies from requirements.txt"
-pi_sat_install_dependencies "${PYTHON_BIN}"
+PYTHON_BIN="$(pi_sat_find_compatible_python)"
+log_info "Using ${PYTHON_BIN} to bootstrap Python"
+VENV_DIR="${INSTALL_DIR}/.venv"
+VENV_PYTHON="${VENV_DIR}/bin/python"
+if command -v systemctl >/dev/null 2>&1 \
+    && [ "$(systemctl show --property=LoadState --value "${SERVICE_NAME}")" != "not-found" ]; then
+  INSTALLER_SERVICE_EXISTED=1
+  configured_python="$(pi_sat_service_python "${SERVICE_NAME}")"
+  if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    INSTALLER_SERVICE_WAS_ACTIVE=1
+  fi
+  if [ "${configured_python}" = "${VENV_PYTHON}" ] \
+      && systemctl is-active --quiet "${SERVICE_NAME}"; then
+    log_info "Stopping ${SERVICE_NAME} while its active virtual environment is updated"
+    sudo systemctl stop "${SERVICE_NAME}"
+    INSTALLER_SERVICE_STOPPED=1
+  fi
+fi
+pi_sat_prepare_virtual_environment "${PYTHON_BIN}" "${VENV_DIR}"
+PYTHON_BIN="${VENV_PYTHON}"
+log_info "Pi-Sat dependencies are installed in ${VENV_DIR}"
 
 log_step "Checking Dire Wolf for the APRS module"
 if command -v direwolf >/dev/null 2>&1; then
@@ -112,7 +188,9 @@ else
   log_info "Dire Wolf is unavailable; the APRS module will report that when enabled."
 fi
 
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+SERVICE_FILE="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
+PYTHON_OVERRIDE_DIR="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service.d"
+PYTHON_OVERRIDE="${PYTHON_OVERRIDE_DIR}/90-pi-sat-python.conf"
 TMP_SERVICE="$(mktemp)"
 
 log_step "Installing systemd service"
@@ -136,25 +214,60 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 EOF
 
+SERVICE_BACKUP="$(mktemp)"
+OVERRIDE_BACKUP="$(mktemp)"
+if sudo test -f "${SERVICE_FILE}"; then
+  sudo cp "${SERVICE_FILE}" "${SERVICE_BACKUP}"
+  SERVICE_FILE_EXISTED=1
+fi
+if sudo test -f "${PYTHON_OVERRIDE}"; then
+  sudo cp "${PYTHON_OVERRIDE}" "${OVERRIDE_BACKUP}"
+  OVERRIDE_FILE_EXISTED=1
+fi
+
+INSTALLER_CONFIG_CHANGED=1
 sudo install -m 0644 "${TMP_SERVICE}" "${SERVICE_FILE}"
 rm -f "${TMP_SERVICE}"
 
 if sudo systemctl list-unit-files | grep -q '^sat-controller\.service'; then
   log_info "Removing older sat-controller service name"
   sudo systemctl disable --now sat-controller >/dev/null 2>&1 || true
-  sudo rm -f /etc/systemd/system/sat-controller.service
+  sudo rm -f "${SYSTEMD_UNIT_DIR}/sat-controller.service"
 fi
 
 log_step "Enabling and starting Pi-Sat"
 log_info "Reloading systemd"
 sudo systemctl daemon-reload
+
+if sudo test -f "${PYTHON_OVERRIDE}"; then
+  log_info "Refreshing the managed Python interpreter override"
+  current_python="$(pi_sat_service_python "${SERVICE_NAME}")"
+  replacement_execstart="$(pi_sat_replacement_execstart "${current_python}" "${PYTHON_BIN}" "${SERVICE_NAME}")"
+  TMP_OVERRIDE="$(mktemp)"
+  {
+    printf '[Service]\n'
+    printf 'ExecStart=\n'
+    printf '%s\n' "${replacement_execstart}"
+  } > "${TMP_OVERRIDE}"
+  sudo install -m 0644 "${TMP_OVERRIDE}" "${PYTHON_OVERRIDE}"
+  rm -f "${TMP_OVERRIDE}"
+  sudo systemctl daemon-reload
+fi
+
+selected_python="$(pi_sat_service_python "${SERVICE_NAME}")"
+if [ "${selected_python}" != "${PYTHON_BIN}" ]; then
+  echo "The Pi-Sat service still selects ${selected_python} instead of ${PYTHON_BIN}." >&2
+  echo "Check service drop-ins for a higher-priority ExecStart override." >&2
+  exit 1
+fi
+
 # Pi-Sat no longer runs a local STUN service. Retire the unit an earlier
 # install added, and the coturn package it existed for, so the station stops
 # listening on UDP 3478 and nothing reintroduces it.
 if sudo systemctl list-unit-files | grep -q '^pi-sat-stun\.service'; then
   log_info "Removing the retired local STUN service"
   sudo systemctl disable --now pi-sat-stun >/dev/null 2>&1 || true
-  sudo rm -f /etc/systemd/system/pi-sat-stun.service
+  sudo rm -f "${SYSTEMD_UNIT_DIR}/pi-sat-stun.service"
   sudo systemctl daemon-reload
 fi
 if dpkg -s coturn >/dev/null 2>&1; then
@@ -165,6 +278,13 @@ log_info "Enabling ${SERVICE_NAME}"
 sudo systemctl enable "${SERVICE_NAME}"
 log_info "Starting or restarting ${SERVICE_NAME} with the installed code"
 sudo systemctl restart "${SERVICE_NAME}"
+if ! pi_sat_wait_service_active "${SERVICE_NAME}"; then
+  echo "${SERVICE_NAME} did not remain active after installation." >&2
+  exit 1
+fi
+INSTALLER_SERVICE_STOPPED=0
+cleanup_temp_files
+trap - EXIT
 
 echo ""
 echo "Install complete."
