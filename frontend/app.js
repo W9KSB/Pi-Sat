@@ -1182,6 +1182,7 @@ function showPage(pageName) {
     button.classList.toggle('active', active);
     button.setAttribute('aria-selected', String(active));
   });
+  window.DesktopUI?.showPage(primaryPage);
   if (selectedPage === 'settings') {
     setActiveSettingsSection(settingsSectionFromHash());
     if (primaryPageChanged || !document.querySelector('[data-settings-panel]')) loadSettings();
@@ -1566,12 +1567,13 @@ function renderPasses(passes) {
     button.dataset.noradId = satellitePass.norad_id;
     button.dataset.aosUtc = satellitePass.aos_utc;
     const aos = new Date(satellitePass.aos_utc);
-    const los = new Date(satellitePass.los_utc);
+    const selected = Number(satellitePass.norad_id) === Number(selectedSatelliteNorad);
+    button.classList.toggle('selected', selected);
+    button.setAttribute('aria-pressed', String(selected));
+    button.title = `${satellitePass.satellite_name} · ${formatLocalDateOnly(aos)}`;
     button.innerHTML = `
       <span>${escapeHtml(satellitePass.satellite_name)}</span>
-      <span>${formatLocalDateOnly(aos)}</span>
-      <span>${formatLocalTimeRange(aos, los)}</span>
-      <span>${formatAzimuthPath(satellitePass)}</span>
+      <span>${formatTimeOnly(aos, false)}</span>
       <span>${Number(satellitePass.max_elevation_deg).toFixed(1)}&deg;</span>
     `;
     button.addEventListener('click', () => selectPass(satellitePass, { source: 'manual' }));
@@ -5511,7 +5513,7 @@ function getActiveOrNextPass() {
     return null;
   }
   const bySat = latestPasses
-    .filter((entry) => Number(entry.norad_id) === selectedNorad)
+    .filter((entry) => Number(entry.norad_id) === selectedNorad && Date.parse(entry.los_utc) >= nowMs)
     .sort((left, right) => new Date(left.aos_utc).getTime() - new Date(right.aos_utc).getTime());
   if (!bySat.length) {
     return null;
@@ -5552,7 +5554,7 @@ function drawPassArc() {
   const startX = 18;
   const endX = width - 18;
   const peakX = (startX + endX) / 2;
-  const peakHeight = Math.max(16, Math.min(56, Number(pass.max_elevation_deg) * 0.52));
+  const peakHeight = Math.max(8, Math.min(height - 34, 56, Number(pass.max_elevation_deg) * 0.52));
   const peakY = baseY - peakHeight;
 
   ctx.strokeStyle = '#325f7f';
