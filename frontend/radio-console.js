@@ -13,13 +13,10 @@
   }
   function pathPanel(side, role) {
     return `<section class="rc-path rc-panel" data-side="${side}" aria-label="${side} ${role}">
-      <div class="rc-path-heading"><h2><i class="rc-led"></i>${side} <span class="rc-role">${role}</span></h2>
+      <div class="rc-path-heading"><h2><button type="button" class="rc-receiver-select" data-action="listen" data-value="${side}" aria-pressed="${side === 'SUB'}" title="Listen and tune ${side}"><i class="rc-led"></i>${side} <span class="rc-role">${role}</span></button></h2>
         <span class="rc-freshness" id="rc-${side}-fresh">NO DATA</span></div>
       <div class="rc-frequency-row"><button type="button" id="rc-${side}-dial" class="rc-frequency" data-action="edit" data-side="${side}" data-radio title="Click to enter Hz; mouse wheel tunes using STEP">
         <span id="rc-${side}-frequency">---.---.---</span><small>MHz</small></button>
-        <div class="rc-frequency-steps" aria-label="${side} step tuning">
-          ${button('+', 'step', `data-side="${side}" data-value="1" data-radio aria-label="Increase ${side} frequency by one step"`)}
-          ${button('−', 'step', `data-side="${side}" data-value="-1" data-radio aria-label="Decrease ${side} frequency by one step"`)}</div>
         ${side === 'MAIN' ? `<div class="rc-transmit"><button type="button" class="rc-ptt" id="rc-ptt" data-action="ptt" data-radio>PTT</button><span id="rc-ptt-state">PTT · UNKNOWN</span></div>` : ''}</div>
       <form class="rc-frequency-editor" id="rc-${side}-editor" hidden>
         <label for="rc-${side}-input">${side} frequency (Hz)</label>
@@ -39,7 +36,7 @@
         <input type="range" min="0" max="255" step="1" value="0" id="rc-${side}-${control}" data-level="${control}" data-side="${side}" data-radio aria-label="${side} ${label}">
         <output id="rc-${side}-${control}-value">—</output></label>`).join('')}
       ${side === 'SUB' ? `<form id="rc-rit-form" class="rc-rit-controls"><label>SUB RIT (Hz)<input id="rc-rit-offset" type="number" min="-9900" max="9900" step="100" value="0" required data-radio title="Adjust with arrows or mouse wheel in 100 Hz steps"></label>
-        <output id="rc-rit-toggle" aria-live="polite">RIT —</output>${button('Reset', 'rit-reset', 'data-radio')}
+        <output id="rc-rit-toggle" aria-live="polite">RIT —</output>
         <output id="rc-rit-readback" class="visually-hidden">No RIT readback</output></form>` : ''}</div>
       <small id="rc-${side}-sql-state" class="rc-control-note">Squelch state unknown</small>
     </section>`;
@@ -66,7 +63,7 @@
         <label class="rc-span-label">STEP <select id="rc-step" title="Spectrum double-click, mouse-wheel and drag tuning step"><option value="10">10 Hz</option><option value="100" selected>100 Hz</option><option value="1000">1 kHz</option><option value="10000">10 kHz</option></select></label>
         <label class="rc-lock"><input id="rc-lock" type="checkbox"> Lock</label>
         <span id="rc-passband-label">Passband —</span>
-        <div class="rc-scope-tools">${button('Max hold', 'hold', 'aria-pressed="false"')}${button('Fill', 'fill', 'aria-pressed="true"')}${button('Grid', 'grid', 'aria-pressed="true"')}${button('Smooth', 'smooth', 'aria-pressed="true" title="Glide the waterfall between sweeps and soften the trace; display only, no radio writes"')}</div></div>
+        <div class="rc-scope-tools">${button('Peak hold', 'hold', 'aria-pressed="false"')}${button('Fill', 'fill', 'aria-pressed="true"')}${button('Grid', 'grid', 'aria-pressed="true"')}${button('<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16M8 3v6M16 9v6M10 15v6"/></svg> Config', 'config-open', 'id="rc-config-open" aria-controls="rc-config" aria-expanded="false"')}</div></div>
       <div class="rc-scope-display">
         <div class="rc-scope-plot"><canvas id="rc-spectrum" width="1400" height="220" aria-label="Live spectrum, relative amplitude" title="Double-click a signal to tune to it; drag inside the passband or scroll to nudge"></canvas>
           <span class="rc-scope-unit">DISPLAY dB</span><div id="rc-scope-message" class="rc-scope-message">Connect to receive spectrum</div></div>
@@ -83,20 +80,31 @@
         </div>
       </div>
     </section>
-    <div class="rc-deck">${pathPanel('MAIN', 'TX')}<div class="rc-center-controls" role="group" aria-label="Radio and tracking actions">
+    <div class="rc-deck radio-controls">${pathPanel('MAIN', 'TX')}<div class="rc-center-controls" role="group" aria-label="Radio and tracking actions">
       <button type="button" id="rc-swap" class="rc-button rc-swap"
         data-action="swap-bands" title="Exchange the MAIN and SUB bands, the same operation as the radio's front-panel M&lt;&gt;S button">M&lt;-&gt;S</button>
       <button type="button" id="rc-reset-offset" class="rc-button rc-center-action" data-action="reset-offset"
         aria-label="Reset Offset" title="Reset tracking offsets, the same action as Reset Offset on the front page">Reset<br>Offset</button>
+      ${button('Reset RIT', 'rit-reset', 'data-radio aria-label="Reset SUB RIT" title="Reset SUB RIT to zero and disable it"')}
       <button type="button" id="rc-tuning-tone" class="rc-button rc-center-action" data-action="tuning-tone"
         aria-label="Tuning Tone" aria-pressed="false" title="Click to transmit a steady 600 Hz tone in USB/LSB; click again to stop">Tuning<br>Tone</button>
     </div>${pathPanel('SUB', 'RX')}</div>
-    <footer class="rc-audio rc-panel"><div class="rc-volume"><label for="rc-volume">MONITOR VOLUME</label><input id="rc-volume" type="range" min="0" max="100" value="70"><output id="rc-volume-value">70%</output></div>
+    <section id="rc-config" class="rc-config rc-panel" role="dialog" aria-modal="false" aria-labelledby="rc-config-title" hidden>
+      <header class="rc-config-heading"><h2 id="rc-config-title">Console configuration</h2>${button('Close ×', 'config-close', 'id="rc-config-close" aria-label="Close configuration"')}</header>
+      <nav class="rc-config-nav" aria-label="Configuration categories">${[['Spectrum', 'rc-config-spectrum'], ['Audio', 'rc-config-audio'], ['Microphone', 'rc-microphone-panel'], ['Doppler', 'desktop-doppler-settings'], ['Display', 'desktop-display-settings'], ['Advanced', 'rc-config-advanced']].map(([label, target]) => button(label, 'config-category', `data-value="${target}"`)).join('')}</nav>
+      <div id="rc-config-content" class="rc-config-content">
+    <section id="rc-config-audio"><h3>Audio</h3><footer class="rc-audio rc-panel"><div class="rc-volume"><label for="rc-volume">MONITOR VOLUME</label><input id="rc-volume" type="range" min="0" max="100" value="70"><output id="rc-volume-value">70%</output></div>
       <span id="radio-audio-status" role="status">Audio off · starts with Connect</span>
       <span class="rc-persistent">Audio follows you across tabs</span></footer>
-    <details class="rc-microphone rc-panel" id="rc-microphone-panel"><summary>Advanced Settings</summary>
-      <div class="rc-advanced-columns">
-        <div class="rc-advanced-column">
+          <div class="rc-advanced-group">
+            <h3>RX Audio Transport</h3>
+            <div class="rc-transport-group" role="group" aria-label="Receive audio transport">
+              ${button('WebRTC', 'audio-transport', 'data-value="webrtc" aria-pressed="false" title="Receive audio over WebRTC with a browser jitter buffer"')}
+              ${button('PCM', 'audio-transport', 'data-value="pcm" aria-pressed="false" title="Receive plain PCM over the audio socket, which an external decoder can tap"')}
+            </div>
+          </div>
+    </section>
+    <details class="rc-microphone rc-panel" id="rc-microphone-panel" open><summary>Microphone</summary>
       <div class="rc-mic-settings"><label>Laptop / USB microphone<select id="rc-mic-device" title="Microphone used for transmit audio; choosing another one reopens capture on it"><option value="">System default microphone</option></select></label>
         ${button('Refresh microphones', 'mic-refresh')}
         <label>Browser mic gain<input id="rc-mic-gain" type="range" min="0" max="200" value="100"><output id="rc-mic-gain-value">100%</output></label>
@@ -111,26 +119,9 @@
         </div>
         <form id="rc-lan-mod-form"><label>Radio LAN MOD level (0–255)<input id="rc-lan-mod" type="number" min="0" max="255" step="1" required data-radio></label><button type="submit" class="rc-button" data-radio>Apply level</button></form>
       </div><p>DATA OFF MOD and DATA MOD are stored on the radio, and Pi-Sat sets the LAN input each time it connects. The buttons are a manual exception for this session; the LAN MOD level only matters while the LAN input is selected.</p>
-        </div>
-        <div class="rc-advanced-column">
-          <div class="rc-advanced-group">
-            <h3>RX Audio Transport</h3>
-            <div class="rc-transport-group" role="group" aria-label="Receive audio transport">
-              ${button('WebRTC', 'audio-transport', 'data-value="webrtc" aria-pressed="false" title="Receive audio over WebRTC with a browser jitter buffer"')}
-              ${button('PCM', 'audio-transport', 'data-value="pcm" aria-pressed="false" title="Receive plain PCM over the audio socket, which an external decoder can tap"')}
-            </div>
-          </div>
-          <div class="rc-advanced-group">
-            <h3>Preamps</h3>
-            <div class="rc-preamp-grid">
-              <span class="rc-preamp-side">MAIN</span>
-              ${button('INTERNAL', 'preamp', 'id="rc-MAIN-preamp-int" data-side="MAIN" data-value="int" data-radio aria-pressed="false" title="Internal preamp for the band the MAIN receiver is on"')}
-              ${button('EXTERNAL', 'preamp', 'id="rc-MAIN-preamp-ext" data-side="MAIN" data-value="ext" data-radio aria-pressed="false" title="External preamp for the MAIN band; the radio enables it per band in the SET menu"')}
-              <span class="rc-preamp-side">SUB</span>
-              ${button('INTERNAL', 'preamp', 'id="rc-SUB-preamp-int" data-side="SUB" data-value="int" data-radio aria-pressed="false" title="Internal preamp for the band the SUB receiver is on"')}
-              ${button('EXTERNAL', 'preamp', 'id="rc-SUB-preamp-ext" data-side="SUB" data-value="ext" data-radio aria-pressed="false" title="External preamp for the SUB band; the radio enables it per band in the SET menu"')}
-            </div>
-          </div>
+    </details>
+    <section id="rc-config-spectrum" class="rc-config-section"><h3>Spectrum</h3>
+      <div class="rc-scope-tools">${button('Smooth', 'smooth', 'aria-pressed="true" title="Glide the waterfall between sweeps and soften the trace; display only, no radio writes"')}</div>
           <div class="rc-advanced-group">
             <h3>Spectrum Trace</h3>
             <div class="rc-sweep-group" role="group" aria-label="Scope sweep speed">
@@ -147,9 +138,25 @@
               <output id="rc-ref-level-value">+0.0 dB</output>
             </div>
           </div>
-        </div>
+    </section>
+    <section id="rc-config-advanced" class="rc-config-section"><h3>Advanced</h3>
+          <div class="rc-advanced-group">
+            <h3>Preamps</h3>
+            <div class="rc-preamp-grid">
+              <span class="rc-preamp-side">MAIN</span>
+              ${button('INTERNAL', 'preamp', 'id="rc-MAIN-preamp-int" data-side="MAIN" data-value="int" data-radio aria-pressed="false" title="Internal preamp for the band the MAIN receiver is on"')}
+              ${button('EXTERNAL', 'preamp', 'id="rc-MAIN-preamp-ext" data-side="MAIN" data-value="ext" data-radio aria-pressed="false" title="External preamp for the MAIN band; the radio enables it per band in the SET menu"')}
+              <span class="rc-preamp-side">SUB</span>
+              ${button('INTERNAL', 'preamp', 'id="rc-SUB-preamp-int" data-side="SUB" data-value="int" data-radio aria-pressed="false" title="Internal preamp for the band the SUB receiver is on"')}
+              ${button('EXTERNAL', 'preamp', 'id="rc-SUB-preamp-ext" data-side="SUB" data-value="ext" data-radio aria-pressed="false" title="External preamp for the SUB band; the radio enables it per band in the SET menu"')}
+            </div>
+          </div>
+
+    </section>
+    <section id="desktop-doppler-settings" class="rc-config-section"><h3>Doppler</h3></section>
+    <section id="desktop-display-settings" class="rc-config-section"><h3>Display</h3></section>
       </div>
-    </details>
+    </section>
     <div class="rc-notices"><span id="rc-status" role="status">Checking radio configuration…</span><span id="rc-command-status" role="status"></span></div>`;
 
   const state = { enabled: false, connected: false, main: {}, sub: {} };
@@ -361,7 +368,7 @@
         $(`rc-${side}-sql-state`).textContent = data.squelch_open == null ? 'Squelch state unknown' : `Squelch ${data.squelch_open ? 'OPEN' : 'CLOSED'}`;
         const panel = root.querySelector(`.rc-path[data-side="${side}"]`);
         panel.classList.toggle('is-target', listeningScopeSide() === side);
-        panel.classList.toggle('is-live', state.connected && streamHealthy);
+        panel.classList.toggle('is-live', state.connected && streamHealthy && data.squelch_open === true && !(side === 'SUB' && state.dualwatch === false));
         panel.classList.toggle('is-transmitting', side === 'MAIN' && state.ptt === true && state.connected);
         $(`rc-${side}-fresh`).textContent = !state.connected ? 'DISCONNECTED' : !data.frequency_hz ? 'NO DATA' : !streamHealthy ? 'STALE'
           : data.age_s > 6 ? `LAST READ · ${data.age_s}s` : 'READBACK';
@@ -531,7 +538,11 @@
     }
   }
 
-  function resumeAudioOnInteraction() {
+  function resumeAudioOnInteraction(event) {
+    if (event?.key === 'Escape' && !$('rc-config').hidden) {
+      event.preventDefault();
+      setConfigOpen(false);
+    }
     if (!state.connected || !wantAudio) return;
     // Autoplay-blocked resume() can stay pending. Retry synchronously inside
     // the gesture even when the original startup is still awaiting permission.
@@ -663,6 +674,9 @@
     const node = event.target.closest('[data-action]');
     if (!node || node.disabled) return;
     const { action, side, value } = node.dataset;
+    if (action === 'config-open') setConfigOpen(true);
+    if (action === 'config-close') setConfigOpen(false);
+    if (action === 'config-category') setConfigCategory(value);
     if (action === 'power') await power();
     if (action === 'step') queueReadoutStep(side, Number(value));
     if (action === 'listen') {
@@ -714,6 +728,26 @@
       paintSpectrum();
     }
   });
+  function setConfigCategory(value) {
+    root.querySelectorAll('.rc-config-content > section, .rc-config-content > details').forEach(section => {
+      section.hidden = section.id !== value;
+    });
+    root.querySelectorAll('[data-action="config-category"]').forEach(node => {
+      node.setAttribute('aria-pressed', String(node.dataset.value === value));
+    });
+    if (value === 'rc-microphone-panel') $('rc-microphone-panel').open = true;
+    $('rc-config-content').scrollTop = 0;
+  }
+  setConfigCategory('rc-config-spectrum');
+  function setConfigOpen(open) {
+    $('rc-config').hidden = !open;
+    $('rc-config-open').setAttribute('aria-expanded', String(open));
+    if (open) {
+      $('rc-microphone-panel').open = true;
+      void refreshRadioMicrophones();
+      $('rc-config-close').focus();
+    } else $('rc-config-open').focus();
+  }
   for (const side of ['MAIN', 'SUB']) {
     $(`rc-${side}-dial`).addEventListener('wheel', event => {
       if (!readoutReady(side) || event.deltaY === 0) return;
@@ -1032,10 +1066,11 @@
     // the bottom: the visible window moves from rows 0..N-1 to rows 1..N.
     const height = waterfall.height + 1;
     if (!waterfallBufferCanvas || waterfallBufferCanvas.width !== waterfall.width || waterfallBufferCanvas.height !== height) {
+      const widthChanged = waterfallBufferCanvas && waterfallBufferCanvas.width !== waterfall.width;
       waterfallBufferCanvas = document.createElement('canvas');
       waterfallBufferCanvas.width = waterfall.width;
       waterfallBufferCanvas.height = height;
-      waterfallRows = [];
+      if (widthChanged) waterfallRows = [];
     }
     return waterfallBufferCanvas;
   }
@@ -1282,9 +1317,24 @@
   // Start the essential state channel before optional spectrum rendering.
   subscribe();
   new ResizeObserver(entries => {
-    const width = Math.round(entries[0].contentRect.width * Math.min(devicePixelRatio || 1, 2));
-    if (width > 0 && $('rc-spectrum').width !== width) { $('rc-spectrum').width = width; paintSpectrum(); }
+    const ratio = Math.min(devicePixelRatio || 1, 2);
+    const width = Math.round(entries[0].contentRect.width * ratio);
+    const height = Math.round(entries[0].contentRect.height * ratio);
+    if (width > 0 && height > 0 && ($('rc-spectrum').width !== width || $('rc-spectrum').height !== height)) {
+      $('rc-spectrum').width = width;
+      $('rc-spectrum').height = height;
+      paintSpectrum();
+    }
   }).observe($('rc-spectrum'));
+  new ResizeObserver(entries => {
+    // Horizontal pixels remain the radio's 475 bins; CSS stretches them across
+    // the available width. A taller viewport can retain more incoming sweeps.
+    const height = Math.round(entries[0].contentRect.height);
+    if (height > 0 && $('rc-waterfall').height !== height) {
+      $('rc-waterfall').height = height;
+      repaintWaterfall();
+    }
+  }).observe($('rc-waterfall'));
   syncLevelControls();
   syncDisplayControls();
   paintSpectrum();
