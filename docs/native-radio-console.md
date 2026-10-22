@@ -3,6 +3,16 @@
 The Radio page provides direct IC-9700 control, receive audio, microphone audio,
 spectrum, waterfall, and meter displays over the radio's LAN interface.
 
+Enable **Enhanced IC-9700 experience** under **Settings → Device Settings →
+My Devices → Icom IC-9700** (`[icom] enabled`) to use the desktop Overview and
+native radio modules. When disabled, the original Home page provides the map,
+passes, transponder selection, separate RX/TX tracking and offset controls, and
+rotator controls. QSO Finder and Map remain available; the native Radio,
+External DATA Decode, SSTV, APRS, and FT4/FT8 interfaces are hidden.
+
+Saving a change to this setting reloads the interface. Disconnecting the radio
+or turning RX/TX control off does not change the selected experience.
+
 ## Connect and disconnect
 
 Select **Connect** to start the native radio session. Pi-Sat remains

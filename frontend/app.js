@@ -477,9 +477,11 @@ async function loadStatus() {
       }
       rotatorControlEnabled = Boolean(status.devices.rotator_enabled);
     }
-    nativeIcomRxActive = status.icom?.rx_native === true;
+    nativeIcomRxActive = status.icom?.enabled === true && status.icom?.rx_native === true;
+    void window.PiSatExperience?.applyStatus(status.icom?.enabled);
     updateManualOffsetControlState();
   } catch (error) {
+    void window.PiSatExperience?.applyStatus(undefined);
     // Other polling paths surface connection failures; avoid repeating log noise here.
   }
 }
@@ -1157,11 +1159,15 @@ async function selectRadioMicrophone(deviceId) {
 }
 
 function showPage(pageName) {
-  const selectedPage = MODULE_NAMES.includes(pageName)
+  let selectedPage = MODULE_NAMES.includes(pageName)
     ? pageName
     : PAGE_NAMES.includes(pageName)
       ? (pageName === 'modules' ? activeModuleName : pageName)
       : 'home';
+  if (
+    window.PiSatExperience?.isPageAvailable(selectedPage) === false
+    || (MODULE_NAMES.includes(selectedPage) && window.PiSatExperience?.isModuleAvailable(selectedPage) === false)
+  ) selectedPage = 'home';
   const primaryPage = MODULE_NAMES.includes(selectedPage) ? 'modules' : selectedPage;
   const primaryPageChanged = primaryPage !== activePrimaryPageName;
   activePrimaryPageName = primaryPage;
@@ -1211,10 +1217,40 @@ function pageFromHash() {
   const route = window.location.hash.replace(/^#/, '').split('/').filter(Boolean);
   const page = route[0] || 'home';
   if (page === 'modules') {
-    return MODULE_NAMES.includes(route[1]) ? route[1] : activeModuleName;
+    const module = MODULE_NAMES.includes(route[1]) ? route[1] : activeModuleName;
+    return window.PiSatExperience?.isModuleAvailable(module) === false ? 'home' : module;
   }
-  if (MODULE_NAMES.includes(page)) return page;
+  if (MODULE_NAMES.includes(page)) return window.PiSatExperience?.isModuleAvailable(page) === false ? 'home' : page;
+  if (window.PiSatExperience?.isPageAvailable(page) === false) return 'home';
   return PAGE_NAMES.includes(page) ? page : 'home';
+}
+
+function refreshExperienceNavigation() {
+  const experience = window.PiSatExperience;
+  if (experience) {
+    document.querySelectorAll('[data-page]').forEach(node => {
+      node.hidden = !experience.isPageAvailable(node.dataset.page);
+    });
+    document.querySelectorAll('[data-module]').forEach(node => {
+      node.hidden = !experience.isModuleAvailable(node.dataset.module);
+    });
+    document.querySelectorAll('[data-enhanced-only]').forEach(node => {
+      node.hidden = !experience.enabled;
+    });
+    if (!experience.isModuleAvailable(activeModuleName)) {
+      activeModuleName = MODULE_NAMES.find(name => experience.isModuleAvailable(name));
+    }
+    const route = window.location.hash.replace(/^#/, '').split('/').filter(Boolean);
+    const requested = route[0] === 'modules' ? route[1] : route[0];
+    if (experience.configured !== null && (
+      experience.isPageAvailable(requested) === false
+      || (MODULE_NAMES.includes(requested) && !experience.isModuleAvailable(requested))
+    )) window.history.replaceState(null, '', '#home');
+  }
+  const refreshSettings = activePrimaryPageName === 'settings';
+  renderPasses(latestPasses);
+  showPage(pageFromHash());
+  if (refreshSettings && activePrimaryPageName === 'settings') void loadSettings();
 }
 
 function settingsSectionFromHash() {
@@ -1571,9 +1607,16 @@ function renderPasses(passes) {
     button.classList.toggle('selected', selected);
     button.setAttribute('aria-pressed', String(selected));
     button.title = `${satellitePass.satellite_name} · ${formatLocalDateOnly(aos)}`;
-    button.innerHTML = `
+    const los = new Date(satellitePass.los_utc);
+    button.innerHTML = window.PiSatExperience?.enabled ? `
       <span>${escapeHtml(satellitePass.satellite_name)}</span>
       <span>${formatTimeOnly(aos, false)}</span>
+      <span>${Number(satellitePass.max_elevation_deg).toFixed(1)}&deg;</span>
+    ` : `
+      <span>${escapeHtml(satellitePass.satellite_name)}</span>
+      <span>${formatLocalDateOnly(aos)}</span>
+      <span>${formatLocalTimeRange(aos, los)}</span>
+      <span>${formatAzimuthPath(satellitePass)}</span>
       <span>${Number(satellitePass.max_elevation_deg).toFixed(1)}&deg;</span>
     `;
     button.addEventListener('click', () => selectPass(satellitePass, { source: 'manual' }));
@@ -2541,6 +2584,7 @@ async function loadSettings() {
     };
     const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'aprs', 'wsjtx', 'sstv', 'safety'];
     orderedSections.forEach((section) => {
+      if (window.PiSatExperience?.isSettingsSectionAvailable(section) === false) return;
       if (section === 'device_roles') {
         appendToSettingsPanel(section,
           buildMyDevicesSection(
@@ -2603,7 +2647,7 @@ function buildMyDevicesSection(icomKeys, icomSettings, rxSettings, txSettings, c
   native.querySelector('legend').textContent = 'Icom IC-9700';
   const nativeNote = document.createElement('div');
   nativeNote.className = 'automation-settings-note settings-row-wide';
-  nativeNote.textContent = 'First-class Pi-Sat network control for Radio, spectrum, audio and satellite tracking through one shared native CI-V core.';
+  nativeNote.textContent = 'Enable the enhanced IC-9700 experience for the desktop radio console, spectrum, audio and native data modules. Leave it disabled for the basic Home page with separate RX/TX tracking controls.';
   native.insertBefore(nativeNote, native.children[1] || null);
   section.appendChild(native);
 
@@ -4168,7 +4212,9 @@ function buildSettingControl(section, key, value) {
 
   const labelText = document.createElement('span');
   labelText.className = 'form-label mb-0';
-  labelText.textContent = section === 'icom' && key === 'serial_port'
+  labelText.textContent = section === 'icom' && key === 'enabled'
+    ? 'Enhanced IC-9700 experience'
+    : section === 'icom' && key === 'serial_port'
     ? 'Icom CI-V UDP Port'
     : formatSettingLabel(key);
 
@@ -5856,7 +5902,7 @@ worldMapImage.addEventListener('load', () => {
   drawQsoMap();
 });
 renderStandardPageHeaders();
-showPage(pageFromHash());
+refreshExperienceNavigation();
 window.addEventListener('hashchange', () => showPage(pageFromHash()));
 window.addEventListener('resize', handleDashboardResize);
 document.addEventListener('visibilitychange', () => {

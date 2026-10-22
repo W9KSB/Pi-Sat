@@ -5,6 +5,7 @@
   const workspace = $('desktop-workspace');
   const consoleRoot = $('radio-console');
   if (!workspace || !consoleRoot) return;
+  document.body.classList.add('desktop-ui');
   const storage = {
     get(key) { try { return localStorage.getItem(key); } catch (_) { return null; } },
     set(key, value) { try { localStorage.setItem(key, value); } catch (_) { /* Preferences remain usable without storage. */ } },

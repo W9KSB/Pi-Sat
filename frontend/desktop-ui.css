@@ -6,6 +6,9 @@
   --desktop-edge: #18354a;
   --desktop-muted: #92a8ba;
 }
+body:not(.desktop-ui) > .desktop-statusbar,
+body:not(.desktop-ui) > .desktop-navigation,
+body:not(.desktop-ui) .desktop-workspace { display: none !important; }
 html:has(body.desktop-ui) { font-size: calc(16px * var(--text-scale)); }
 body.desktop-ui {
   --app-bg: #04111b;
