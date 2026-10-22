@@ -275,9 +275,6 @@
   .rc-deck { grid-template-columns: minmax(0, 1fr); }
   .rc-scope-axis { font-size: 8px; }
 }
-@container (max-width: 360px) {
-  .desktop-ui .radio-controls .rc-path-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
 @media (max-width: 740px) {
   .rc-session { gap: 6px; flex-wrap: wrap; }
   .rc-session .rc-power { margin-left: auto; }
@@ -299,74 +296,4 @@
   .rc-frequency { padding-block: 6px; }
   .rc-transmit .rc-ptt { min-height: 34px; }
   .rc-path-controls select { height: 32px; }
-}
-
-.rc-receiver-select { display: inline-flex; align-items: center; gap: 8px; padding: 3px 0; border: 0; background: transparent; color: inherit; font-weight: inherit; letter-spacing: inherit; cursor: pointer; }
-.rc-button svg { width: 14px; height: 14px; vertical-align: middle; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
-.rc-path.is-transmitting .rc-path-heading .rc-led { background: #ff4859; box-shadow: 0 0 9px #ff485960; }
-.rc-config { position: fixed; z-index: 1200; inset: auto 24px 24px auto; display: flex; flex-direction: column; width: min(720px, calc(100vw - 32px)); max-height: calc(100dvh - 100px); color: #eaf3ff; background: #081724f5; box-shadow: 0 14px 65px #000b; backdrop-filter: blur(14px); overflow: hidden; }
-.rc-config-heading { display: flex; flex: none; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--rc-edge); }
-.rc-config-heading h2 { font-size: 16px; }
-.rc-config-nav { display: flex; flex: none; gap: 5px; flex-wrap: wrap; padding: 10px 16px; border-bottom: 1px solid var(--rc-edge); }
-.rc-config-nav .rc-button { padding: 5px 8px; min-height: 28px; border-radius: 4px; background: #102d42; color: #b5dcf5; font-size: 12px; }
-.rc-config-content { position: relative; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; display: grid; gap: 18px; }
-.rc-config-content > section, .rc-config-content > details { scroll-margin-block: 10px; display: grid; gap: 12px; }
-.rc-config-content h3 { font-size: 13px; color: #b8d8ee; }
-.rc-config-content .rc-scope-tools { margin-left: 0; }
-.rc-config-content .rc-audio { box-shadow: none; }
-.rc-config-content .rc-microphone { box-shadow: none; }
-.rc-config-content .rc-microphone:not([open]) { display: block; }
-
-@media (min-width: 1000px) {
-  .desktop-ui .radio-console { --radio-actions-width: calc(84px * var(--ui-scale, 1)); display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0; gap: calc(8px * var(--density-space, 1)); border-radius: 0; background: transparent; font-size: calc(12px * var(--text-scale, 1)); }
-  .desktop-ui .rc-panel { border-radius: 5px; box-shadow: inset 0 1px #ffffff05; }
-  .desktop-ui .rc-button { min-height: calc(28px * var(--ui-scale, 1)); padding: calc(4px * var(--ui-scale, 1)) calc(7px * var(--ui-scale, 1)); font-size: calc(11px * var(--text-scale, 1)); }
-  .desktop-ui .rc-lock, .desktop-ui .rc-span-label, .desktop-ui .rc-role { font-size: calc(10px * var(--text-scale, 1)); }
-  .desktop-ui .rc-frequency small, .desktop-ui .rc-meter-heading, .desktop-ui .rc-meter-scale, .desktop-ui .rc-transmit > span { font-size: calc(9px * var(--text-scale, 1)); }
-  .desktop-ui .rc-meter { grid-template-rows: auto 9px auto; line-height: 1.2; }
-  .desktop-ui .rc-rit-controls label, .desktop-ui .rc-rit-controls output { font-size: calc(10px * var(--text-scale, 1)); }
-  .desktop-ui .rc-config h3, .desktop-ui .rc-config summary { font-size: calc(13px * var(--text-scale, 1)); }
-  .desktop-ui .rc-config label, .desktop-ui .rc-config p, .desktop-ui .rc-config output, .desktop-ui #radio-audio-status { font-size: calc(11px * var(--text-scale, 1)); }
-  .desktop-ui .rc-session { flex: none; padding: 5px 9px; gap: 8px; min-height: 34px; }
-  .desktop-ui .rc-session .rc-button { min-height: 25px; padding: 3px 8px; font-size: calc(11px * var(--text-scale, 1)); }
-  .desktop-ui .rc-session .rc-power { min-width: 90px; }
-  .desktop-ui .rc-tracking { display: none; }
-  .desktop-ui .rc-scope { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 275px; }
-  .desktop-ui .rc-scope-toolbar { flex: none; gap: 8px; padding: 5px 9px; }
-  .desktop-ui .rc-scope-toolbar h2 { display: none; }
-  .desktop-ui .rc-scope-source { font-size: calc(10px * var(--text-scale, 1)); }
-  .desktop-ui #rc-scope-range { margin-right: auto; font-size: calc(10px * var(--text-scale, 1)); }
-  .desktop-ui #rc-passband-label { display: none; }
-  .desktop-ui .rc-scope-tools .rc-button, .desktop-ui .rc-span-label select { min-height: 26px; font-size: calc(11px * var(--text-scale, 1)); padding: 3px 7px; }
-  .desktop-ui .rc-scope-display { display: grid; flex: 1 1 auto; min-height: 0; grid-template-rows: minmax(100px, 1.1fr) minmax(70px, 1fr) auto; }
-  .desktop-ui .rc-scope-plot { grid-row: 1; min-height: 0; }
-  .desktop-ui #rc-spectrum { width: 100%; height: 100%; }
-  .desktop-ui #rc-waterfall { grid-row: 2; min-height: 0; height: 100%; }
-  .desktop-ui .rc-scope-axis { grid-row: 3; padding-block: 4px; font-size: calc(10px * var(--text-scale, 1)); }
-  .desktop-ui .radio-controls { flex: none; display: grid; grid-template-columns: minmax(0, 1fr) var(--radio-actions-width) minmax(0, 1fr); gap: 12px; align-items: stretch; }
-  .desktop-ui .rc-center-controls { align-self: stretch; justify-self: stretch; width: auto; gap: 5px; justify-content: center; min-width: 0; }
-  .desktop-ui .rc-center-controls .rc-button { min-height: 28px; padding: 4px 2px; font-size: calc(10px * var(--text-scale, 1)); }
-  .desktop-ui .rc-path { display: flex; flex-direction: column; padding: calc(8px * var(--density-space, 1)) calc(10px * var(--ui-scale, 1)); }
-  .desktop-ui .rc-path-heading h2 { font-size: calc(14px * var(--text-scale, 1)); }
-  .desktop-ui .rc-freshness { font-size: calc(8px * var(--text-scale, 1)); }
-  .desktop-ui .rc-frequency-row { min-height: 48px; gap: 8px; }
-  .desktop-ui .rc-frequency { flex: 1; padding: 7px 0; }
-  .desktop-ui .rc-frequency span { font-size: calc(clamp(20px, 6.2cqw, 50px) * var(--frequency-size, 1)); }
-  .desktop-ui .rc-transmit { flex: 0 0 58px; }
-  .desktop-ui .rc-transmit .rc-ptt { min-height: 38px; }
-  .desktop-ui .rc-path-controls { grid-template-columns: .8fr 1.1fr .9fr 1fr; gap: 6px; padding-block: calc(6px * var(--density-space, 1)); }
-  .desktop-ui .rc-path-controls label { font-size: calc(9px * var(--text-scale, 1)); }
-  .desktop-ui .rc-path-controls select { height: calc(29px * var(--ui-scale, 1)); font-size: calc(11px * var(--text-scale, 1)); padding: 3px 5px; }
-  .desktop-ui .rc-secondary-controls { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; padding-top: 5px; }
-  .desktop-ui .rc-secondary-controls .rc-rit-controls { grid-column: 1 / -1; padding: 0; border: 0; min-height: 27px; }
-  .desktop-ui .rc-path[data-side="MAIN"] .rc-secondary-controls::after { content: ''; grid-column: 1 / -1; min-height: 27px; }
-  .desktop-ui .rc-level-control { font-size: calc(9px * var(--text-scale, 1)); }
-  .desktop-ui .rc-level-control output { font-size: calc(9px * var(--text-scale, 1)); }
-  .desktop-ui .rc-control-note { margin-top: auto; font-size: calc(8px * var(--text-scale, 1)); padding-top: 3px; }
-  .desktop-ui .rc-notices { flex: none; min-height: 12px; font-size: calc(9px * var(--text-scale, 1)); }
-}
-@media (max-width: 620px) {
-  .rc-config { inset: auto 8px 8px auto; width: calc(100vw - 16px); max-height: calc(100dvh - 32px); }
-  .rc-config-content { padding: 12px; }
-  .rc-center-controls { flex-direction: row; width: 100%; }
 }

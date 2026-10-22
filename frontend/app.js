@@ -477,11 +477,9 @@ async function loadStatus() {
       }
       rotatorControlEnabled = Boolean(status.devices.rotator_enabled);
     }
-    nativeIcomRxActive = status.icom?.enabled === true && status.icom?.rx_native === true;
-    void window.PiSatExperience?.applyStatus(status.icom?.enabled);
+    nativeIcomRxActive = status.icom?.rx_native === true;
     updateManualOffsetControlState();
   } catch (error) {
-    void window.PiSatExperience?.applyStatus(undefined);
     // Other polling paths surface connection failures; avoid repeating log noise here.
   }
 }
@@ -1159,15 +1157,11 @@ async function selectRadioMicrophone(deviceId) {
 }
 
 function showPage(pageName) {
-  let selectedPage = MODULE_NAMES.includes(pageName)
+  const selectedPage = MODULE_NAMES.includes(pageName)
     ? pageName
     : PAGE_NAMES.includes(pageName)
       ? (pageName === 'modules' ? activeModuleName : pageName)
       : 'home';
-  if (
-    window.PiSatExperience?.isPageAvailable(selectedPage) === false
-    || (MODULE_NAMES.includes(selectedPage) && window.PiSatExperience?.isModuleAvailable(selectedPage) === false)
-  ) selectedPage = 'home';
   const primaryPage = MODULE_NAMES.includes(selectedPage) ? 'modules' : selectedPage;
   const primaryPageChanged = primaryPage !== activePrimaryPageName;
   activePrimaryPageName = primaryPage;
@@ -1188,7 +1182,6 @@ function showPage(pageName) {
     button.classList.toggle('active', active);
     button.setAttribute('aria-selected', String(active));
   });
-  window.DesktopUI?.showPage(primaryPage);
   if (selectedPage === 'settings') {
     setActiveSettingsSection(settingsSectionFromHash());
     if (primaryPageChanged || !document.querySelector('[data-settings-panel]')) loadSettings();
@@ -1217,40 +1210,10 @@ function pageFromHash() {
   const route = window.location.hash.replace(/^#/, '').split('/').filter(Boolean);
   const page = route[0] || 'home';
   if (page === 'modules') {
-    const module = MODULE_NAMES.includes(route[1]) ? route[1] : activeModuleName;
-    return window.PiSatExperience?.isModuleAvailable(module) === false ? 'home' : module;
+    return MODULE_NAMES.includes(route[1]) ? route[1] : activeModuleName;
   }
-  if (MODULE_NAMES.includes(page)) return window.PiSatExperience?.isModuleAvailable(page) === false ? 'home' : page;
-  if (window.PiSatExperience?.isPageAvailable(page) === false) return 'home';
+  if (MODULE_NAMES.includes(page)) return page;
   return PAGE_NAMES.includes(page) ? page : 'home';
-}
-
-function refreshExperienceNavigation() {
-  const experience = window.PiSatExperience;
-  if (experience) {
-    document.querySelectorAll('[data-page]').forEach(node => {
-      node.hidden = !experience.isPageAvailable(node.dataset.page);
-    });
-    document.querySelectorAll('[data-module]').forEach(node => {
-      node.hidden = !experience.isModuleAvailable(node.dataset.module);
-    });
-    document.querySelectorAll('[data-enhanced-only]').forEach(node => {
-      node.hidden = !experience.enabled;
-    });
-    if (!experience.isModuleAvailable(activeModuleName)) {
-      activeModuleName = MODULE_NAMES.find(name => experience.isModuleAvailable(name));
-    }
-    const route = window.location.hash.replace(/^#/, '').split('/').filter(Boolean);
-    const requested = route[0] === 'modules' ? route[1] : route[0];
-    if (experience.configured !== null && (
-      experience.isPageAvailable(requested) === false
-      || (MODULE_NAMES.includes(requested) && !experience.isModuleAvailable(requested))
-    )) window.history.replaceState(null, '', '#home');
-  }
-  const refreshSettings = activePrimaryPageName === 'settings';
-  renderPasses(latestPasses);
-  showPage(pageFromHash());
-  if (refreshSettings && activePrimaryPageName === 'settings') void loadSettings();
 }
 
 function settingsSectionFromHash() {
@@ -1603,16 +1566,8 @@ function renderPasses(passes) {
     button.dataset.noradId = satellitePass.norad_id;
     button.dataset.aosUtc = satellitePass.aos_utc;
     const aos = new Date(satellitePass.aos_utc);
-    const selected = Number(satellitePass.norad_id) === Number(selectedSatelliteNorad);
-    button.classList.toggle('selected', selected);
-    button.setAttribute('aria-pressed', String(selected));
-    button.title = `${satellitePass.satellite_name} · ${formatLocalDateOnly(aos)}`;
     const los = new Date(satellitePass.los_utc);
-    button.innerHTML = window.PiSatExperience?.enabled ? `
-      <span>${escapeHtml(satellitePass.satellite_name)}</span>
-      <span>${formatTimeOnly(aos, false)}</span>
-      <span>${Number(satellitePass.max_elevation_deg).toFixed(1)}&deg;</span>
-    ` : `
+    button.innerHTML = `
       <span>${escapeHtml(satellitePass.satellite_name)}</span>
       <span>${formatLocalDateOnly(aos)}</span>
       <span>${formatLocalTimeRange(aos, los)}</span>
@@ -2584,7 +2539,6 @@ async function loadSettings() {
     };
     const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'aprs', 'wsjtx', 'sstv', 'safety'];
     orderedSections.forEach((section) => {
-      if (window.PiSatExperience?.isSettingsSectionAvailable(section) === false) return;
       if (section === 'device_roles') {
         appendToSettingsPanel(section,
           buildMyDevicesSection(
@@ -2647,7 +2601,7 @@ function buildMyDevicesSection(icomKeys, icomSettings, rxSettings, txSettings, c
   native.querySelector('legend').textContent = 'Icom IC-9700';
   const nativeNote = document.createElement('div');
   nativeNote.className = 'automation-settings-note settings-row-wide';
-  nativeNote.textContent = 'Enable the enhanced IC-9700 experience for the desktop radio console, spectrum, audio and native data modules. Leave it disabled for the basic Home page with separate RX/TX tracking controls.';
+  nativeNote.textContent = 'First-class Pi-Sat network control for Radio, spectrum, audio and satellite tracking through one shared native CI-V core.';
   native.insertBefore(nativeNote, native.children[1] || null);
   section.appendChild(native);
 
@@ -4212,9 +4166,7 @@ function buildSettingControl(section, key, value) {
 
   const labelText = document.createElement('span');
   labelText.className = 'form-label mb-0';
-  labelText.textContent = section === 'icom' && key === 'enabled'
-    ? 'Enhanced IC-9700 experience'
-    : section === 'icom' && key === 'serial_port'
+  labelText.textContent = section === 'icom' && key === 'serial_port'
     ? 'Icom CI-V UDP Port'
     : formatSettingLabel(key);
 
@@ -5559,7 +5511,7 @@ function getActiveOrNextPass() {
     return null;
   }
   const bySat = latestPasses
-    .filter((entry) => Number(entry.norad_id) === selectedNorad && Date.parse(entry.los_utc) >= nowMs)
+    .filter((entry) => Number(entry.norad_id) === selectedNorad)
     .sort((left, right) => new Date(left.aos_utc).getTime() - new Date(right.aos_utc).getTime());
   if (!bySat.length) {
     return null;
@@ -5600,7 +5552,7 @@ function drawPassArc() {
   const startX = 18;
   const endX = width - 18;
   const peakX = (startX + endX) / 2;
-  const peakHeight = Math.max(8, Math.min(height - 34, 56, Number(pass.max_elevation_deg) * 0.52));
+  const peakHeight = Math.max(16, Math.min(56, Number(pass.max_elevation_deg) * 0.52));
   const peakY = baseY - peakHeight;
 
   ctx.strokeStyle = '#325f7f';
@@ -5902,7 +5854,7 @@ worldMapImage.addEventListener('load', () => {
   drawQsoMap();
 });
 renderStandardPageHeaders();
-refreshExperienceNavigation();
+showPage(pageFromHash());
 window.addEventListener('hashchange', () => showPage(pageFromHash()));
 window.addEventListener('resize', handleDashboardResize);
 document.addEventListener('visibilitychange', () => {
