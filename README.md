@@ -166,3 +166,6 @@ SSTVFlow and APRS receiver notices are preserved in [THIRD_PARTY_LICENSES.md](TH
 
 Pi-Sat depends on these projects and data sources for core functionality. We
 thank their maintainers for the outstanding work they have done in this space.
+
+### AI Usage
+Let's address the elephant in well.... every room nowadays. This project utilizes AI, Codex in particular with a few other models. I'm not hiding it, I'm embracing it. I've been working with python for the last 12-15 years or so, but recognized the possibilities of what this project could be with some AI assistance. I don't hide that it has been a very helpful tool and helped me put together some pretty cool things. That being said, I always believe in transparency and why I felt the need to at least add this statement. 

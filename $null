@@ -1,5 +1,0 @@
-rg: speed|mode|wsjtx|ft[248]|q65|qso|tx: The filename, directory name, or volume label syntax is incorrect. (os error 123)
-rg: message|band: The filename, directory name, or volume label syntax is incorrect. (os error 123)
-rg: activity|rx: The filename, directory name, or volume label syntax is incorrect. (os error 123)
-rg: frequency|tx: The filename, directory name, or volume label syntax is incorrect. (os error 123)
-rg: frequency|waterfall|slot|cycle": The filename, directory name, or volume label syntax is incorrect. (os error 123)
