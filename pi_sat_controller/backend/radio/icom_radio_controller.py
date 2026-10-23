@@ -199,6 +199,7 @@ class IcomRadioController:
     # never more often than the interval below.
     _SCOPE_STALL_S = 3.0
     _SCOPE_REASSERT_INTERVAL_S = 5.0
+    _TUNING_HISTORY_LIMIT = 64
 
     def __init__(self, config: IcomRadioConfig, connectivity: IcomConnectivity,
                  stop_event: Event | None = None) -> None:
@@ -206,6 +207,7 @@ class IcomRadioController:
         self.connectivity = connectivity
         self._lock = RLock()
         self._audio_lock = Lock()
+        self._tuning_lock = Lock()
         self._scope_lock = Lock()
         self._snapshot_lock = Lock()
         self._operator_lock = Lock()
@@ -233,6 +235,12 @@ class IcomRadioController:
         self._scope_side_mismatch_logged = False
         self._latest_scope: bytes | None = None
         self._audio_subscribers: list[AudioBuffer] = []
+        self._tuning_history: dict[
+            str, deque[tuple[float, int, str | None, int]]
+        ] = {
+            "MAIN": deque(maxlen=self._TUNING_HISTORY_LIMIT),
+            "SUB": deque(maxlen=self._TUNING_HISTORY_LIMIT),
+        }
         self._operator_waiters = 0
         self._connection_generation = 0
         self._lan_if_commanded = False
@@ -430,6 +438,7 @@ class IcomRadioController:
                         self.connectivity.snapshot().get("transport_authenticated", True)
                     )
                     self._connection_generation += 1
+                    self._reset_tuning_history_locked()
                     self._stage = "connected"
                     self._bump_tx_audio_epoch_locked()
                     try:
@@ -1144,7 +1153,7 @@ class IcomRadioController:
             # CI-V lock, so verification by readback is a losing trade here.
             self._civ_transaction_locked(self._frame(0x27, bytes([0x1A, side_code, code])))
             setattr(self._state, f"{side.lower()}_scope_sweep_speed", normalized)
-            return self._state.to_dict()
+            return {**self._state.to_dict(), "scope_setting_side": side}
 
     # Scope reference level (CI-V 27 19): -20.0 to +20.0 dB in 0.5 dB steps.
     _SCOPE_REFERENCE_LIMIT_DB = 20.0
@@ -1177,7 +1186,7 @@ class IcomRadioController:
                 self._frame(0x27, bytes([0x19, side_code]) + magnitude + bytes([sign]))
             )
             setattr(self._state, f"{side.lower()}_scope_reference_db", round(level, 1))
-            return self._state.to_dict()
+            return {**self._state.to_dict(), "scope_setting_side": side}
 
     def configure_microphone(self, use_lan: bool = False, lan_mod_level: int | None = None,
                              use_transport: bool = False,
@@ -1403,6 +1412,20 @@ class IcomRadioController:
 
     def read_audio(self, queue: AudioBuffer) -> list[bytes]:
         return queue.drain()
+
+    def read_audio_timed(self, queue: AudioBuffer) -> list[tuple[float, bytes]]:
+        """Drain audio without taking the CAT/controller lock."""
+
+        return queue.drain_timed()
+
+    def rx_tuning_history(
+        self, side: str = "SUB",
+    ) -> list[tuple[float, int, str | None, int]]:
+        """Return confirmed tuning changes without waiting for CAT."""
+
+        normalized = self._normalize_side(side)
+        with self._tuning_lock:
+            return list(self._tuning_history[normalized])
 
     def drain_scope_packets(self) -> list[bytes]:
         with self._scope_lock:
@@ -1717,13 +1740,14 @@ class IcomRadioController:
     def _service_once(self, timeout_s: float = 0.0) -> None:
         with self._lock:
             incoming = self.connectivity.poll(timeout_s)
+            poll_arrived_at = monotonic()
             for chunk in incoming.control_chunks:
                 self._receive_civ_locked(chunk)
             if incoming.audio_chunks:
                 # The radio can emit a short burst and then pause while it
                 # finishes bringing its LAN audio stream up; that pause is
                 # listening silence, so it is worth seeing in the log.
-                arrived_at = monotonic()
+                arrived_at = poll_arrived_at
                 if (self._last_audio_chunk_at is not None
                         and arrived_at - self._last_audio_chunk_at >= 1.0):
                     LOGGER.info(
@@ -1746,12 +1770,22 @@ class IcomRadioController:
                     self._first_audio_chunks,
                     "an unknown time" if elapsed is None else f"{elapsed:.2f}s",
                 )
-            for pcm in incoming.audio_chunks:
+            audio_arrival_times = self._audio_chunk_end_times(
+                incoming.audio_chunks,
+                poll_arrived_at,
+            )
+            for pcm, arrival_monotonic in zip(
+                incoming.audio_chunks,
+                audio_arrival_times,
+            ):
                 packet = self._browser_audio_packet(pcm)
                 with self._audio_lock:
                     self._audio_queue.append(packet)
                     for queue in self._audio_subscribers:
-                        queue.append(packet)
+                        queue.append(
+                            packet,
+                            arrival_monotonic=arrival_monotonic,
+                        )
                 self._state.rx_audio_packets += 1
 
     def _select_locked(self, physical_side: str, vfo: str | None) -> None:
@@ -1793,7 +1827,7 @@ class IcomRadioController:
         if self._read_side_locked() != side:
             raise IcomRadioError("MAIN/SUB changed during readback; state not applied")
         self._set_frequency_state(side, self._state.vfo, value)
-        setattr(self._state, f"{side.lower()}_mode", {
+        self._set_mode_state(side, {
             0: "LSB", 1: "USB", 2: "AM", 3: "CW", 5: "FM", 7: "CW-R", 0x17: "DV", 0x22: "DD"
         }.get(mode[5]))
         setattr(self._state, f"{side.lower()}_data_mode", data_mode)
@@ -1839,7 +1873,7 @@ class IcomRadioController:
         mode = {
             0: "LSB", 1: "USB", 2: "AM", 3: "CW", 5: "FM", 7: "CW-R", 0x17: "DV", 0x22: "DD"
         }.get(response[5])
-        setattr(self._state, f"{side.lower()}_mode", mode)
+        self._set_mode_state(side, mode)
         setattr(self._state, f"{side.lower()}_data_mode", data_mode)
         setattr(self._state, f"{side.lower()}_filter", data_filter if data_mode else filter_number)
         setattr(self._state, f"{side.lower()}_bandwidth_hz", bandwidth)
@@ -2290,7 +2324,10 @@ class IcomRadioController:
             return
         mode = self._MODE_NAMES.get(value)
         if mode is not None:
-            setattr(self._state, f"{side.lower()}_mode", mode)
+            if getattr(self._state, f"{side.lower()}_mode") != mode:
+                # A mode echo does not report the new mode's filter width.
+                setattr(self._state, f"{side.lower()}_bandwidth_hz", None)
+            self._set_mode_state(side, mode)
 
     def _arm_external_refresh_locked(self, name: str, now: float) -> None:
         self._external_refresh_properties.add(name)
@@ -2379,6 +2416,28 @@ class IcomRadioController:
         self._browser_audio_seq = (self._browser_audio_seq + 1) & 0xFFFF
         return bytes(packet)
 
+    def _audio_chunk_end_times(
+        self,
+        chunks: tuple[bytes, ...],
+        poll_arrived_at: float,
+    ) -> tuple[float, ...]:
+        """Estimate each drained PCM chunk's content end from the poll receipt."""
+
+        channels = 2 if self.config.rx_codec == "lpcm16_stereo" else 1
+        frame_bytes = 2 * channels
+        frame_counts = [
+            max(1, len(pcm) // frame_bytes)
+            for pcm in chunks
+        ]
+        remaining_frames = sum(frame_counts)
+        arrival_times = []
+        for frames in frame_counts:
+            remaining_frames -= frames
+            arrival_times.append(
+                poll_arrived_at - remaining_frames / self.config.sample_rate
+            )
+        return tuple(arrival_times)
+
     def _frame(self, command: int, data: bytes = b"") -> bytes:
         return b"\xfe\xfe" + bytes([self.config.civ_address, self.config.controller_address, command]) + data + b"\xfd"
 
@@ -2433,9 +2492,54 @@ class IcomRadioController:
         raise ValueError("Microphone source must be MIC, ACC, MIC+ACC, USB, MIC+USB or LAN")
 
     def _set_frequency_state(self, side: str, vfo: str | None, frequency_hz: int) -> None:
+        active_vfo = getattr(self._state, f"{side.lower()}_vfo")
+        previous = getattr(self._state, f"{side.lower()}_frequency_hz")
         setattr(self._state, f"{side.lower()}_frequency_hz", frequency_hz)
         if vfo is not None:
             setattr(self._state, f"{side.lower()}_{vfo.lower()}_hz", frequency_hz)
+        if (
+            previous != frequency_hz
+            and (vfo is None or vfo == active_vfo)
+        ):
+            self._record_tuning_event_locked(
+                side,
+                int(frequency_hz),
+                getattr(self._state, f"{side.lower()}_mode"),
+            )
+
+    def _set_mode_state(self, side: str, mode: str | None) -> None:
+        normalized = side.upper()
+        previous = getattr(self._state, f"{normalized.lower()}_mode")
+        setattr(self._state, f"{normalized.lower()}_mode", mode)
+        frequency_hz = getattr(self._state, f"{normalized.lower()}_frequency_hz")
+        if previous != mode and frequency_hz is not None:
+            self._record_tuning_event_locked(
+                normalized,
+                int(frequency_hz),
+                mode,
+            )
+
+    def _record_tuning_event_locked(
+        self,
+        side: str,
+        frequency_hz: int,
+        mode: str | None,
+    ) -> None:
+        normalized = side.upper()
+        generation = self._connection_generation
+        timestamp = monotonic()
+        with self._tuning_lock:
+            history = self._tuning_history[normalized]
+            if history and history[-1][3] != generation:
+                history.clear()
+            if history and history[-1][1:] == (frequency_hz, mode, generation):
+                return
+            history.append((timestamp, frequency_hz, mode, generation))
+
+    def _reset_tuning_history_locked(self) -> None:
+        with self._tuning_lock:
+            for history in self._tuning_history.values():
+                history.clear()
 
     @staticmethod
     def _decode_frequency_response(response: bytes) -> int | None:
@@ -2461,6 +2565,7 @@ class IcomRadioController:
         self._state.connecting = preserve_connecting
         self._state.authenticated = False
         self._serial_buffer.clear()
+        self._reset_tuning_history_locked()
         with self._audio_lock:
             self._audio_queue.clear()
             for queue in self._audio_subscribers:

@@ -11,6 +11,7 @@
   const enableButton = byId('wsjtx-enable');
   const resetButton = byId('wsjtx-reset');
   const engineSelect = byId('wsjtx-engine');
+  const decodeDepthSelect = byId('wsjtx-decode-depth');
   let snapshot = null;
   let selectedEngineKey = '';
   let manualEngineSelection = false;
@@ -21,6 +22,8 @@
   let receivedAt = 0;
   let unavailable = false;
   let pending = false;
+  let haltPending = false;
+  let actionSequence = 0;
   let stopped = false;
   let socket = null;
   let reconnectTimer = null;
@@ -131,6 +134,10 @@
     text('wsjtx-detail', unavailable ? 'Backend connection lost. Reconnecting; readouts show last reported values.'
       : stale() ? 'Waiting for fresh listener status; readouts show last reported values.'
         : managed?.state === 'error' ? managed.detail : managed?.detail || snapshot?.detail || 'Enable UDP reporting in WSJT-X to receive its status and decodes.');
+    const decodeDepth = managed?.decode_depth || 'fast';
+    decodeDepthSelect.value = ['fast', 'normal', 'deep'].includes(decodeDepth) ? decodeDepth : 'fast';
+    decodeDepthSelect.disabled = pending || Boolean(managed?.running) || !snapshot || stale();
+    text('wsjtx-decode-depth-detail', managed?.running ? 'Stop RX before changing decoder depth.' : 'Decoder depth applies when RX starts.');
     const active = managed ? managed.running === true : snapshot?.enabled === true;
     enableButton.textContent = managed ? active ? 'Stop RX' : 'Start RX' : active ? 'Disable listening' : 'Enable listening';
     enableButton.setAttribute('aria-pressed', String(active));
@@ -155,7 +162,7 @@
     tx.textContent = qso?.enabled ? 'Disable TX' : 'Enable TX';
     tx.setAttribute('aria-pressed', String(qso?.enabled === true));
     tx.disabled = disabled;
-    byId('wsjtx-halt').disabled = pending || !qso || !(qso.enabled || qso.transmitting);
+    byId('wsjtx-halt').disabled = haltPending || !qso || !(pending || qso.enabled || qso.transmitting);
     byId('wsjtx-cq').disabled = disabled;
     byId('wsjtx-auto').checked = qso?.auto_sequence !== false;
     byId('wsjtx-auto').disabled = disabled;
@@ -164,18 +171,23 @@
     text('wsjtx-next-slot', qso?.enabled && qso?.next_slot_utc ? `Next TX slot ${utc({ time_utc: qso.next_slot_utc })} UTC` : '');
     const messages = byId('wsjtx-messages');
     messages.disabled = disabled;
-    messages.replaceChildren();
+    if (messages.children.length !== 6) messages.replaceChildren();
     for (let n = 1; n <= 6; n += 1) {
       const entry = qso?.messages?.find(item => item.number === n);
-      const label = document.createElement('label');
-      label.className = 'wsjtx-message-choice';
-      const radio = document.createElement('input');
-      radio.type = 'radio'; radio.name = 'wsjtx-message'; radio.value = String(n);
+      let label = messages.children[n - 1];
+      if (!label) {
+        label = document.createElement('label');
+        label.className = 'wsjtx-message-choice';
+        const radio = document.createElement('input');
+        radio.type = 'radio'; radio.name = 'wsjtx-message'; radio.value = String(n);
+        radio.addEventListener('change', () => { if (radio.checked) void command('/qso/message', { number: n }); });
+        const name = document.createElement('span'); name.className = 'wsjtx-message-number'; name.textContent = `Tx${n}`;
+        const content = document.createElement('span'); content.className = 'wsjtx-message-text';
+        label.append(radio, name, content); messages.append(label);
+      }
+      const radio = label.children[0];
       radio.checked = qso?.selected_message === n; radio.disabled = disabled;
-      radio.addEventListener('change', () => { if (radio.checked) void command('/qso/message', { number: n }); });
-      const name = document.createElement('span'); name.className = 'wsjtx-message-number'; name.textContent = `Tx${n}`;
-      const content = document.createElement('span'); content.className = 'wsjtx-message-text'; content.textContent = entry?.text || '—';
-      label.append(radio, name, content); messages.append(label);
+      label.children[2].textContent = entry?.text || '—';
     }
     const contacts = byId('wsjtx-contacts'); contacts.replaceChildren();
     if (!qso?.contacts?.length) {
@@ -198,7 +210,9 @@
     spectrumSpan = Number.isFinite(spectrum?.span_hz) && spectrum.span_hz > 0 ? spectrum.span_hz : 3000;
     const estimated = !spectrum || spectrum.estimated === true;
     const filter = [1, 2, 3].includes(spectrum?.filter) ? `FIL${spectrum.filter} SSB passband` : 'SSB passband';
-    text('wsjtx-spectrum-span', `0–${Math.round(spectrumSpan)} Hz · ${estimated ? 'estimated SSB width' : filter}`);
+    const incompatibleMode = spectrum?.ssb_compatible === false;
+    const spanLabel = incompatibleMode ? `estimated audio span · SUB ${spectrum.receive_mode}` : estimated ? 'estimated SSB width' : filter;
+    text('wsjtx-spectrum-span', `0–${Math.round(spectrumSpan)} Hz · ${spanLabel}`);
     const limits = offsetLimits();
     const input = byId('wsjtx-offset'); input.min = String(limits.min); input.max = String(limits.max); input.disabled = pending || stale() || qso?.tx_available !== true;
     if (document.activeElement !== input) input.value = String(qso?.tx_offset_hz ?? 1500);
@@ -207,7 +221,11 @@
       const marker = byId(id); marker.hidden = !Number.isFinite(offset); marker.style.left = `${Math.max(0, Math.min(100, (offset || 0) / spectrumSpan * 100))}%`;
     }
     const bins = Array.isArray(spectrum?.bins) ? spectrum.bins : [];
-    text('wsjtx-spectrum-detail', stale() ? 'Audio display is stale. Waiting for backend updates.' : bins.length ? 'Click the passband to set your held TX offset. RX is green; TX is red.' : 'Waiting for receive audio. Click the passband to set your held TX offset.');
+    const invalidSsbWidth = estimated && !incompatibleMode && spectrum?.reported_bandwidth_hz > 3600;
+    text('wsjtx-spectrum-detail', stale() ? 'Audio display is stale. Waiting for backend updates.'
+      : incompatibleMode ? `SUB is reporting ${spectrum.receive_mode}. FT4/FT8 needs USB or LSB; the audio span is estimated.`
+        : invalidSsbWidth ? `Radio reports a ${Math.round(spectrum.reported_bandwidth_hz)} Hz filter width, which is outside the SSB range. The audio span is estimated.`
+          : bins.length ? 'Click the passband to set your held TX offset. RX is green; TX is red.' : 'Waiting for receive audio. Click the passband to set your held TX offset.');
     const canvas = byId('wsjtx-spectrum'); const context = canvas.getContext?.('2d');
     const waterfall = byId('wsjtx-waterfall'); const water = waterfall.getContext?.('2d');
     if (!context || !water) return;
@@ -237,27 +255,37 @@
   }
 
   async function command(path, payload, allowStale = false) {
-    if (pending || !snapshot || (!allowStale && (stale() || snapshot.qso?.tx_available !== true))) return;
+    const halt = path === '/qso/enabled' && payload.enabled === false;
+    if ((pending && !halt) || (halt && haltPending) || !snapshot || (!allowStale && (stale() || snapshot.qso?.tx_available !== true))) return;
+    const action = ++actionSequence;
+    if (halt) haltPending = true;
     pending = true; actionError = ''; renderEngine();
     const requestEpoch = connectionEpoch;
     try {
       const response = await fetch(`/api/wsjtx${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       const result = await response.json();
       if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'Unable to update QSO state.');
-      if (requestEpoch === connectionEpoch) renderSnapshot(result);
+      if (requestEpoch === connectionEpoch && action === actionSequence) renderSnapshot(result);
     } catch (error) {
-      actionError = error.message || 'Unable to update QSO state.';
-      text('wsjtx-qso-detail', actionError);
-      appendMonitor(`command:${Date.now()}`, error.message || 'Unable to update QSO state.', 'error');
-    } finally { pending = false; renderControlsAfterCommand(); }
+      if (requestEpoch === connectionEpoch && action === actionSequence) {
+        actionError = error.message || 'Unable to update QSO state.';
+        text('wsjtx-qso-detail', actionError);
+        appendMonitor(`command:${Date.now()}`, actionError, 'error');
+      }
+    } finally {
+      if (halt) haltPending = false;
+      if (action === actionSequence) pending = false;
+      renderControlsAfterCommand();
+    }
   }
 
   function renderControlsAfterCommand() {
-    const disabled = !snapshot || stale() || snapshot.qso?.tx_available !== true;
-    enableButton.disabled = !snapshot || stale();
+    const disabled = pending || !snapshot || stale() || snapshot.qso?.tx_available !== true;
+    enableButton.disabled = pending || !snapshot || stale();
     resetButton.disabled = pending || !snapshot?.engine;
     for (const id of ['wsjtx-tx-enable', 'wsjtx-cq', 'wsjtx-auto', 'wsjtx-offset', 'wsjtx-messages']) byId(id).disabled = disabled;
-    byId('wsjtx-halt').disabled = !snapshot?.qso || !(snapshot.qso.enabled || snapshot.qso.transmitting);
+    decodeDepthSelect.disabled = pending || Boolean(snapshot?.engine?.running) || !snapshot || stale();
+    byId('wsjtx-halt').disabled = haltPending || !snapshot?.qso || !(pending || snapshot.qso.enabled || snapshot.qso.transmitting);
     for (const label of byId('wsjtx-messages').children) if (label.children[0]?.type === 'radio') label.children[0].disabled = disabled;
     byId('wsjtx-spectrum-hit').setAttribute('aria-disabled', String(disabled));
   }
@@ -375,6 +403,28 @@
     renderEngine();
     renderDecodes();
   });
+  decodeDepthSelect.addEventListener('change', async () => {
+    if (!snapshot || pending || stale()) return;
+    const depth = decodeDepthSelect.value;
+    pending = true;
+    renderEngine();
+    try {
+      const response = await fetch('/api/wsjtx/decode-depth', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ depth }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'Unable to change decoder depth.');
+      renderSnapshot(result);
+    } catch (error) {
+      actionError = error.message || 'Unable to change decoder depth.';
+      text('wsjtx-decode-depth-detail', actionError);
+      renderEngine();
+    } finally {
+      pending = false;
+      renderControlsAfterCommand();
+    }
+  });
   byId('wsjtx-clear').addEventListener('click', () => {
     for (const entry of activityEntries(false)) clearedKeys.add(entry.key);
     selectedDecodeKey = '';
@@ -382,6 +432,7 @@
   });
   enableButton.addEventListener('click', async () => {
     if (!snapshot || pending || stale()) return;
+    const action = ++actionSequence;
     pending = true;
     renderEngine();
     const requestEpoch = connectionEpoch;
@@ -394,13 +445,18 @@
       });
       const result = await response.json();
       if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'Unable to change listening state.');
-      if (requestEpoch === connectionEpoch) renderSnapshot(result);
-    } catch (error) { text('wsjtx-detail', error.message || 'Unable to change listening state.'); }
-    finally { pending = false; renderControlsAfterCommand(); }
+      if (requestEpoch === connectionEpoch && action === actionSequence) renderSnapshot(result);
+    } catch (error) {
+      if (requestEpoch === connectionEpoch && action === actionSequence) text('wsjtx-detail', error.message || 'Unable to change listening state.');
+    } finally {
+      if (action === actionSequence) pending = false;
+      renderControlsAfterCommand();
+    }
   });
 
   resetButton.addEventListener('click', async () => {
     if (!snapshot?.engine || pending) return;
+    const action = ++actionSequence;
     pending = true;
     actionError = '';
     renderEngine();
@@ -411,16 +467,22 @@
       });
       const result = await response.json();
       if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'Unable to reset WSJT-X.');
+      if (requestEpoch !== connectionEpoch || action !== actionSequence) return;
       manualEngineSelection = false;
-      if (requestEpoch === connectionEpoch) renderSnapshot(result);
+      renderSnapshot(result);
       // The backend stops the engine before answering; a resource it could not
       // release is reported as an engine error instead of a clean reset.
       if (result.engine?.state === 'error') throw new Error(result.engine.detail || 'WSJT-X reset did not finish.');
     } catch (error) {
-      const message = error.message || 'Unable to reset WSJT-X.';
-      text('wsjtx-detail', message);
-      appendMonitor(`reset:${Date.now()}`, message, 'error');
-    } finally { pending = false; renderControlsAfterCommand(); }
+      if (requestEpoch === connectionEpoch && action === actionSequence) {
+        const message = error.message || 'Unable to reset WSJT-X.';
+        text('wsjtx-detail', message);
+        appendMonitor(`reset:${Date.now()}`, message, 'error');
+      }
+    } finally {
+      if (action === actionSequence) pending = false;
+      renderControlsAfterCommand();
+    }
   });
 
   byId('wsjtx-tx-enable').addEventListener('click', () => command('/qso/enabled', { enabled: snapshot?.qso?.enabled !== true }));

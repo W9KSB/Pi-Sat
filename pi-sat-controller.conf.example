@@ -118,6 +118,26 @@ full_duplex = true
 scope_enabled = true
 debug_logging = false
 
+[scope]
+# Display levels are relative dB, with a minimum 10 dB window per receiver.
+main_display_min = -160
+main_display_max = 0
+sub_display_min = -160
+sub_display_max = 0
+fill = true
+grid = true
+smooth = true
+hold = false
+# Empty span keeps the radio's current width; supported widths are in Hz.
+span_hz =
+tuning_step_hz = 100
+click_tune_locked = false
+# Empty hardware values leave the radio unchanged until a console control is used.
+main_sweep_speed =
+sub_sweep_speed =
+main_reference_db =
+sub_reference_db =
+
 [aprs]
 # APRS transmit. Dire Wolf's gen_packets modulates each frame and Pi-Sat sends
 # it through the native radio. Transmit stays disabled while mycall is empty.
@@ -153,6 +173,8 @@ discord_webhook_url =
 executable = wsjtx
 callsign =
 mode = FT8
+# Stock decoder depth: fast, normal, or deep.
+decode_depth = fast
 # Local UDP reporting endpoint used by the managed engine.
 udp_host = 127.0.0.1
 udp_port = 2237

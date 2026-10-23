@@ -34,6 +34,8 @@ class WsjtxRxAudioBridge:
         get_block_reason: Callable[[], str] = lambda: "",
         get_playback_environment: Callable[[], dict[str, str]] | None = None,
         on_pcm: Callable[[bytes, int], None] | None = None,
+        process_pcm: Callable[[bytes, int, float], bytes] | None = None,
+        on_batch_end: Callable[[], None] | None = None,
         channel: str = "right",
     ) -> None:
         if channel not in ("left", "right"):
@@ -43,6 +45,8 @@ class WsjtxRxAudioBridge:
         self._get_block_reason = get_block_reason
         self._get_playback_environment = get_playback_environment
         self._on_pcm = on_pcm
+        self._process_pcm = process_pcm
+        self._on_batch_end = on_batch_end
         self._channel = channel
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
@@ -169,6 +173,25 @@ class WsjtxRxAudioBridge:
                 self._detail = "Forwarding native AF audio to the local decoder input"
             deadline = time.monotonic() + _WRITE_TIMEOUT_SECONDS
 
+    def _prepare_pcm(
+        self,
+        packet: bytes,
+        sample_rate: int,
+        arrival_monotonic: float,
+        *,
+        channels: int,
+    ) -> bytes:
+        pcm = extract_mono_pcm(packet, channels, self._channel)
+        if not pcm:
+            raise ValueError("Malformed native RX audio packet; WSJT-X RX audio stopped")
+        if self._process_pcm is not None:
+            corrected = self._process_pcm(pcm, sample_rate, arrival_monotonic)
+            if (not isinstance(corrected, (bytes, bytearray))
+                    or len(corrected) != len(pcm)):
+                raise ValueError("Receive Doppler correction changed the PCM packet size")
+            pcm = bytes(corrected)
+        return pcm
+
     def _prime_playback(self, controller: Any, audio_format: tuple[int, str, int], process: subprocess.Popen) -> None:
         # Wake and drain playback before accepting real samples. Otherwise a
         # sink's initial scheduling delay becomes persistent receive latency.
@@ -256,17 +279,30 @@ class WsjtxRxAudioBridge:
                     self._detail = "Local audio playback started; waiting for native AF PCM"
                 while not self._stop.is_set():
                     self._check_source(controller, audio_queue, audio_format, process)
-                    packets = controller.read_audio(audio_queue)
+                    timed_reader = getattr(controller, "read_audio_timed", None)
+                    if callable(timed_reader):
+                        packets = timed_reader(audio_queue)
+                    else:
+                        now = time.monotonic()
+                        packets = [(now, packet) for packet in controller.read_audio(audio_queue)]
                     self._check_source(controller, audio_queue, audio_format, process)
                     with self._lock:
-                        self._pending_bytes = sum(max(0, len(packet) - 24) // channels for packet in packets)
-                    for packet in packets:
-                        pcm = extract_mono_pcm(packet, channels, self._channel)
-                        if not pcm:
-                            raise ValueError("Malformed native RX audio packet; WSJT-X RX audio stopped")
+                        self._pending_bytes = sum(
+                            max(0, len(packet) - 24) // channels
+                            for _, packet in packets
+                        )
+                    for arrival, packet in packets:
+                        pcm = self._prepare_pcm(
+                            packet,
+                            sample_rate,
+                            arrival,
+                            channels=channels,
+                        )
                         if self._on_pcm is not None:
                             self._on_pcm(pcm, sample_rate)
                         self._write_pcm(pcm, controller, audio_queue, audio_format, process)
+                    if packets and self._on_batch_end is not None:
+                        self._on_batch_end()
                     if not packets:
                         self._wake.wait(0.05)
                         self._wake.clear()

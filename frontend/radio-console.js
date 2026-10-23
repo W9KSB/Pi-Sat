@@ -185,8 +185,9 @@
   let waterfallRows = [];
   const traceY = new Float32Array(512);
   const traceSoft = new Float32Array(512);
-  let traceGradient = null;
-  let traceGradientHeight = -1;
+  let spectrumFillGradient = null;
+  let spectrumFillGradientWidth = -1;
+  let spectrumFillGradientHeight = -1;
   // The waterfall keeps its rows in an offscreen buffer one row taller than the
   // visible canvas. Each sweep inserts a row at the top and the visible canvas
   // is drawn at a fractional offset, so 4-5 sweeps/s glide instead of jumping.
@@ -219,9 +220,10 @@
     return flags;
   }
   const display = loadDisplayFlags();
-  function saveDisplayFlags() {
+  function saveDisplayFlags(key) {
     try { localStorage.setItem(DISPLAY_STORAGE_KEY, JSON.stringify(display)); }
     catch { /* Display toggles still work when browser storage is unavailable. */ }
+    queueScopeSettings({ [key]: display[key] });
   }
   function syncDisplayControls() {
     root.querySelectorAll('[data-action="hold"],[data-action="fill"],[data-action="grid"],[data-action="smooth"]')
@@ -262,12 +264,87 @@
     return ranges;
   }
   const levelRanges = loadLevelRanges();
-  // Fixed relative-level color mapping shared by the trace and waterfall.
+  let scopeSettingsReady = false;
+  let scopeSettingsSaving = false;
+  let scopeSettingsTimer = null;
+  let pendingScopeSettings = {};
+  const editedScopeSettings = new Set();
+  let scopeSettingsError = '';
+  function queueScopeSettings(patch) {
+    Object.keys(patch).forEach(key => editedScopeSettings.add(key));
+    Object.assign(pendingScopeSettings, patch);
+    clearTimeout(scopeSettingsTimer);
+    scopeSettingsTimer = setTimeout(() => { void flushScopeSettings(); }, 300);
+  }
+  async function scopeSettingsRequest(method, patch, keepalive = false) {
+    const response = await fetch('/api/radio/scope-settings', {
+      method, headers: { 'Content-Type': 'application/json' }, keepalive: keepalive || method === 'PATCH',
+      ...(patch ? { body: JSON.stringify(patch) } : {}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || 'Configuration request failed');
+    return result.settings;
+  }
+  async function flushScopeSettings(keepalive = false) {
+    if (!scopeSettingsReady || scopeSettingsSaving) return;
+    scopeSettingsSaving = true;
+    try {
+      while (Object.keys(pendingScopeSettings).length) {
+        const patch = pendingScopeSettings;
+        pendingScopeSettings = {};
+        try {
+          await scopeSettingsRequest('PATCH', patch, keepalive);
+          if (scopeSettingsError && $('rc-command-status').textContent === scopeSettingsError) consoleApi.error('');
+          scopeSettingsError = '';
+        } catch (error) {
+          pendingScopeSettings = { ...patch, ...pendingScopeSettings };
+          scopeSettingsError = `Spectrum settings are not saved: ${error.message}`;
+          consoleApi.error(scopeSettingsError);
+          break;
+        }
+      }
+    } finally { scopeSettingsSaving = false; }
+  }
+  async function loadScopeSettings() {
+    try {
+      const saved = await scopeSettingsRequest('GET');
+      const apply = (key, setter) => {
+        if (!editedScopeSettings.has(key)) setter(saved[key]);
+      };
+      for (const key of Object.keys(display)) apply(key, value => { display[key] = value; });
+      for (const side of ['MAIN', 'SUB']) {
+        for (const edge of ['min', 'max']) {
+          apply(`${side.toLowerCase()}_display_${edge}`, value => { levelRanges[side][edge] = value; });
+        }
+      }
+      apply('span_hz', value => { requestedSpan = value; $('rc-span').value = value === null ? '' : String(value); });
+      apply('tuning_step_hz', value => { $('rc-step').value = String(value); });
+      apply('click_tune_locked', value => { $('rc-lock').checked = value; });
+      syncDisplayControls();
+      syncLevelControls();
+      maxBins = null;
+      paintSpectrum();
+      repaintWaterfall();
+      if (display.smooth) requestScroll();
+      else { scrollOffset = 0; paintWaterfall(); }
+    } catch (error) {
+      consoleApi.error(`Spectrum configuration could not be loaded; using browser defaults: ${error.message}`);
+    } finally {
+      scopeSettingsReady = true;
+      scopeSyncQueued = true;
+      void syncListeningScope();
+      if (Object.keys(pendingScopeSettings).length) void flushScopeSettings();
+    }
+  }
+  // Fixed relative-level color mapping for waterfall history.
   // Warm colors start below full scale so ordinary strong signals are visible;
   // this changes display contrast, never the received amplitudes or RF scale.
   const intensityStops = [[0, [1, 5, 20]], [0.08, [0, 12, 100]], [0.20, [0, 72, 250]],
     [0.34, [0, 220, 255]], [0.46, [55, 245, 115]], [0.58, [255, 236, 45]],
     [0.70, [255, 62, 32]], [1, [255, 35, 30]]];
+  const spectrumFillStops = [[0, '#111a64'], [0.14, '#1644c0'], [0.28, '#008cdd'],
+    [0.39, '#00d6d0'], [0.48, '#49df74'], [0.57, '#e7ed58'], [0.66, '#ffae43'],
+    [0.78, '#f45441'], [1, '#ffdbcf']];
   const palette = Array.from({ length: 161 }, (_, value) => {
     const level = value / 160;
     const upper = intensityStops.findIndex(([at]) => at >= level);
@@ -285,9 +362,11 @@
     const displayDb = Number(value) - 160;
     return Math.max(0, Math.min(160, Math.round((displayDb - range.min) / (range.max - range.min) * 160)));
   }
-  function saveLevelRanges() {
+  function saveLevelRanges(side) {
     try { localStorage.setItem(LEVEL_STORAGE_KEY, JSON.stringify(levelRanges)); }
     catch { /* Display controls still work when browser storage is unavailable. */ }
+    queueScopeSettings({ [`${side.toLowerCase()}_display_min`]: levelRanges[side].min,
+      [`${side.toLowerCase()}_display_max`]: levelRanges[side].max });
   }
   function syncLevelControls(bounds = scope) {
     const range = levelRange(bounds);
@@ -312,7 +391,7 @@
     if (edge === 'min') current.min = Math.min(value, current.max - DISPLAY_DB_LIMITS.gap);
     else current.max = Math.max(value, current.min + DISPLAY_DB_LIMITS.gap);
     levelRanges[key] = validLevelRange(current);
-    saveLevelRanges();
+    saveLevelRanges(key);
     syncLevelControls();
     scheduleLevelPaint();
   }
@@ -580,7 +659,7 @@
     }
   }
   async function syncListeningScope() {
-    if (scopeSyncRunning || busy || !state.connected || !streamHealthy) return;
+    if (!scopeSettingsReady || scopeSyncRunning || busy || !state.connected || !streamHealthy) return;
     scopeSyncRunning = true;
     try {
       // Do not lose a listening change during another scope request. Coalesce
@@ -705,7 +784,8 @@
       display[action] = !display[action];
       if (action === 'hold') maxBins = null;
       node.setAttribute('aria-pressed', String(display[action]));
-      saveDisplayFlags();
+      saveDisplayFlags(action);
+      void flushScopeSettings();
       if (action === 'smooth') {
         // Turning smoothing off drops the glide and shows whole rows again.
         if (display.smooth) requestScroll();
@@ -793,11 +873,23 @@
   }
   $('rc-span').addEventListener('change', () => {
     requestedSpan = Number($('rc-span').value) || null;
+    queueScopeSettings({ span_hz: requestedSpan });
+    void flushScopeSettings();
     scopeSyncQueued = true;
     void syncListeningScope();
   });
+  $('rc-step').addEventListener('change', () => {
+    queueScopeSettings({ tuning_step_hz: Number($('rc-step').value) });
+    void flushScopeSettings();
+  });
+  $('rc-lock').addEventListener('change', () => {
+    queueScopeSettings({ click_tune_locked: $('rc-lock').checked });
+    void flushScopeSettings();
+  });
+  window.addEventListener('pagehide', () => { void flushScopeSettings(true); });
   for (const edge of ['min', 'max']) {
     $(`rc-level-${edge}`).addEventListener('input', event => updateLevelRange(edge, event.target.value));
+    $(`rc-level-${edge}`).addEventListener('change', () => { void flushScopeSettings(); });
   }
   const queueRit = bindAdjustment($('rc-rit-offset'), 'sub-rit', offset_hz => ({ offset_hz, enabled: offset_hz !== 0 }), -9900, 9900, 100);
   $('rc-rit-form').addEventListener('submit', event => {
@@ -1193,7 +1285,8 @@
       // and the bright outline instead of re-deriving all 475 points twice.
       // Smoothing is display-only: a light three-point average takes the edge
       // off bin-to-bin noise, and the underlying bins never change.
-      const scaleY = (height - 12) / 160;
+      const traceTop = 12;
+      const scaleY = (height - traceTop) / 160;
       let points = values;
       if (display.smooth && values.length > 2) {
         for (let index = 0; index < values.length; index++) {
@@ -1215,14 +1308,13 @@
       edge();
       if (fill) {
         ctx.lineTo(width, height); ctx.lineTo(0, height); ctx.closePath();
-        if (!traceGradient || traceGradientHeight !== height) {
-          traceGradient = ctx.createLinearGradient(0, height, 0, 12);
-          for (const [level, rgb] of intensityStops) {
-            traceGradient.addColorStop(level, `rgba(${rgb.join(',')},${0.85 + level * 0.15})`);
-          }
-          traceGradientHeight = height;
+        if (!spectrumFillGradient || spectrumFillGradientWidth !== width || spectrumFillGradientHeight !== height) {
+          spectrumFillGradient = ctx.createLinearGradient(0, height, 0, traceTop);
+          for (const [level, color] of spectrumFillStops) spectrumFillGradient.addColorStop(level, color);
+          spectrumFillGradientWidth = width;
+          spectrumFillGradientHeight = height;
         }
-        ctx.fillStyle = traceGradient; ctx.fill();
+        ctx.fillStyle = spectrumFillGradient; ctx.fill();
         // Rebuild only the trace edge, so the bright outline does not close
         // around the bottom/sides of the filled polygon.
         edge();
@@ -1230,7 +1322,7 @@
       ctx.strokeStyle = color; ctx.lineWidth = fill ? 1 : 1.2; ctx.stroke();
     };
     if (display.hold && maxBins) trace(maxBins, '#be995b', false);
-    trace(scope.bins, '#b7eeff', display.fill);
+    trace(scope.bins, '#effcff', display.fill);
   }
   function subscribe() {
     try {
@@ -1287,6 +1379,7 @@
   }).observe($('rc-spectrum'));
   syncLevelControls();
   syncDisplayControls();
+  void loadScopeSettings();
   paintSpectrum();
   consoleApi.render({});
   renderTrackingSummary();

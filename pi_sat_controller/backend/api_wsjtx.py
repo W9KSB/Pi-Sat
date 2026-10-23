@@ -14,6 +14,7 @@ def register_wsjtx_api(
     get_engine: Callable[[], Any] | None = None,
     get_qso: Callable[[], Any] | None = None,
     get_spectrum: Callable[[], Any] | None = None,
+    save_settings: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     def snapshot() -> dict[str, Any]:
         result = get_manager().snapshot()
@@ -85,6 +86,21 @@ def register_wsjtx_api(
             get_qso().set_enabled(False)
         get_engine().stop()
         get_manager().set_enabled(False)
+        return snapshot()
+
+    @app.post("/api/wsjtx/decode-depth")
+    def set_decode_depth(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        depth = str(payload.get("depth", "")).strip().lower()
+        if depth not in {"fast", "normal", "deep"}:
+            raise HTTPException(status_code=400, detail="depth must be fast, normal, or deep")
+        if save_settings is None:
+            raise HTTPException(status_code=503, detail="WSJT-X settings are unavailable")
+        if get_engine is not None and get_engine().snapshot().get("running"):
+            raise HTTPException(status_code=409, detail="Stop WSJT-X RX before changing decoder depth")
+        try:
+            save_settings({"wsjtx": {"decode_depth": depth}})
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         return snapshot()
 
     @app.post("/api/wsjtx/qso/target")

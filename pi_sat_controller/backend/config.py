@@ -190,6 +190,7 @@ class WsjtxConfig:
     executable: str = "wsjtx"
     callsign: str = ""
     mode: str = "FT8"
+    decode_depth: str = "fast"
     udp_host: str = "127.0.0.1"
     udp_port: int = 2237
     client_timeout_seconds: int = 45
@@ -245,6 +246,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
     if not loaded:
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
+    if parser.has_section("scope"):
+        _parse_scope_settings(dict(parser.items("scope")))
     cat_devices = _load_cat_devices(parser)
 
     return AppConfig(
@@ -362,6 +365,7 @@ def _load_wsjtx_config(parser: ConfigParser) -> WsjtxConfig:
         executable=_get_text(parser, "wsjtx", "executable", "wsjtx"),
         callsign=_get_text(parser, "wsjtx", "callsign", "").upper(),
         mode=_get_text(parser, "wsjtx", "mode", "FT8").upper(),
+        decode_depth=_get_text(parser, "wsjtx", "decode_depth", "fast").lower(),
         udp_host=_get_text(parser, "wsjtx", "udp_host", "127.0.0.1"),
         udp_port=_get_int(parser, "wsjtx", "udp_port", 2237),
         client_timeout_seconds=_get_int(parser, "wsjtx", "client_timeout_seconds", 45),
@@ -371,6 +375,8 @@ def _load_wsjtx_config(parser: ConfigParser) -> WsjtxConfig:
         raise ValueError("[wsjtx] udp_host must be a nonempty address")
     if config.mode not in ("FT4", "FT8"):
         raise ValueError("[wsjtx] mode must be FT4 or FT8")
+    if config.decode_depth not in ("fast", "normal", "deep"):
+        raise ValueError("[wsjtx] decode_depth must be fast, normal, or deep")
     if not 1 <= config.udp_port <= 65535:
         raise ValueError("[wsjtx] udp_port must be between 1 and 65535")
     if not 1 <= config.client_timeout_seconds <= 3600:
@@ -657,7 +663,85 @@ CAT_DEVICE_FIELDS = [
 ]
 
 
+SCOPE_DEFAULTS: dict[str, Any] = {
+    "main_display_min": -160, "main_display_max": 0,
+    "sub_display_min": -160, "sub_display_max": 0,
+    "fill": True, "grid": True, "smooth": True, "hold": False,
+    "span_hz": None, "tuning_step_hz": 100, "click_tune_locked": False,
+    "main_sweep_speed": None, "sub_sweep_speed": None,
+    "main_reference_db": None, "sub_reference_db": None,
+}
+SCOPE_HARDWARE_KEYS = {f"{side}_{field}" for side in ("main", "sub")
+                       for field in ("sweep_speed", "reference_db")}
+
+
+def validate_scope_settings(values: dict[str, Any]) -> None:
+    """Validate typed scope preferences before writing the shared config."""
+    if not isinstance(values, dict):
+        raise ValueError("Spectrum settings must be an object")
+    for key, value in values.items():
+        if key not in SCOPE_DEFAULTS:
+            raise ValueError(f"Unknown spectrum setting: {key}")
+        if isinstance(SCOPE_DEFAULTS[key], bool):
+            valid = type(value) is bool
+        elif key.endswith("display_min") or key.endswith("display_max"):
+            valid = type(value) in (int, float) and math.isfinite(value) and -160 <= value <= 0
+        elif key.endswith("sweep_speed"):
+            valid = value is None or (type(value) is str and value in {"fast", "mid", "slow"})
+        elif key.endswith("reference_db"):
+            valid = value is None or (type(value) in (int, float) and math.isfinite(value)
+                                      and -20 <= value <= 20 and value * 2 == round(value * 2))
+        elif key == "span_hz":
+            valid = value is None or (type(value) is int and value in
+                                      {5000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000})
+        else:
+            valid = type(value) is int and value in {10, 100, 1000, 10000}
+        if not valid:
+            raise ValueError(f"Invalid spectrum setting: {key}")
+    for side in ("main", "sub"):
+        if f"{side}_display_min" in values and f"{side}_display_max" in values:
+            if values[f"{side}_display_max"] - values[f"{side}_display_min"] < 10:
+                raise ValueError("Spectrum display range must span at least 10 dB")
+
+
+def load_scope_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+    return _parse_scope_settings(load_settings(path)["scope"])
+
+
+def _parse_scope_settings(raw: dict[str, str]) -> dict[str, Any]:
+    values = dict(SCOPE_DEFAULTS)
+    for key, default in values.items():
+        text = raw.get(key, "").strip()
+        if not text:
+            continue
+        if isinstance(default, bool):
+            if text.lower() not in {"true", "false"}:
+                raise ValueError(f"Invalid spectrum setting: {key}")
+            values[key] = text.lower() == "true"
+        elif key.endswith("sweep_speed"):
+            values[key] = text
+        elif "display_" in key or key.endswith("reference_db"):
+            values[key] = float(text)
+        else:
+            values[key] = int(text)
+    validate_scope_settings(values)
+    return values
+
+
+def save_scope_settings(patch: dict[str, Any], path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+    with config_transaction():
+        validate_scope_settings(patch)
+        current = load_scope_settings(path)
+        current.update(patch)
+        validate_scope_settings(current)
+        encoded = {key: ("" if value is None else str(value).lower() if type(value) is bool else str(value))
+                   for key, value in patch.items()}
+        save_settings({"scope": encoded}, path=path, validate_role_assignments=False)
+        return current
+
+
 SETTINGS_SCHEMA: dict[str, list[str]] = {
+    "scope": list(SCOPE_DEFAULTS),
     "server": ["host", "port", "gui_resources_caching", "https_enabled", "https_port",
                "tls_certfile", "tls_keyfile", "tls_names"],
     "station": ["name", "grid_locator", "latitude_deg", "longitude_deg", "elevation_m"],
@@ -742,6 +826,7 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "executable",
         "callsign",
         "mode",
+        "decode_depth",
         "udp_host",
         "udp_port",
         "client_timeout_seconds",
@@ -915,6 +1000,7 @@ def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str,
     for key, default in {
         "executable": "wsjtx",
         "mode": "FT8",
+        "decode_depth": "fast",
         "udp_host": "127.0.0.1", "udp_port": "2237",
         "client_timeout_seconds": "45", "max_decodes": "300",
     }.items():
@@ -981,6 +1067,7 @@ def save_settings(
                     current[role]["device_id"] = id_mapping[selected_id]
 
         _apply_station_grid_locator(current)
+        _parse_scope_settings(current["scope"])
         if validate_role_assignments:
             _validate_role_device_assignments(current, current_cat_devices)
 
@@ -1196,6 +1283,10 @@ def _render_settings(
     values = section("icom")
     lines.append("# Native IC-9700 control over the LAN transport; one Pi-Sat process owns it.")
     _append_keys(lines, values, SETTINGS_SCHEMA["icom"])
+    lines.append("")
+    values = section("scope")
+    lines.append("# Radio console spectrum preferences. Empty hardware values leave radio settings unchanged.")
+    _append_keys(lines, values, SETTINGS_SCHEMA["scope"])
     lines.append("")
     values = section("aprs")
     lines.append("# APRS transmit. Dire Wolf's gen_packets modulates the frame and")

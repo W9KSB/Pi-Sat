@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from threading import RLock
 from collections.abc import Callable
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
+
+from pi_sat_controller.backend.config import SCOPE_HARDWARE_KEYS, validate_scope_settings
 
 from pi_sat_controller.backend.radio.audio_websocket import stream_audio, stream_microphone
 from pi_sat_controller.backend.radio.audio_webrtc import (
@@ -40,11 +43,74 @@ def register_radio_api(
     app: FastAPI,
     *,
     get_controller: Callable[[], Any],
+    load_scope_settings: Callable[[], dict[str, Any]] | None = None,
+    save_scope_settings: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> None:
     # Count microphone uplinks so closing an RX listener cannot unkey a
     # transmission another session is feeding.
     microphone_sessions = 0
     webrtc_audio = WebrtcAudioTransport(get_controller=get_controller)
+    scope_lock = RLock()
+    restored_session: tuple[Any, int] | None = None
+    restored_sides: set[str] = set()
+
+    @app.get("/api/radio/scope-settings")
+    def get_scope_settings() -> dict[str, Any]:
+        if load_scope_settings is None:
+            raise HTTPException(status_code=503, detail="Spectrum configuration is unavailable.")
+        try:
+            return {"settings": load_scope_settings()}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.patch("/api/radio/scope-settings")
+    def update_scope_settings(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        if save_scope_settings is None:
+            raise HTTPException(status_code=503, detail="Spectrum configuration is unavailable.")
+        try:
+            if SCOPE_HARDWARE_KEYS.intersection(payload):
+                raise ValueError("Radio scope settings must be applied through the radio controls.")
+            validate_scope_settings(payload)
+            with scope_lock:
+                return {"settings": save_scope_settings(payload)}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Spectrum settings were not saved: {exc}") from exc
+
+    def persist_hardware_setting(result: dict[str, Any], field: str, requested_side: Any) -> None:
+        side = str(result.pop("scope_setting_side", requested_side)).lower()
+        if save_scope_settings is None:
+            return
+        if side not in {"main", "sub"}:
+            raise RuntimeError("Radio setting applied, but its receiver side could not be saved.")
+        patch = {f"{side}_{field}": result[side][f"scope_{field}"]}
+        if patch:
+            try:
+                save_scope_settings(patch)
+            except Exception as exc:
+                raise RuntimeError(f"Radio setting applied, but spectrum configuration was not saved: {exc}") from exc
+
+    def restore_scope_settings(controller: Any, side: str) -> dict[str, Any] | None:
+        nonlocal restored_session
+        if load_scope_settings is None:
+            return None
+        session = (controller, controller.connection_generation())
+        if restored_session != session:
+            restored_session = session
+            restored_sides.clear()
+        if side in restored_sides:
+            return None
+        settings = load_scope_settings()
+        result = None
+        speed = settings[f"{side.lower()}_sweep_speed"]
+        reference = settings[f"{side.lower()}_reference_db"]
+        if speed is not None:
+            result = controller.set_scope_sweep_speed(speed, side)
+        if reference is not None:
+            result = controller.set_scope_reference_level(reference, side)
+        restored_sides.add(side)
+        return result
 
     @app.get("/api/radio")
     def get_radio() -> dict[str, object]:
@@ -147,7 +213,13 @@ def register_radio_api(
         if controller is None:
             raise HTTPException(status_code=409, detail="Advanced Icom control is disabled.")
         try:
-            return {"ok": True, **controller.scope_configure(payload["physical_side"], payload.get("enabled", True), payload.get("span_hz"))}
+            with scope_lock:
+                side = str(payload["physical_side"]).upper()
+                result = controller.scope_configure(side, payload.get("enabled", True), payload.get("span_hz"))
+                if payload.get("enabled", True):
+                    result = restore_scope_settings(controller, side) or result
+                result.pop("scope_setting_side", None)
+                return {"ok": True, **result}
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -159,8 +231,16 @@ def register_radio_api(
         if controller is None:
             raise HTTPException(status_code=409, detail="Advanced Icom control is disabled.")
         try:
-            return {"ok": True, **controller.set_scope_sweep_speed(
-                payload["speed"], payload.get("physical_side"))}
+            with scope_lock:
+                speed = payload["speed"]
+                if isinstance(speed, str):
+                    speed = speed.strip().lower()
+                validate_scope_settings({"main_sweep_speed": speed})
+                if speed is None:
+                    raise ValueError("Scope sweep speed is required")
+                result = controller.set_scope_sweep_speed(speed, payload.get("physical_side"))
+                persist_hardware_setting(result, "sweep_speed", payload.get("physical_side"))
+                return {"ok": True, **result}
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -172,8 +252,14 @@ def register_radio_api(
         if controller is None:
             raise HTTPException(status_code=409, detail="Advanced Icom control is disabled.")
         try:
-            return {"ok": True, **controller.set_scope_reference_level(
-                payload["level_db"], payload.get("physical_side"))}
+            with scope_lock:
+                level = payload["level_db"]
+                validate_scope_settings({"main_reference_db": level})
+                if level is None:
+                    raise ValueError("Scope reference level is required")
+                result = controller.set_scope_reference_level(level, payload.get("physical_side"))
+                persist_hardware_setting(result, "reference_db", payload.get("physical_side"))
+                return {"ok": True, **result}
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:

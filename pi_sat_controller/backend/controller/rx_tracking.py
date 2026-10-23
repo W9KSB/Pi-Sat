@@ -8,8 +8,10 @@ offsets remain stable user intent while Doppler is recalculated each cycle.
 """
 
 from contextlib import nullcontext
+from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from math import isfinite
 from threading import Event, Lock, Thread
 from time import monotonic
 from types import SimpleNamespace
@@ -26,6 +28,7 @@ from pi_sat_controller.backend.models import (
     TransponderProfile,
 )
 from pi_sat_controller.backend.orbital.doppler import (
+    SPEED_OF_LIGHT_M_S,
     doppler_shift_hz,
     uplink_doppler_correction_hz,
 )
@@ -125,6 +128,7 @@ class RxTrackingManager:
         self._stop = Event()
         self._wake = Event()
         self._lock = Lock()
+        self._doppler_lock = Lock()
         self._update_lock = Lock()
         self._thread: Thread | None = None
         self._active = False
@@ -139,6 +143,10 @@ class RxTrackingManager:
         self._tx_session_ready = False
         self._rx_session_generation: int | None = None
         self._tx_session_generation: int | None = None
+        self._doppler_session_generation = 0
+        self._doppler_context_epoch = 0
+        self._doppler_samples: deque[tuple[float, float]] = deque(maxlen=8)
+        self._audio_doppler_state: dict[str, Any] | None = None
         self._last_pass_active = False
         self._last_commanded_rx_hz: int | None = None
         self._last_commanded_tx_hz: int | None = None
@@ -180,6 +188,7 @@ class RxTrackingManager:
             was_active = self._active
             self._active = True
             if not was_active:
+                self._invalidate_audio_doppler_state(session_break=True)
                 self._rx_session_ready = False
                 self._tx_session_ready = False
         self._set_background_polling_enabled(False)
@@ -193,6 +202,7 @@ class RxTrackingManager:
     def stop(self) -> None:
         with self._lock:
             self._active = False
+            self._invalidate_audio_doppler_state()
             self._last_snapshot = replace(self._last_snapshot, active=False)
         self._set_background_polling_enabled(True)
         self._wake.set()
@@ -200,6 +210,7 @@ class RxTrackingManager:
     def shutdown(self) -> None:
         with self._lock:
             self._active = False
+            self._invalidate_audio_doppler_state()
         self._set_background_polling_enabled(True)
         self._stop.set()
         self._wake.set()
@@ -226,6 +237,7 @@ class RxTrackingManager:
                 self._tx_session_ready = False
                 self._rx_session_generation = None
                 self._tx_session_generation = None
+                self._invalidate_audio_doppler_state(session_break=True)
                 if manual_offset_readback_active_pass_only is not None:
                     self.manual_offset_readback_active_pass_only = bool(
                         manual_offset_readback_active_pass_only
@@ -259,6 +271,7 @@ class RxTrackingManager:
                 self._last_observed_tx_hz = None
                 self._last_rx_write_at = 0.0
                 self._last_tx_write_at = 0.0
+                self._invalidate_audio_doppler_state(session_break=True)
         self.refresh_snapshot_only()
         self._wake.set()
 
@@ -266,12 +279,111 @@ class RxTrackingManager:
         with self._lock:
             return self._last_snapshot
 
+    def audio_doppler_state(self) -> dict[str, Any] | None:
+        """Return cached causal RX Doppler metadata without doing radio work."""
+
+        with self._doppler_lock:
+            if self._audio_doppler_state is None:
+                return None
+            return self._audio_doppler_state.copy()
+
+    def _invalidate_audio_doppler_state(
+        self,
+        *,
+        session_break: bool = False,
+        context_changed: bool = True,
+    ) -> None:
+        with self._doppler_lock:
+            if session_break:
+                self._doppler_session_generation += 1
+            if context_changed:
+                self._doppler_context_epoch += 1
+            self._doppler_samples.clear()
+            self._audio_doppler_state = None
+
+    def _publish_audio_doppler_state(
+        self,
+        sample_time: float,
+        range_rate_m_s: float,
+        user_downlink_offset_hz: float,
+        user_uplink_offset_hz: float,
+        virtual_rit_hz: float,
+        manual_offsets_enabled: bool,
+        sync_offsets: bool,
+    ) -> None:
+        if not isfinite(sample_time) or not isfinite(range_rate_m_s):
+            return
+        smooth_doppler_hz = (
+            -float(self.transponder.preferred_downlink)
+            * float(range_rate_m_s)
+            / SPEED_OF_LIGHT_M_S
+        )
+        target_hz = (
+            float(self.transponder.preferred_downlink)
+            + smooth_doppler_hz
+            + float(user_downlink_offset_hz)
+            + float(virtual_rit_hz)
+        )
+        if not isfinite(target_hz):
+            return
+        with self._doppler_lock:
+            identity = (
+                "rx-doppler-v1",
+                self._doppler_session_generation,
+                self.satellite.name,
+                self.satellite.norad_id,
+                self.transponder.name,
+                self.transponder.preferred_downlink,
+                self.transponder.preferred_uplink,
+                self.transponder.downlink_mode,
+                self._rx_only,
+                float(user_downlink_offset_hz),
+                float(user_uplink_offset_hz),
+                float(virtual_rit_hz),
+                bool(manual_offsets_enabled),
+                bool(sync_offsets),
+            )
+            samples = self._doppler_samples
+            if samples and sample_time == samples[-1][0]:
+                samples[-1] = (sample_time, target_hz)
+            elif samples and sample_time < samples[-1][0]:
+                samples.clear()
+                samples.append((sample_time, target_hz))
+            else:
+                samples.append((sample_time, target_hz))
+            rate_hz_s = 0.0
+            if len(samples) >= 2:
+                origin_time = samples[-1][0]
+                mean_x = sum(
+                    sample_time - origin_time for sample_time, _ in samples
+                ) / len(samples)
+                mean_y = sum(
+                    target for _, target in samples
+                ) / len(samples)
+                denominator = sum(
+                    (sample_time - origin_time - mean_x) ** 2
+                    for sample_time, _ in samples
+                )
+                if denominator > 1e-12:
+                    numerator = sum(
+                        (sample_time - origin_time - mean_x) * (target - mean_y)
+                        for sample_time, target in samples
+                    )
+                    rate_hz_s = numerator / denominator
+            self._audio_doppler_state = {
+                "sample_time": float(sample_time),
+                "target_hz": float(target_hz),
+                "rate_hz_s": float(rate_hz_s),
+                "identity": identity,
+            }
+
     def reset_offset(self) -> RxTrackingSnapshot:
         with self._lock:
             self._user_downlink_offset_hz = 0
             self._user_uplink_offset_hz = 0
             self._virtual_rit_hz = 0
             self._sync_enable_pending = False
+            self._invalidate_audio_doppler_state(session_break=True)
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
         self._wake.set()
         return snapshot
@@ -279,6 +391,7 @@ class RxTrackingManager:
     def reset_virtual_rit(self) -> RxTrackingSnapshot:
         with self._lock:
             self._virtual_rit_hz = 0
+            self._invalidate_audio_doppler_state(session_break=True)
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
         self._wake.set()
         return snapshot
@@ -291,6 +404,7 @@ class RxTrackingManager:
                 self._user_uplink_offset_hz = 0
                 self._virtual_rit_hz = 0
                 self._sync_enable_pending = False
+            self._invalidate_audio_doppler_state(session_break=True)
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
         self._wake.set()
         return snapshot
@@ -306,6 +420,7 @@ class RxTrackingManager:
                 and self._manual_offsets_enabled
                 and (sync_already_pending or not sync_already_enabled)
             )
+            self._invalidate_audio_doppler_state(session_break=True)
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
         self._wake.set()
         return snapshot
@@ -320,6 +435,7 @@ class RxTrackingManager:
                         delta_hz,
                         self.transponder,
                     )
+            self._invalidate_audio_doppler_state(session_break=True)
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
         self._wake.set()
         return snapshot
@@ -328,6 +444,7 @@ class RxTrackingManager:
         with self._lock:
             if self._manual_offsets_enabled:
                 self._virtual_rit_hz += delta_hz
+            self._invalidate_audio_doppler_state(session_break=True)
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
         self._wake.set()
         return snapshot
@@ -347,6 +464,7 @@ class RxTrackingManager:
                         delta_hz,
                         self.transponder,
                     )
+            self._invalidate_audio_doppler_state(session_break=True)
         snapshot = self._apply_current_plan(write_rx=False, write_tx=False)
         self._wake.set()
         return snapshot
@@ -491,13 +609,19 @@ class RxTrackingManager:
                 # milliseconds and must not hold the controller lock that PTT,
                 # transmit audio and telemetry all need.
                 position = self.orbital_engine.get_position(self.satellite.norad_id)
+                sample_time = monotonic()
                 errors: list[str] = []
                 # The rotator is a separate device on its own transport, so it
                 # runs outside the batch: a slow rotctld round trip must not
                 # extend the radio lock hold that receive audio waits on.
                 self._apply_rotator(position, write_devices=True, errors=errors)
                 with self._radio_operation_batch():
-                    self._apply_update(position, write_devices=True, errors=errors)
+                    self._apply_update(
+                        position,
+                        write_devices=True,
+                        errors=errors,
+                        sample_time=sample_time,
+                    )
             except Exception as exc:
                 self._record_error(str(exc))
 
@@ -505,9 +629,15 @@ class RxTrackingManager:
         with self._update_lock:
             try:
                 position = self.orbital_engine.get_position(self.satellite.norad_id)
+                sample_time = monotonic()
                 errors: list[str] = []
                 self._apply_rotator(position, write_devices=False, errors=errors)
-                self._apply_update(position, write_devices=False, errors=errors)
+                self._apply_update(
+                    position,
+                    write_devices=False,
+                    errors=errors,
+                    sample_time=sample_time,
+                )
             except Exception as exc:
                 self._record_error(str(exc))
 
@@ -516,9 +646,12 @@ class RxTrackingManager:
         position: SatellitePosition,
         write_devices: bool,
         errors: list[str] | None = None,
+        sample_time: float | None = None,
     ) -> None:
         """Applies one orbital position update to the radio and the snapshot."""
 
+        if sample_time is None:
+            sample_time = monotonic()
         pass_active = bool(position.elevation_deg >= 0.0)
         pass_transition: str | None = None
         downlink_doppler = doppler_shift_hz(
@@ -540,6 +673,19 @@ class RxTrackingManager:
             sync_enable_pending = self._sync_enable_pending
             last_commanded = self._last_commanded_rx_hz
             last_commanded_tx_hz = self._last_commanded_tx_hz
+            doppler_context_epoch = self._doppler_context_epoch
+            if tracking_active:
+                self._publish_audio_doppler_state(
+                    sample_time,
+                    position.range_rate_m_s,
+                    user_offset,
+                    user_uplink_offset,
+                    virtual_rit_hz,
+                    manual_offsets_enabled,
+                    sync_offsets,
+                )
+            else:
+                self._invalidate_audio_doppler_state(context_changed=False)
 
         current_rx_hz = self.sdr_manager.snapshot().frequency_hz
         current_tx_hz: int | None = None
@@ -552,7 +698,6 @@ class RxTrackingManager:
             downlink_doppler,
             uplink_doppler or 0,
         )
-
         commanded_rx_hz = self._last_commanded_rx_hz
         commanded_tx_hz = self._last_commanded_tx_hz
         if errors is None:
@@ -652,6 +797,10 @@ class RxTrackingManager:
                             self._last_commanded_tx_hz = current_tx_hz
                             self._last_commanded_at = monotonic()
                             self._sync_enable_pending = False
+                            self._invalidate_audio_doppler_state(
+                                session_break=True,
+                                context_changed=False,
+                            )
                         plan = self._build_plan(
                             user_offset,
                             user_uplink_offset,
@@ -668,6 +817,10 @@ class RxTrackingManager:
                         with self._lock:
                             self._sync_offsets = False
                             self._sync_enable_pending = False
+                            self._invalidate_audio_doppler_state(
+                                session_break=True,
+                                context_changed=False,
+                            )
             elif manual_offsets_enabled and (rx_delta is not None or tx_delta is not None):
                 if rx_delta is not None and tx_delta is not None and sync_offsets:
                     sync_offsets = False
@@ -697,6 +850,10 @@ class RxTrackingManager:
                         self._last_commanded_at = monotonic()
                     if tx_delta is not None:
                         self._last_commanded_tx_hz = current_tx_hz
+                    self._invalidate_audio_doppler_state(
+                        session_break=True,
+                        context_changed=False,
+                    )
                 last_commanded = current_rx_hz if rx_delta is not None else last_commanded
                 last_commanded_tx_hz = (
                     current_tx_hz if tx_delta is not None else last_commanded_tx_hz
@@ -831,6 +988,19 @@ class RxTrackingManager:
                 last_update_at_utc=_utc_now(),
                 error=" | ".join(errors) if errors else None,
             )
+            if (
+                self._active
+                and self._doppler_context_epoch == doppler_context_epoch
+            ):
+                self._publish_audio_doppler_state(
+                    sample_time,
+                    position.range_rate_m_s,
+                    self._user_downlink_offset_hz,
+                    self._user_uplink_offset_hz,
+                    self._virtual_rit_hz,
+                    self._manual_offsets_enabled,
+                    False if self._rx_only else self._sync_offsets,
+                )
             snapshot = self._last_snapshot
 
         if write_devices and pass_transition:
@@ -1166,6 +1336,7 @@ class RxTrackingManager:
 
     def _record_error(self, error: str) -> None:
         with self._lock:
+            self._invalidate_audio_doppler_state(session_break=True)
             current = self._last_snapshot
             self._last_snapshot = RxTrackingSnapshot(
                 active=bool(self._active),

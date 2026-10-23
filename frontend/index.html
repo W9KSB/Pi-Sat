@@ -821,9 +821,9 @@
               <div class="card-body">
                 <div class="wsjtx-toolbar-main">
                   <div class="d-flex flex-wrap align-items-center gap-2"><h2 class="h5 mb-0">FT4 / FT8</h2><span id="wsjtx-mode" class="wsjtx-badge">—</span><span id="wsjtx-state" class="wsjtx-badge" role="status">Loading</span></div>
-                  <div class="wsjtx-listener-controls"><label for="wsjtx-engine" class="small text-body-secondary">Engine</label><select id="wsjtx-engine" class="form-select form-select-sm" aria-label="WSJT-X engine" disabled><option value="">No engine</option></select><button id="wsjtx-enable" class="btn btn-primary" type="button" aria-pressed="false" disabled>Start RX</button><button id="wsjtx-reset" class="btn btn-outline-warning" type="button" disabled>Reset</button></div>
+                  <div class="wsjtx-listener-controls"><label for="wsjtx-engine" class="small text-body-secondary">Engine</label><select id="wsjtx-engine" class="form-select form-select-sm" aria-label="WSJT-X engine" disabled><option value="">No engine</option></select><label for="wsjtx-decode-depth" class="small text-body-secondary">Decode speed</label><select id="wsjtx-decode-depth" class="form-select form-select-sm" aria-label="WSJT-X decode speed" disabled><option value="fast">Fast</option><option value="normal">Normal</option><option value="deep">Deep</option></select><button id="wsjtx-enable" class="btn btn-primary" type="button" aria-pressed="false" disabled>Start RX</button><button id="wsjtx-reset" class="btn btn-outline-warning" type="button" disabled>Reset</button></div>
                 </div>
-                <p id="wsjtx-detail" class="small text-body-secondary mt-2 mb-0">Loading WSJT-X listener status.</p>
+                <p id="wsjtx-detail" class="small text-body-secondary mt-2 mb-0">Loading WSJT-X listener status.</p><p id="wsjtx-decode-depth-detail" class="small text-body-secondary mt-1 mb-0">Decode speed applies when RX starts.</p>
               </div>
             </div>
             <section class="card wsjtx-spectrum-panel" aria-label="Digital audio passband">
@@ -892,6 +892,6 @@
     <script src="/audio-stream.js?v=20260928-external-data1"></script>
     <script src="/sstv.js?v=20261008-wsjtx-tx1"></script>
     <script src="/aprs.js?v=20260914-aprs4"></script>
-    <script src="/wsjtx.js?v=20261016-wsjtx-reset1"></script>
+    <script src="/wsjtx.js?v=20261022-wsjtx-tx1"></script>
   </body>
 </html>

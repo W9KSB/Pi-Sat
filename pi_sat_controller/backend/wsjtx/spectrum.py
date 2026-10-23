@@ -17,6 +17,7 @@ _UPDATE_SECONDS = 0.2
 _STALE_SECONDS = 2.0
 _FLOOR_DBFS = -100.0
 _FALLBACK_SPAN_HZ = 3000.0
+_MAX_SSB_BANDWIDTH_HZ = 3600.0
 
 
 class WsjtxAudioSpectrum:
@@ -24,8 +25,8 @@ class WsjtxAudioSpectrum:
 
     ``feed`` accepts complete signed 16-bit little-endian mono samples. Odd
     byte counts and invalid sample rates raise ValueError without changing the
-    previous spectrum. The display span uses cached bandwidth readback; an
-    unknown bandwidth uses an explicitly estimated 3000 Hz span.
+    previous spectrum. The display span uses valid cached SSB bandwidth readback;
+    other modes or unavailable widths use an explicitly estimated 3000 Hz span.
     """
 
     def __init__(self, *, get_controller: Callable[[], Any]) -> None:
@@ -70,7 +71,7 @@ class WsjtxAudioSpectrum:
             self._generation += 1
 
     def snapshot(self) -> dict[str, Any]:
-        bandwidth, filter_number, connected = self._radio_metadata()
+        bandwidth, filter_number, connected, mode, reported_width = self._radio_metadata()
         now = time.monotonic()
         with self._lock:
             estimated = bandwidth is None
@@ -84,6 +85,9 @@ class WsjtxAudioSpectrum:
                 "available": available,
                 "span_hz": span,
                 "bandwidth_hz": bandwidth,
+                "reported_bandwidth_hz": reported_width,
+                "receive_mode": mode,
+                "ssb_compatible": mode in ("USB", "LSB", "USB-DATA", "LSB-DATA") if mode else None,
                 "filter": filter_number,
                 "estimated": estimated,
                 "sample_rate": self._sample_rate,
@@ -119,23 +123,33 @@ class WsjtxAudioSpectrum:
         np.maximum.at(output, buckets, self._levels[:count])
         return np.round(output, 2).tolist()
 
-    def _radio_metadata(self) -> tuple[float | None, int | None, bool]:
+    def _radio_metadata(self) -> tuple[float | None, int | None, bool, str | None, float | None]:
         try:
             controller = self._get_controller()
             if controller is None:
-                return None, None, False
+                return None, None, False, None, None
             # try_snapshot reads cached state and never issues a CAT command.
             state = controller.try_snapshot()
             if not isinstance(state, dict):
-                return None, None, True
+                return None, None, True, None, None
             sub = state.get("sub") or {}
             width = sub.get("bandwidth_hz")
             bandwidth = float(width) if isinstance(width, (int, float)) and not isinstance(width, bool) else None
             if bandwidth is not None and (not math.isfinite(bandwidth) or bandwidth <= 0):
                 bandwidth = None
+            reported_width = bandwidth
+            mode = sub.get("mode")
+            mode = mode.upper() if isinstance(mode, str) and mode else None
+            if mode in ("USB", "LSB") and sub.get("data_mode") is True:
+                mode += "-DATA"
+            # FM/DV IF filter widths do not describe the demodulated AF span.
+            # SSB widths beyond the IC-9700's range are stale or invalid metadata.
+            if ((mode and mode not in ("USB", "LSB", "USB-DATA", "LSB-DATA"))
+                    or (bandwidth is not None and bandwidth > _MAX_SSB_BANDWIDTH_HZ)):
+                bandwidth = None
             filter_number = sub.get("filter")
             if type(filter_number) is not int or filter_number not in (1, 2, 3):
                 filter_number = None
-            return bandwidth, filter_number, state.get("connected") is not False
+            return bandwidth, filter_number, state.get("connected") is not False, mode, reported_width
         except Exception:
-            return None, None, True
+            return None, None, True, None, None

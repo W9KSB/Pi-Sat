@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import configparser
 import logging
-import math
 import os
 import re
 import select
@@ -19,10 +18,13 @@ from typing import Any
 
 from .audio_rx import WsjtxRxAudioBridge
 from .audio_tx import WsjtxTxAudioBridge
-from .control import WsjtxControl
+from .control import WsjtxControl, WsjtxControlCancelled
+from .rx_doppler import WsjtxRxDoppler
 from .spectrum import WsjtxAudioSpectrum
 
 LOGGER = logging.getLogger(__name__)
+
+_DECODE_DEPTH_VALUES = {"fast": 1, "normal": 2, "deep": 3}
 
 
 class WsjtxEngine:
@@ -40,12 +42,15 @@ class WsjtxEngine:
         get_controller: Callable[[], Any],
         get_block_reason: Callable[[], str],
         get_manager: Callable[[], Any] | None = None,
+        get_rx_tracking_manager: Callable[[], Any] | None = None,
     ) -> None:
         self._root = Path(project_root) / "data" / "wsjtx" / "engine"
         self._get_settings = get_settings
         self._get_block_reason = get_block_reason
         self._get_controller = get_controller
         self._lock = threading.RLock()
+        self._state_lock = threading.RLock()
+        self._tx_operation_lock = threading.Lock()
         self._process: subprocess.Popen | None = None
         self._display_process: subprocess.Popen | None = None
         self._bus_process: subprocess.Popen | None = None
@@ -60,8 +65,9 @@ class WsjtxEngine:
         self._started_at = 0.0
         self._generation = 0
         self._mode = "FT8"
-        self._pending_tx: tuple[str, int, bool] | None = None
-        self._tx_enable_at: float | None = None
+        self._decode_depth = "fast"
+        self._pending_tx: tuple[int, str, int, bool] | None = None
+        self._tx_epoch = 0
         self._last_radio = None
         self._last_radio_state: dict = {}
         self._last_radio_seen = 0.0
@@ -71,6 +77,10 @@ class WsjtxEngine:
                                     get_started_at=lambda: self._started_at,
                                     get_environment=self._playback_environment)
         self.spectrum = WsjtxAudioSpectrum(get_controller=get_controller)
+        self._rx_doppler = WsjtxRxDoppler(
+            get_controller=get_controller,
+            get_tracking_manager=get_rx_tracking_manager,
+        )
         self._state = "stopped"
         self._detail = "Managed WSJT-X receive engine is stopped."
         self._monitor_stop = threading.Event()
@@ -80,6 +90,8 @@ class WsjtxEngine:
             playback_command=self._playback_command,
             get_playback_environment=self._playback_environment,
             on_pcm=self.spectrum.feed,
+            process_pcm=self._rx_doppler.process_pcm,
+            on_batch_end=self._rx_doppler.finish_batch,
             channel="right",
         )
         self._tx_audio = WsjtxTxAudioBridge(
@@ -110,66 +122,108 @@ class WsjtxEngine:
                     and self._tx_audio.snapshot().get("state") != "error")
 
     def configure_tx(self, message: str, offset_hz: int, tx_even: bool) -> None:
-        with self._lock:
-            if not self._tx_available():
-                raise RuntimeError("Connect the native radio and start managed RX before enabling TX.")
-            if self._tx_audio.snapshot()["transmitting"] or self._control.status().get("transmitting"):
-                self._pending_tx = (message, offset_hz, tx_even)
-                return
-            restore_enabled = self._control.status().get("tx_enabled") is True
-            self._control.configure(message, offset_hz, tx_even)
-            self._tx_audio.prepare(message)
-            if restore_enabled and self._tx_audio.snapshot()["enabled"]:
-                self._arm_stock()
-            self._pending_tx = None
+        with self._tx_operation_lock:
+            with self._state_lock:
+                self._tx_epoch += 1
+                epoch = self._tx_epoch
+                self._pending_tx = None
+            self._configure_tx_epoch(epoch, message, offset_hz, tx_even)
 
-    def set_tx_enabled(self, enabled: bool) -> None:
-        with self._lock:
-            if not enabled:
-                self.halt_tx()
-                return
+    def set_tx_enabled(
+        self, enabled: bool, *, cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        if not enabled:
+            self.halt_tx()
+            return
+        with self._tx_operation_lock:
+            with self._state_lock:
+                epoch = self._tx_epoch
+            superseded = lambda: (
+                not self._tx_epoch_is_current(epoch)
+                or (cancelled is not None and cancelled())
+            )
+            if superseded():
+                raise WsjtxControlCancelled("Transmit request was superseded")
             if not self._tx_available():
                 raise RuntimeError("Managed native transmit is unavailable.")
-            self._tx_audio.set_enabled(True)
             try:
-                self._arm_stock()
+                if superseded():
+                    raise WsjtxControlCancelled("Transmit request was superseded")
+                # Halt cannot acquire this operation lock, so cleanup of any
+                # claim made here remains bound to this serialized request.
+                self._tx_audio.set_enabled(True)
+                if superseded():
+                    raise WsjtxControlCancelled("Transmit request was superseded")
+                self._arm_stock(epoch, cancelled)
             except Exception:
                 self._tx_audio.set_enabled(False)
                 raise
 
-    def _arm_stock(self) -> None:
-        status = self._control.status()
-        period = 7.5 if status.get("mode") == "FT4" else 15.0
-        even = status.get("tx_even")
-        now = time.time()
-        slot = math.floor(now / period)
-        # Native discovery and activation need time before the selected slot.
-        # Stock accepts late starts, so never begin setup inside that slot.
-        if type(even) is bool:
-            selected_slot = ((slot % 2 == 0) == even)
-            scheduled = self._tx_enable_at is not None and now >= self._tx_enable_at
-            target = (slot + (2 if selected_slot else 1)) * period
-            if selected_slot or (not scheduled and target - now < 2.0):
-                if not selected_slot:
-                    target += 2 * period
-                self._tx_enable_at = target - 2.0
-                return
-        self._tx_enable_at = None
-        self._control.set_enabled(True)
+    def _tx_epoch_is_current(self, epoch: int) -> bool:
+        with self._state_lock:
+            return self._tx_epoch == epoch
+
+    def _check_tx_epoch(self, epoch: int) -> None:
+        if not self._tx_epoch_is_current(epoch):
+            raise WsjtxControlCancelled("Transmit request was superseded")
+
+    def _configure_tx_epoch(
+        self, epoch: int, message: str, offset_hz: int, tx_even: bool,
+    ) -> None:
+        self._check_tx_epoch(epoch)
+        if not self._tx_available():
+            raise RuntimeError("Connect the native radio and start managed RX before enabling TX.")
+        if self._tx_audio.snapshot()["transmitting"] or self._control.status().get("transmitting"):
+            with self._state_lock:
+                if self._tx_epoch == epoch:
+                    self._pending_tx = (epoch, message, offset_hz, tx_even)
+            return
+        restore_enabled = self._control.status().get("tx_enabled") is True
+        cancelled = lambda: not self._tx_epoch_is_current(epoch)
+        self._control.configure(message, offset_hz, tx_even, cancelled=cancelled)
+        self._check_tx_epoch(epoch)
+        self._tx_audio.prepare(message)
+        self._check_tx_epoch(epoch)
+        if restore_enabled and self._tx_audio.snapshot()["enabled"]:
+            self._arm_stock(epoch)
+        with self._state_lock:
+            if self._pending_tx is not None and self._pending_tx[0] == epoch:
+                self._pending_tx = None
+
+    def _arm_stock(
+        self, epoch: int | None = None, cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        if epoch is None:
+            with self._state_lock:
+                epoch = self._tx_epoch
+        superseded = lambda: (
+            not self._tx_epoch_is_current(epoch)
+            or (cancelled is not None and cancelled())
+        )
+        if superseded():
+            raise WsjtxControlCancelled("Transmit request was superseded")
+        self._control.set_enabled(True, cancelled=superseded)
+        if superseded():
+            raise WsjtxControlCancelled("Transmit request was superseded")
 
     def halt_tx(self) -> None:
-        with self._lock:
-            self._tx_enable_at = None
+        # Invalidate work first. A slow native helper that completes later must
+        # never re-arm the station after this Halt request.
+        with self._state_lock:
+            self._tx_epoch += 1
             self._pending_tx = None
-            problem = None
-            try:
-                if self._control.status().get("connected"):
-                    self._control.halt()
-            except Exception as error:
-                problem = error
+        problem = None
+        try:
             self._tx_audio.set_enabled(False)
-            if problem is not None:
-                raise RuntimeError(str(problem)) from problem
+        except Exception as error:
+            problem = error
+        try:
+            if self._control.status().get("connected"):
+                self._control.halt()
+        except Exception as error:
+            problem = problem or error
+        if problem is not None:
+            raise RuntimeError(str(problem)) from problem
 
     def _playback_command(self, sample_rate: int) -> list[str]:
         return [
@@ -263,7 +317,7 @@ class WsjtxEngine:
         self._environment["DBUS_SESSION_BUS_ADDRESS"] = value
         self._environment.pop("AT_SPI_BUS_ADDRESS", None)
 
-    def _settings(self) -> tuple[str, str, str, int, str]:
+    def _settings(self) -> tuple[str, str, str, int, str, str]:
         settings = self._get_settings()
         executable = settings.get("executable", "wsjtx")
         if not isinstance(executable, str) or not executable.strip():
@@ -282,9 +336,15 @@ class WsjtxEngine:
         mode = str(settings.get("mode", "FT8")).upper()
         if mode not in ("FT4", "FT8"):
             raise ValueError("Managed WSJT-X mode must be FT4 or FT8.")
-        return self._executable(executable.strip()), callsign, grid, port, mode
+        decode_depth = str(settings.get("decode_depth", "fast")).lower().strip()
+        if decode_depth not in _DECODE_DEPTH_VALUES:
+            raise ValueError("Managed WSJT-X decode depth must be fast, normal, or deep.")
+        return self._executable(executable.strip()), callsign, grid, port, mode, decode_depth
 
-    def _write_profile(self, callsign: str, grid: str, port: int, mode: str) -> Path:
+    def _write_profile(self, callsign: str, grid: str, port: int, mode: str,
+                       decode_depth: str = "fast") -> Path:
+        if decode_depth not in _DECODE_DEPTH_VALUES:
+            raise ValueError("Managed WSJT-X decode depth must be fast, normal, or deep.")
         config_dir = self._root / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
         (self._root / "data").mkdir(parents=True, exist_ok=True)
@@ -300,8 +360,8 @@ class WsjtxEngine:
             "SoundOutName": self.TX_SINK_NAME, "AudioOutputChannel": "Mono",
             "MonitorOFF": "false", "MonitorLastUsed": "false",
         }
-        config["Common"] = {"AutoSeq": "false", "Mode": mode, "HoldTxFreq": "true",
-                            "TxFreq": "1500"}
+        config["Common"] = {"AutoSeq": "false", "Mode": mode, "NDepth": str(_DECODE_DEPTH_VALUES[decode_depth]),
+                            "HoldTxFreq": "true", "TxFreq": "1500"}
         # Stock decode bounds follow its Wide Graph, even on a private display.
         # Cover the supported audio range independently of Pi-Sat's filter span.
         config["WideGraph"] = {"StartFreq": "0", "BinsPerPixel": "8", "PlotWidth": "1000"}
@@ -410,6 +470,7 @@ class WsjtxEngine:
             self._log_file = None
         self._display = ""
         self.spectrum.reset()
+        self._rx_doppler.reset("Managed receive engine stopped")
         if failures:
             LOGGER.warning("Managed WSJT-X cleanup reported %d failure(s): %s", len(failures), "; ".join(failures))
         return failures
@@ -460,43 +521,59 @@ class WsjtxEngine:
                 raise
         setattr(self, attribute, None)
 
-    def _snapshot_locked(self) -> dict[str, Any]:
-        running = self._process is not None and self._process.poll() is None
+    def _snapshot_current(self) -> dict[str, Any]:
+        with self._state_lock:
+            process = self._process
+            running = process is not None and process.poll() is None
+            state, detail = self._state, self._detail
+            display = self._display
+            module_id, generation = self._module_id, self._generation
+            mode = self._mode
+            decode_depth = self._decode_depth
+            pending = self._pending_tx is not None
         stock = self._control.status()
         tx = self._tx_audio.snapshot()
         return {
-            "running": running, "state": self._state, "detail": self._detail,
-            "pid": self._process.pid if running else None, "display": self._display,
+            "running": running, "state": state, "detail": detail,
+            "pid": process.pid if running else None, "display": display,
             "profile": str(self._root / "config" / f"WSJT-X - {self.RIG_NAME}.ini"),
-            "sink": self.SINK_NAME if self._module_id is not None else "",
-            "audio": self._audio.snapshot(),
+            "sink": self.SINK_NAME if module_id is not None else "",
+            "decode_depth": decode_depth,
+            "audio": {**self._audio.snapshot(), "doppler": self._rx_doppler.snapshot()},
             "tx": {**tx, "available": self._tx_available(), "connected": stock.get("connected", False),
-                   "offset_hz": stock.get("tx_df_hz", 1500), "mode": self._mode,
-                   "generation": self._generation, "client_key": stock.get("client_key", ""),
-                   "stock_transmitting": stock.get("transmitting", False)},
+                   "offset_hz": stock.get("tx_df_hz", 1500), "mode": mode,
+                   "generation": generation, "client_key": stock.get("client_key", ""),
+                   "stock_transmitting": stock.get("transmitting", False),
+                   "configuration_pending": pending},
         }
 
     def snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            return self._snapshot_locked()
+        return self._snapshot_current()
+
+    def rx_audio_frequency_hz(self, offset_hz: int) -> int | None:
+        if self._state != "running" or not self._audio.snapshot().get("running"):
+            return None
+        return self._rx_doppler.rx_audio_frequency_hz(offset_hz)
 
     def start(self) -> dict[str, Any]:
         with self._lock:
             if self._process is not None and self._process.poll() is None:
-                return self._snapshot_locked()
+                return self._snapshot_current()
             # Always reclaim outstanding work first: a previous stop can leave a
             # live audio worker with no module or process reference left behind.
             failures = self._cleanup()
             if failures:
-                self._state, self._detail = "error", "; ".join(failures)
-                return self._snapshot_locked()
-            self._state, self._detail = "starting", "Preparing the managed WSJT-X receive engine."
+                with self._state_lock:
+                    self._state, self._detail = "error", "; ".join(failures)
+                return self._snapshot_current()
+            with self._state_lock:
+                self._state, self._detail = "starting", "Preparing the managed WSJT-X receive engine."
             try:
                 reason = self._get_block_reason()
                 if reason:
                     raise RuntimeError(reason)
-                executable, callsign, grid, port, mode = self._settings()
-                self._mode = mode
+                executable, callsign, grid, port, mode, decode_depth = self._settings()
+                self._mode, self._decode_depth = mode, decode_depth
                 self._pactl = self._executable("pactl")
                 self._pacat = self._executable("pacat")
                 xvfb = self._executable("Xvfb")
@@ -518,7 +595,7 @@ class WsjtxEngine:
                 if not tx_module.isdecimal():
                     raise RuntimeError("PulseAudio did not return a transmit sink module ID.")
                 self._tx_module_id = tx_module
-                self._write_profile(callsign, grid, port, mode)
+                self._write_profile(callsign, grid, port, mode, decode_depth)
                 self._log_file = (self._root / "engine.log").open("ab")
                 self._start_bus()
                 self._start_display(xvfb)
@@ -549,55 +626,56 @@ class WsjtxEngine:
                 threading.Thread(target=self._monitor, args=(self._monitor_stop,), name="wsjtx-engine", daemon=True).start()
             except Exception as error:
                 failures = self._cleanup()
-                self._state = "error"
-                self._detail = "; ".join([str(error), *failures])
+                with self._state_lock:
+                    self._state = "error"
+                    self._detail = "; ".join([str(error), *failures])
                 LOGGER.warning("Managed WSJT-X start failed: %s", self._detail)
-            return self._snapshot_locked()
+            return self._snapshot_current()
 
     def _monitor(self, stop: threading.Event) -> None:
         while not stop.wait(0.25):
-            with self._lock:
-                if stop.is_set():
-                    return
-                reason = ""
-                if self._process is not None and self._process.poll() is not None:
-                    reason = f"WSJT-X exited with code {self._process.returncode}; inspect the engine log."
-                elif self._display_process is not None and self._display_process.poll() is not None:
-                    reason = "The private WSJT-X display exited."
-                elif self._bus_process is not None and self._bus_process.poll() is not None:
-                    reason = "The private WSJT-X session bus exited."
-                else:
-                    audio = self._audio.snapshot()
-                    if audio.get("state") == "error":
-                        reason = audio.get("detail") or "Native receive audio bridge failed."
-                    elif self._tx_audio.snapshot().get("state") == "error":
-                        reason = self._tx_audio.snapshot().get("detail") or "Native transmit audio bridge failed."
-                    elif self._pending_tx is not None and not self._tx_audio.snapshot()["transmitting"] and not self._control.status().get("transmitting"):
-                        pending = self._pending_tx
-                        self._pending_tx = None
-                        try:
-                            restore_enabled = self._control.status().get("tx_enabled") is True
-                            self._control.configure(*pending)
-                            self._tx_audio.prepare(pending[0])
-                            if restore_enabled and self._tx_audio.snapshot()["enabled"]:
-                                self._arm_stock()
-                        except Exception as error:
-                            reason = f"Transmit preparation failed: {error}"
-                    if not reason and self._tx_enable_at is not None and time.time() >= self._tx_enable_at:
-                        try:
-                            if not self._tx_audio.snapshot()["enabled"] or not self._tx_available():
-                                raise RuntimeError("Managed transmit source is no longer ready")
-                            self._arm_stock()
-                        except Exception as error:
-                            reason = f"Transmit arming failed: {error}"
-                if reason:
-                    failures = self._cleanup()
+            if stop.is_set():
+                return
+            with self._state_lock:
+                process, display, bus = self._process, self._display_process, self._bus_process
+                pending = self._pending_tx
+            reason = ""
+            if process is not None and process.poll() is not None:
+                reason = f"WSJT-X exited with code {process.returncode}; inspect the engine log."
+            elif display is not None and display.poll() is not None:
+                reason = "The private WSJT-X display exited."
+            elif bus is not None and bus.poll() is not None:
+                reason = "The private WSJT-X session bus exited."
+            else:
+                audio = self._audio.snapshot()
+                tx_audio = self._tx_audio.snapshot()
+                if audio.get("state") == "error":
+                    reason = audio.get("detail") or "Native receive audio bridge failed."
+                elif tx_audio.get("state") == "error":
+                    reason = tx_audio.get("detail") or "Native transmit audio bridge failed."
+                elif pending is not None and not tx_audio["transmitting"] and not self._control.status().get("transmitting"):
+                    with self._tx_operation_lock:
+                        with self._state_lock:
+                            current_pending = self._pending_tx
+                            if current_pending is pending:
+                                self._pending_tx = None
+                        if current_pending is pending:
+                            try:
+                                self._configure_tx_epoch(*pending)
+                            except WsjtxControlCancelled:
+                                pass
+                            except Exception as error:
+                                reason = f"Transmit preparation failed: {error}"
+            if reason:
+                failures = self._cleanup()
+                with self._state_lock:
                     self._state, self._detail = "error", "; ".join([reason, *failures])
-                    return
+                return
 
     def stop(self) -> dict[str, Any]:
         with self._lock:
             failures = self._cleanup()
-            self._state = "error" if failures else "stopped"
-            self._detail = "; ".join(failures) if failures else "Managed WSJT-X receive engine is stopped."
-            return self._snapshot_locked()
+            with self._state_lock:
+                self._state = "error" if failures else "stopped"
+                self._detail = "; ".join(failures) if failures else "Managed WSJT-X receive engine is stopped."
+            return self._snapshot_current()

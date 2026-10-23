@@ -16,6 +16,11 @@ LOGGER = logging.getLogger(__name__)
 class WsjtxTxAudioBridge:
     """Deliver the managed decoder's isolated output through the shared radio."""
 
+    _SLOT_PERIODS_S = {"FT4": 7.5, "FT8": 15.0}
+    _SLOT_RELEASE_GUARD_S = 0.05
+    _STATUS_TAIL_S = 0.15
+    _CLOSED_INTENT_WITHOUT_SEQUENCE = object()
+
     def __init__(self, *, get_controller: Callable[[], Any], get_status: Callable[[], dict],
                  get_block_reason: Callable[[], str], capture_command: Callable[[int], list[str]],
                  get_environment: Callable[[], dict[str, str]], request_status: Callable[[], Any] | None = None) -> None:
@@ -45,6 +50,10 @@ class WsjtxTxAudioBridge:
         self._detail = ""
         self._keyed_at = 0.0
         self._tail_until: float | None = None
+        self._slot_deadline: float | None = None
+        self._closed_intent_sequence: int | object | None = None
+        self._enable_generation = 0
+        self._ptt_unconfirmed = False
         self._radio_state: dict = {}
         self._radio_seen_at = 0.0
 
@@ -54,7 +63,8 @@ class WsjtxTxAudioBridge:
                     "transmitting": self._transmitting, "message": self._message,
                     "sample_rate": self._rate, "frames": self._frames, "sequence": self._sequence,
                     "capture_running": self._process is not None and self._process.poll() is None,
-                    "owns_transmit": self._token is not None}
+                    "owns_transmit": self._token is not None,
+                    "ptt_unconfirmed": self._ptt_unconfirmed}
 
     def prepare(self, message: str) -> None:
         with self._lock:
@@ -96,16 +106,25 @@ class WsjtxTxAudioBridge:
             self._stop = threading.Event()
             self._process, self._rate = process, sample_rate
             self._frames = 0
+            self._ptt_unconfirmed = False
+            self._slot_deadline = None
+            self._closed_intent_sequence = None
             self._state, self._detail = "listening", "Managed TX output is isolated; transmitter is disabled."
             self._thread = threading.Thread(target=self._run, name="wsjtx-tx-audio", daemon=True)
             self._thread.start()
 
     def set_enabled(self, enabled: bool) -> None:
-        with self._operation:
-            if not enabled:
+        if not enabled:
+            self._request_disarm()
+            with self._operation:
                 self._disable()
-                return
+            return
+        with self._lock:
+            generation = self._enable_generation
+        with self._operation:
             with self._lock:
+                if generation != self._enable_generation:
+                    raise RuntimeError("Managed transmit enable was cancelled.")
                 if self._enabled:
                     return
                 if self._process is None or self._process.poll() is not None or self._state == "error":
@@ -116,6 +135,10 @@ class WsjtxTxAudioBridge:
                 raise RuntimeError("Native radio digital transmit ownership is unavailable.")
             token = controller.claim_transmit_stream("wsjtx")
             try:
+                with self._lock:
+                    cancelled = generation != self._enable_generation
+                if cancelled:
+                    raise RuntimeError("Managed transmit enable was cancelled.")
                 state = controller.configure_microphone(use_transport=True) or {}
                 microphone = state.get("microphone", {})
                 if microphone.get("lan_mod_level", 0) <= 0:
@@ -123,18 +146,30 @@ class WsjtxTxAudioBridge:
                 # The controller verifies the transport input when configuring it.
                 self._check(controller)
                 with self._lock:
+                    if generation != self._enable_generation:
+                        raise RuntimeError("Managed transmit enable was cancelled.")
                     self._controller, self._token = controller, token
                     self._enabled = True
                     self._state, self._detail = "armed", "Waiting for the selected WSJT-X transmit slot."
             except Exception:
-                controller.release_transmit_stream(token)
+                try:
+                    controller.release_transmit_stream(token)
+                except Exception:
+                    if self._radio(controller).get("connected"):
+                        raise
                 raise
 
-    def _release_key(self) -> None:
+    def _request_disarm(self) -> None:
+        with self._lock:
+            self._enable_generation += 1
+            self._enabled = False
+            self._tail_until = None
+
+    def _release_key(self) -> str | None:
         with self._lock:
             controller, token = self._controller, self._token
         if controller is None or token is None:
-            return
+            return None
         problem = "Radio transmit release was not confirmed."
         for _ in range(3):
             try:
@@ -146,12 +181,14 @@ class WsjtxTxAudioBridge:
                     with self._lock:
                         self._transmitting = False
                         self._tail_until = None
+                        self._slot_deadline = None
                         self._sequence += 1
-                    return
+                    self._ptt_unconfirmed = False
+                    return None
             except Exception as error:
                 problem = str(error)
             if not self._radio(controller).get("connected"):
-                break
+                return problem
         raise RuntimeError(f"WSJT-X could not confirm PTT OFF: {problem}")
 
     def _disable(self) -> None:
@@ -159,28 +196,108 @@ class WsjtxTxAudioBridge:
             self._enabled = False
             controller, token = self._controller, self._token
             keyed = self._transmitting
+        release_problem = ""
+        uncertainty_preserved = False
         if controller is not None and token is not None:
-            if keyed or controller.transmit_active:
-                self._release_key()
-            controller.release_transmit_stream(token)
+            controller_uncertain = self._radio(controller).get("tx_unconfirmed") is True
+            try:
+                if keyed or controller.transmit_active or controller_uncertain:
+                    release_problem = self._release_key() or ""
+                if not release_problem:
+                    try:
+                        controller.release_transmit_stream(token)
+                    except Exception as error:
+                        if self._radio(controller).get("connected"):
+                            raise
+                        release_problem = str(error)
+            except Exception as error:
+                if self._radio(controller).get("connected"):
+                    raise
+                release_problem = str(error)
+            uncertainty_preserved = self._radio(controller).get("tx_unconfirmed") is True
         with self._lock:
             self._controller = self._token = None
             self._transmitting = False
             self._tail_until = None
+            self._slot_deadline = None
+            self._ptt_unconfirmed = bool(release_problem or uncertainty_preserved)
+            if self._ptt_unconfirmed:
+                warning = (
+                    "WSJT-X could not confirm PTT OFF because the radio disconnected: "
+                    f"{release_problem or 'the controller reports an unconfirmed PTT state.'}"
+                )
+                self._detail = "; ".join(filter(None, (self._detail, warning)))
             if self._state != "error":
-                self._state, self._detail = "listening", "Transmitter is disabled."
+                self._state = "listening"
+                if not self._ptt_unconfirmed:
+                    self._detail = "Transmitter is disabled."
+
+    @classmethod
+    def _utc_slot(cls, mode: str) -> tuple[bool, float]:
+        period = cls._SLOT_PERIODS_S.get(mode.upper())
+        if period is None:
+            raise RuntimeError(f"WSJT-X reported unsupported TX mode {mode!r}; PTT was not keyed.")
+        now = time.time()
+        slot_index = int(now // period)
+        return slot_index % 2 == 0, (slot_index + 1) * period
+
+    def _finish_transmission(
+        self,
+        controller: Any,
+        token: str | None,
+        *,
+        status_sequence: int | None = None,
+        intent_still_active: bool = False,
+    ) -> None:
+        controller.flush_audio(transmit_token=token)
+        release_problem = self._release_key()
+        if release_problem is not None:
+            raise RuntimeError(f"WSJT-X could not confirm PTT OFF: {release_problem}")
+        with self._lock:
+            if intent_still_active:
+                self._closed_intent_sequence = (
+                    status_sequence
+                    if type(status_sequence) is int
+                    else self._CLOSED_INTENT_WITHOUT_SEQUENCE
+                )
+            else:
+                self._closed_intent_sequence = None
+            self._state, self._detail = "armed", "Waiting for the next transmit slot."
 
     def _update_intent(self, status: dict, now: float) -> None:
         with self._lock:
             enabled, keyed = self._enabled, self._transmitting
             controller, token = self._controller, self._token
+            slot_deadline = self._slot_deadline
+            generation = self._enable_generation
         if not enabled:
             return
         self._check(controller)
         if not status.get("connected"):
             raise RuntimeError("Managed WSJT-X status is unavailable; transmitter stopped.")
         intent = status.get("transmitting") is True
+        status_sequence = status.get("status_sequence")
+        with self._lock:
+            closed_sequence = self._closed_intent_sequence
+            if not intent:
+                self._closed_intent_sequence = None
+            elif closed_sequence is not None:
+                if (
+                    closed_sequence is self._CLOSED_INTENT_WITHOUT_SEQUENCE
+                    or type(status_sequence) is not int
+                    or status_sequence <= closed_sequence
+                ):
+                    return
+                self._closed_intent_sequence = None
         if intent and not keyed:
+            tx_even = status.get("tx_even")
+            if type(tx_even) is not bool:
+                raise RuntimeError(
+                    "WSJT-X did not provide verified transmit-slot parity; PTT was not keyed."
+                )
+            _, slot_end = self._utc_slot(str(status.get("mode", "")))
+            if slot_end - time.time() <= self._SLOT_RELEASE_GUARD_S:
+                return
             if self._prepared_message and str(status.get("tx_message", "")).strip() != self._prepared_message:
                 self._unmatched_since = self._unmatched_since or now
                 if self._request_status is not None and now - self._status_requested_at >= 0.3:
@@ -192,14 +309,32 @@ class WsjtxTxAudioBridge:
             self._unmatched_since = None
             controller.set_transmit_stream_paced(True, transmit_token=token)
             controller.set_ptt(True, transmit_token=token)
+            keyed_at = time.monotonic()
+            remaining = max(0.0, slot_end - time.time() - self._SLOT_RELEASE_GUARD_S)
             with self._lock:
-                self._transmitting = True
-                self._keyed_at = time.monotonic()
-                self._tail_until = None
-                self._message = str(status.get("tx_message", ""))
-                self._sequence += 1
-                self._state, self._detail = "transmitting", self._message
+                cancelled = generation != self._enable_generation
+                if cancelled:
+                    self._transmitting = True
+                    self._keyed_at = keyed_at
+                    self._slot_deadline = keyed_at + remaining
+                else:
+                    self._transmitting = True
+                    self._keyed_at = keyed_at
+                    self._slot_deadline = keyed_at + remaining
+                    self._tail_until = None
+                    self._closed_intent_sequence = None
+                    self._message = str(status.get("tx_message", ""))
+                    self._sequence += 1
+                    self._state, self._detail = "transmitting", self._message
+            if cancelled:
+                controller.flush_audio(transmit_token=token)
+                release_problem = self._release_key()
+                if release_problem is not None:
+                    raise RuntimeError(f"WSJT-X could not confirm PTT OFF: {release_problem}")
+                return
             LOGGER.info("WSJT-X native transmit started: %s", self._message)
+            if keyed_at >= self._slot_deadline:
+                self._finish_transmission(controller, token)
         elif keyed:
             if intent:
                 self._tail_until = None
@@ -207,12 +342,9 @@ class WsjtxTxAudioBridge:
             if now - self._keyed_at > maximum:
                 raise RuntimeError("WSJT-X transmit exceeded its slot; transmitter stopped.")
             if not intent and self._tail_until is None:
-                self._tail_until = now + 0.15
+                self._tail_until = min(now + self._STATUS_TAIL_S, slot_deadline or float("inf"))
             if self._tail_until is not None and now >= self._tail_until:
-                controller.flush_audio(transmit_token=token)
-                self._release_key()
-                with self._lock:
-                    self._state, self._detail = "armed", "Waiting for the next transmit slot."
+                self._finish_transmission(controller, token)
 
     def _run(self) -> None:
         import fcntl
@@ -226,13 +358,15 @@ class WsjtxTxAudioBridge:
         try:
             while not self._stop.is_set():
                 with self._operation:
-                    self._update_intent(self._get_status(), time.monotonic())
+                    status = self._get_status()
+                    if (self._transmitting and status.get("transmitting") is True
+                            and time.monotonic() - max(last_pcm, self._keyed_at) > 0.6):
+                        raise RuntimeError("Managed transmit audio stalled; transmitter stopped.")
+                    self._update_intent(status, time.monotonic())
                 if process.poll() is not None:
                     raise RuntimeError("Managed transmit audio capture exited.")
                 ready, _, _ = select.select([descriptor], [], [], 0.02)
                 if not ready:
-                    if self._transmitting and time.monotonic() - max(last_pcm, self._keyed_at) > 0.6:
-                        raise RuntimeError("Managed transmit audio stalled; transmitter stopped.")
                     continue
                 queued = array.array("i", [0])
                 fcntl.ioctl(descriptor, termios.FIONREAD, queued, True)
@@ -272,6 +406,7 @@ class WsjtxTxAudioBridge:
                     process.wait(timeout=1)
 
     def stop(self) -> dict[str, Any]:
+        self._request_disarm()
         self._stop.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
@@ -303,8 +438,9 @@ class WsjtxTxAudioBridge:
             if cleanup_error is not None:
                 self._state = "error"
                 self._detail = "; ".join(filter(None, (self._detail, str(cleanup_error))))
-            elif self._state == "error":
+            elif self._state == "error" or self._ptt_unconfirmed:
                 # Resources are released now. Keep the reason the capture ended,
+                # or the bounded warning from the disconnected release attempt,
                 # but this is a completed cleanup rather than a live failure.
                 self._state = "stopped"
             else:

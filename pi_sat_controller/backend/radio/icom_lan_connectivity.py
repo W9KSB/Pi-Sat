@@ -13,7 +13,7 @@ import random
 import select
 import socket
 import struct
-from threading import Event
+from threading import Event, Lock
 from time import monotonic, sleep
 from typing import Any
 
@@ -88,6 +88,7 @@ class IcomLanConnectivity:
         self._stream_sequences: dict[socket.socket, int] = {}
         self._ping_sequences: dict[socket.socket, int] = {}
         self._sent_packets: dict[socket.socket, dict[int, bytes]] = {}
+        self._packet_lock = Lock()
         self._civ_seq = 1
         self._session_seq = 1
         self._auth_inner_seq = self._AUTH_INNER_SEQ_START
@@ -259,15 +260,18 @@ class IcomLanConnectivity:
     def write_control(self, payload: bytes) -> None:
         if self._serial is None or not self._connected:
             raise IcomConnectivityError("Icom LAN serial channel is unavailable")
+        with self._packet_lock:
+            sequence = self._claim_session_seq_locked(self._serial)
+            civ_sequence = self._civ_seq
+            self._civ_seq = (self._civ_seq + 1) & 0xFFFF or 1
         envelope = bytearray(self._header(
-            0, length=21 + len(payload), seq=self._claim_session_seq(self._serial), sock=self._serial
+            0, length=21 + len(payload), seq=sequence, sock=self._serial
         ))
         envelope.extend(b"\xc1")
         envelope.append(len(payload))
         envelope.append(0)
-        envelope.extend(struct.pack(">H", self._civ_seq))
+        envelope.extend(struct.pack(">H", civ_sequence))
         envelope.extend(payload)
-        self._civ_seq = (self._civ_seq + 1) & 0xFFFF or 1
         self._send_tracked(self._serial, bytes(envelope), self._serial_remote_port)
 
     def write_audio(self, pcm: bytes) -> int:
@@ -560,19 +564,21 @@ class IcomLanConnectivity:
                     packet = self._header(0, seq=self._claim_session_seq(sock), sock=sock)
                     self._send_tracked(sock, packet, port)
                 if send_ping:
-                    sequence = self._ping_sequences.get(sock, 0)
-                    self._ping_sequences[sock] = (sequence + 1) & 0xFFFF
+                    with self._packet_lock:
+                        sequence = self._ping_sequences.get(sock, 0)
+                        self._ping_sequences[sock] = (sequence + 1) & 0xFFFF
                     packet = self._header(7, length=21, seq=sequence, sock=sock)
                     packet += b"\x00" + struct.pack("<I", int(now * 1000) & 0xFFFFFFFF)
                     sock.sendto(packet, (self.config.host, port))
 
     def _send_tracked(self, sock: socket.socket, packet: bytes, port: int) -> None:
         sequence = struct.unpack_from("<H", packet, 6)[0]
-        cache = self._sent_packets.setdefault(sock, {})
-        cache.pop(sequence, None)
-        cache[sequence] = packet
-        while len(cache) > 128:
-            del cache[next(iter(cache))]
+        with self._packet_lock:
+            cache = self._sent_packets.setdefault(sock, {})
+            cache.pop(sequence, None)
+            cache[sequence] = packet
+            while len(cache) > 128:
+                del cache[next(iter(cache))]
         sock.sendto(packet, (self.config.host, port))
 
     def _handle_transport(self, sock: socket.socket, packet: bytes, port: int) -> bool:
@@ -590,7 +596,8 @@ class IcomLanConnectivity:
                 sock.sendto(reply, (self.config.host, port))
             return True
         if packet_type == 1:
-            cache = self._sent_packets.get(sock, {})
+            with self._packet_lock:
+                cache = dict(self._sent_packets.get(sock, {}))
             if len(packet) == 16:
                 requested = [sequence] if sequence in cache else []
             elif (len(packet) - 16) % 2 == 0:
@@ -599,10 +606,11 @@ class IcomLanConnectivity:
                 ))
             else:
                 requested = []
-            for seq in requested:
-                sock.sendto(cache[seq], (self.config.host, port))
+            retransmits = [cache[seq] for seq in requested]
+            for request in retransmits:
+                sock.sendto(request, (self.config.host, port))
                 sleep(self._BOOTSTRAP_DUPLICATE_GAP_S)
-                sock.sendto(cache[seq], (self.config.host, port))
+                sock.sendto(request, (self.config.host, port))
             return True
         if packet_type == 5:
             raise IcomConnectivityError("Icom radio disconnected the LAN session")
@@ -619,6 +627,10 @@ class IcomLanConnectivity:
         return struct.pack("<IHH", length, packet_type, sequence) + struct.pack(">II", local_value, remote_value)
 
     def _claim_session_seq(self, sock: socket.socket | None = None) -> int:
+        with self._packet_lock:
+            return self._claim_session_seq_locked(sock)
+
+    def _claim_session_seq_locked(self, sock: socket.socket | None = None) -> int:
         sock = self._control if sock is None else sock
         sequence = self._stream_sequences.get(sock, 1) if sock is not None else self._session_seq
         next_sequence = (sequence + 1) & 0xFFFF
@@ -631,15 +643,18 @@ class IcomLanConnectivity:
     def _send_audio_part(self, pcm: bytes) -> None:
         if self._audio is None:
             return
+        with self._packet_lock:
+            transport_sequence = self._claim_session_seq_locked(self._audio)
+            audio_sequence = self._audio_send_seq
+            self._audio_send_seq = (self._audio_send_seq + 1) & 0xFFFF
         payload = bytearray(b"\x80\x00")
-        payload.extend(struct.pack(">H", self._audio_send_seq & 0xFFFF))
+        payload.extend(struct.pack(">H", audio_sequence & 0xFFFF))
         payload.extend(b"\x00\x00")
         payload.extend(struct.pack(">H", len(pcm)))
         payload.extend(pcm)
         packet = self._header(0, length=16 + len(payload),
-                              seq=self._claim_session_seq(self._audio), sock=self._audio) + bytes(payload)
+                              seq=transport_sequence, sock=self._audio) + bytes(payload)
         self._send_tracked(self._audio, packet, self._audio_remote_port)
-        self._audio_send_seq = (self._audio_send_seq + 1) & 0xFFFF
 
     @classmethod
     def _passcode(cls, value: str) -> bytes:

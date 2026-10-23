@@ -477,7 +477,11 @@ async function loadStatus() {
       }
       rotatorControlEnabled = Boolean(status.devices.rotator_enabled);
     }
-    nativeIcomRxActive = status.icom?.rx_native === true;
+    nativeIcomRxActive = status.icom?.enabled === true && status.icom?.rx_native === true;
+    if (nativeIcomRxActive) {
+      manualOffsetsEnabled = true;
+      syncRxTx = true;
+    }
     updateManualOffsetControlState();
   } catch (error) {
     // Other polling paths surface connection failures; avoid repeating log noise here.
@@ -1418,6 +1422,12 @@ function getSelectedFrequencyProfile() {
 }
 
 async function updateManualOffsetsMode(event) {
+  if (nativeIcomRxActive) {
+    manualOffsetsEnabled = true;
+    event.currentTarget.checked = true;
+    updateManualOffsetControlState();
+    return;
+  }
   const requestedValue = event.currentTarget.checked;
   manualOffsetsEnabled = requestedValue;
   manualOffsetsToggleUpdatePending = true;
@@ -1449,6 +1459,12 @@ async function updateManualOffsetsMode(event) {
 }
 
 async function updateSyncMode(event) {
+  if (nativeIcomRxActive) {
+    syncRxTx = true;
+    event.currentTarget.checked = true;
+    updateManualOffsetControlState();
+    return;
+  }
   const requestedValue = event.currentTarget.checked;
   syncRxTx = requestedValue;
   syncToggleUpdatePending = true;
@@ -1802,6 +1818,7 @@ function isRxOnlyProfile(profile) {
 
 function updateTxProfileState(profile) {
   const rxOnly = isRxOnlyProfile(profile);
+  const nativeIcomOffsetsLocked = nativeIcomRxActive;
   const txPanel = document.getElementById('tx-link-panel');
   const syncToggle = document.getElementById('sync-rx-tx-toggle');
   const syncLabel = syncToggle?.closest('label');
@@ -1817,15 +1834,18 @@ function updateTxProfileState(profile) {
     button.disabled = rxOnly || !manualOffsetsEnabled;
   });
   if (syncToggle) {
-    syncToggle.disabled = rxOnly || !manualOffsetsEnabled;
+    syncToggle.disabled = rxOnly || !manualOffsetsEnabled || nativeIcomOffsetsLocked;
     if (rxOnly) {
       syncToggle.checked = false;
     } else {
-      syncToggle.checked = syncRxTx;
+      syncToggle.checked = nativeIcomOffsetsLocked || syncRxTx;
     }
   }
   if (syncLabel) {
-    syncLabel.classList.toggle('control-disabled', rxOnly || !manualOffsetsEnabled);
+    syncLabel.classList.toggle(
+      'control-disabled',
+      rxOnly || !manualOffsetsEnabled || nativeIcomOffsetsLocked,
+    );
   }
 }
 
@@ -1841,8 +1861,13 @@ function updateManualOffsetControlState() {
   const virtualRitControls = document.getElementById('virtual-rit-controls');
   const virtualRitNativeNote = document.getElementById('virtual-rit-native-note');
   const virtualRitDisabled = shouldDisableVirtualRit(manualOffsetsEnabled, nativeIcomRxActive);
+  if (nativeIcomRxActive) {
+    manualOffsetsEnabled = true;
+    syncRxTx = true;
+  }
   if (toggle) {
     toggle.checked = manualOffsetsEnabled;
+    toggle.disabled = nativeIcomRxActive;
   }
   document.querySelectorAll('[data-rx-step-hz]').forEach((button) => {
     button.disabled = !manualOffsetsEnabled;
@@ -4973,7 +4998,7 @@ function renderTracking(result) {
     typeof result.manual_offsets_enabled === 'boolean'
     && !manualOffsetsToggleUpdatePending
   ) {
-    manualOffsetsEnabled = result.manual_offsets_enabled;
+    manualOffsetsEnabled = nativeIcomRxActive ? true : result.manual_offsets_enabled;
     updateManualOffsetControlState();
   }
   if (
@@ -4983,7 +5008,7 @@ function renderTracking(result) {
   ) {
     const profileSupportsSync = !isRxOnlyProfile(getSelectedFrequencyProfile());
     if (profileSupportsSync) {
-      syncRxTx = result.sync_offsets;
+      syncRxTx = nativeIcomRxActive ? true : result.sync_offsets;
     }
     syncToggle.checked = profileSupportsSync ? syncRxTx : false;
   }

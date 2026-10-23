@@ -45,6 +45,8 @@ from pi_sat_controller.backend.config import (
     load_config,
     load_my_satellites,
     load_settings,
+    load_scope_settings,
+    save_scope_settings,
     save_my_satellites,
     save_settings,
 )
@@ -258,6 +260,7 @@ def _wsjtx_settings() -> dict[str, object]:
         "executable": config.executable,
         "callsign": config.callsign,
         "mode": config.mode,
+        "decode_depth": config.decode_depth,
         "grid_locator": load_settings()["station"]["grid_locator"],
         "udp_host": config.udp_host,
         "udp_port": config.udp_port,
@@ -288,6 +291,7 @@ wsjtx_engine = WsjtxEngine(
     get_controller=lambda: icom_controller,
     get_block_reason=_wsjtx_block_reason,
     get_manager=lambda: wsjtx_manager,
+    get_rx_tracking_manager=lambda: rx_tracking_manager,
 )
 
 
@@ -1111,6 +1115,11 @@ def _reload_runtime_config_locked() -> list[str]:
                 config.safety.manual_offset_readback_active_pass_only
             ),
         )
+        if config.icom.enabled and config.rx.device_id == NATIVE_ICOM_DEVICE_ID:
+            # Native IC-9700 tracking keeps manual paired offsets available.
+            rx_tracking_manager.set_manual_offsets_enabled(True)
+            if config.tx.enabled and config.tx.device_id == NATIVE_ICOM_DEVICE_ID:
+                rx_tracking_manager.set_offset_sync(True)
     if sdr_manager is not None and not isinstance(sdr_manager, FailedTrackingSdrManager):
         sdr_manager.start()
     if rx_tracking_manager is not None:
@@ -1859,9 +1868,11 @@ register_settings_api(
     build_status=_build_status_payload,
 )
 
-register_radio_api(app, get_controller=lambda: icom_controller)
+register_radio_api(app, get_controller=lambda: icom_controller,
+                   load_scope_settings=load_scope_settings, save_scope_settings=save_scope_settings)
 register_wsjtx_api(app, get_manager=lambda: wsjtx_manager, get_engine=lambda: wsjtx_engine,
-                   get_qso=lambda: wsjtx_qso, get_spectrum=wsjtx_engine.spectrum.snapshot)
+                   get_qso=lambda: wsjtx_qso, get_spectrum=wsjtx_engine.spectrum.snapshot,
+                   save_settings=lambda patch: save_settings(patch))
 register_audio_stream_api(
     app, get_status=_audio_stream_status, set_enabled=_set_audio_stream_enabled,
     set_demodulation=_set_audio_stream_demodulation,

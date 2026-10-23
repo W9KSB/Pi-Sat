@@ -1,5 +1,6 @@
 """Independently locked audio buffers, never protected by CAT locks."""
 from collections import deque
+from math import isfinite
 from threading import Lock
 from time import monotonic
 from typing import Callable
@@ -35,9 +36,19 @@ class AudioBuffer:
         with self._lock:
             return self._frames / self._sample_rate
 
-    def append(self, packet: bytes) -> None:
+    def append(
+        self,
+        packet: bytes,
+        *,
+        arrival_monotonic: float | None = None,
+    ) -> None:
         frames = max(1, (len(packet) - 24) // (2 * self._channels))
-        now = monotonic()
+        if arrival_monotonic is None:
+            now = monotonic()
+        else:
+            now = float(arrival_monotonic)
+            if not isfinite(now):
+                raise ValueError("Audio arrival time must be finite")
         with self._lock:
             if (self._max_frames is not None and not self._drop_oldest
                     and (self._overrun or self._frames + frames > self._max_frames)):
@@ -56,12 +67,17 @@ class AudioBuffer:
             self._notify()
 
     def drain(self) -> list[bytes]:
+        return [packet for _, packet in self.drain_timed()]
+
+    def drain_timed(self) -> list[tuple[float, bytes]]:
+        """Drain packets with the host monotonic time observed on arrival."""
+
         now = monotonic()
         with self._lock:
             packets = []
             for timestamp, packet, _ in self._packets:
                 if self._max_seconds is None or not self._drop_oldest or now - timestamp <= self._max_seconds:
-                    packets.append(packet)
+                    packets.append((timestamp, packet))
                 else:
                     self.dropped += 1
             self._packets.clear()
