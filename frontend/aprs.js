@@ -23,6 +23,8 @@
   let pollTimer = null;
   let currentSequence = 0;
   let lastPacketCount = -1;
+  let txPending = false;
+  let lastTransmitState = 'Disarmed';
 
   function stateDetail(status) {
     if (status.error) return status.error;
@@ -54,8 +56,8 @@
     stateNode.dataset.state = (status.state || 'Disabled').toLowerCase().replaceAll(' ', '-');
     byId('aprs-detail').textContent = stateDetail(status);
     enableButton.textContent = enabled ? 'Disable' : 'Enable';
-    enableButton.classList.toggle('btn-danger', enabled);
-    enableButton.classList.toggle('btn-primary', !enabled);
+    enableButton.classList.toggle('module-button-danger', enabled);
+    enableButton.classList.toggle('module-button-primary', !enabled);
     enableButton.setAttribute('aria-pressed', String(enabled));
     byId('aprs-source').textContent = status.audio_source || 'Native IC-9700 RX PCM';
     byId('aprs-engine').textContent = status.decoder || 'Dire Wolf';
@@ -115,25 +117,43 @@
     if (!status) return;
     armed = status.armed === true;
     armToggle.checked = armed;
-    byId('aprs-tx-state').textContent = status.state || (armed ? 'Ready' : 'Disarmed');
+    lastTransmitState = status.state || (armed ? 'Ready' : 'Disarmed');
+    byId('aprs-tx-state').textContent = lastTransmitState;
     byId('aprs-tx-last').textContent = status.last_tx_utc
       ? new Date(status.last_tx_utc).toLocaleString()
       : 'Never';
-    byId('aprs-tx-detail').textContent = status.error || status.warning || '';
+    const feedback = status.error || status.warning
+      || (armed ? 'Transmit is armed. Choose a manual action below.' : 'Arm transmit to enable the three manual actions.');
+    const feedbackNode = byId('aprs-tx-detail');
+    feedbackNode.textContent = feedback;
+    feedbackNode.classList.toggle('aprs-tx-error', Boolean(status.error));
     renderTransmitControls();
   }
 
   function renderTransmitControls() {
-    sendBeaconButton.disabled = !armed;
-    sendStatusButton.disabled = !armed;
-    sendMessageButton.disabled = !armed;
-    addresseeInput.disabled = !armed;
-    textInput.disabled = !armed;
+    const disabled = !armed || txPending;
+    sendBeaconButton.disabled = disabled;
+    sendStatusButton.disabled = disabled;
+    sendMessageButton.disabled = disabled;
+    addresseeInput.disabled = disabled;
+    textInput.disabled = disabled;
+    armToggle.disabled = txPending;
+    updateCharacterCount();
+  }
+
+  function updateCharacterCount() {
+    const counter = byId('aprs-tx-character-count');
+    if (counter) counter.textContent = `${textInput.value.length} / 67 · status 62 max`;
   }
 
   function transmitButton(button, body) {
     button.addEventListener('click', async () => {
-      button.disabled = true;
+      if (txPending) return;
+      txPending = true;
+      button.setAttribute('aria-busy', 'true');
+      byId('aprs-tx-state').textContent = 'Submitting';
+      byId('aprs-tx-detail').textContent = 'Submitting APRS transmit request...';
+      renderTransmitControls();
       try {
         const response = await fetch('/api/aprs/transmit', {
           method: 'POST',
@@ -144,8 +164,13 @@
         if (!response.ok) throw new Error(result.detail || 'Unable to transmit');
         renderTransmit(result.status);
       } catch (error) {
-        byId('aprs-tx-detail').textContent = error.message || 'Unable to transmit.';
+        const feedback = byId('aprs-tx-detail');
+        feedback.textContent = error.message || 'Unable to transmit.';
+        feedback.classList.add('aprs-tx-error');
+        byId('aprs-tx-state').textContent = lastTransmitState;
       } finally {
+        txPending = false;
+        button.setAttribute('aria-busy', 'false');
         renderTransmitControls();
       }
     });
@@ -319,6 +344,7 @@
     addressee: addresseeInput.value,
     text: textInput.value,
   }));
+  textInput.addEventListener('input', updateCharacterCount);
 
   let logTimer = null;
   const logDetails = byId('aprs-decoder-log')?.closest('details') || null;

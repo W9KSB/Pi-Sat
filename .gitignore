@@ -15,6 +15,8 @@ pi-sat-controller.conf
 update_pi.sh
 /tests/
 /pi-sat-tests-backup/
+# Operating documentation belongs in the separate wiki repository.
+/docs/
 external-streamer/build/
 external-streamer/dist/
 external-streamer/*.exe

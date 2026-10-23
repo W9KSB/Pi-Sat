@@ -8,7 +8,8 @@ INSTALL_DIR="${INSTALL_DIR:-$HOME/pi-sat}"
 SYSTEMD_UNIT_DIR="/etc/systemd/system"
 RUN_USER="$(id -un)"
 STEP=0
-TOTAL_STEPS=7
+TOTAL_STEPS=8
+WSJTX_INSTALL_RESULT="not_requested"
 INSTALLER_SERVICE_STOPPED=0
 INSTALLER_SERVICE_EXISTED=0
 INSTALLER_SERVICE_WAS_ACTIVE=0
@@ -19,6 +20,67 @@ TMP_SERVICE=""
 TMP_OVERRIDE=""
 SERVICE_BACKUP=""
 OVERRIDE_BACKUP=""
+UNINSTALL=0
+
+usage() {
+  echo "Usage: sh install/install_pi.sh [--uninstall | --help]"
+  echo "  No option: install or update Pi-Sat."
+  echo "  --uninstall: stop and remove the Pi-Sat service; preserve application files and station data."
+  echo "  --help: show this help."
+}
+
+uninstall_pi_sat() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl is required to uninstall the Pi-Sat service." >&2
+    return 1
+  fi
+
+  uninstall_unit="${SERVICE_NAME}.service"
+  if uninstall_load_state="$(sudo systemctl show --property=LoadState --value "${uninstall_unit}")"; then
+    :
+  elif [ "${uninstall_load_state}" != "not-found" ]; then
+    echo "Cannot inspect ${uninstall_unit}; no service files were removed." >&2
+    return 1
+  fi
+  if [ -z "${uninstall_load_state}" ]; then
+    echo "Cannot determine the state of ${uninstall_unit}; no service files were removed." >&2
+    return 1
+  fi
+
+  if [ "${uninstall_load_state}" != "not-found" ]; then
+    if ! sudo systemctl disable --now "${uninstall_unit}"; then
+      echo "Cannot stop and disable ${uninstall_unit}; no service files were removed." >&2
+      return 1
+    fi
+  fi
+
+  if ! sudo rm -f -- \
+      "${SYSTEMD_UNIT_DIR}/${uninstall_unit}" \
+      "${SYSTEMD_UNIT_DIR}/${uninstall_unit}.d/90-pi-sat-python.conf"; then
+    echo "Could not remove the Pi-Sat service files; uninstallation is incomplete." >&2
+    return 1
+  fi
+  if ! sudo systemctl daemon-reload; then
+    echo "Could not reload systemd; uninstallation is incomplete." >&2
+    return 1
+  fi
+
+  echo "Pi-Sat service uninstalled."
+  echo "Application files, configuration, recordings, images, and QSO logs were preserved."
+  echo "Shared packages, audio services, and user permissions were left unchanged."
+}
+
+case "$#" in
+  0) ;;
+  1)
+    case "$1" in
+      --uninstall) UNINSTALL=1 ;;
+      --help|-h) usage; exit 0 ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    ;;
+  *) usage >&2; exit 2 ;;
+esac
 
 log_step() {
   STEP=$((STEP + 1))
@@ -30,14 +92,64 @@ log_info() {
   echo "    $1"
 }
 
+install_optional_wsjtx() {
+  log_info "WSJT-X is optional and enables FT4/FT8 with the native IC-9700."
+  # Quick install pipes the script into sh, so answers must come from the terminal.
+  if ! ( : < /dev/tty ) 2>/dev/null; then
+    log_info "No controlling terminal; skipping optional WSJT-X installation."
+    return 0
+  fi
+
+  exec 3</dev/tty
+  while :; do
+    printf "Install WSJT-X for FT4/FT8? [y/N] "
+    if ! IFS= read -r wsjtx_answer <&3; then
+      echo ""
+      log_info "Skipping optional WSJT-X installation."
+      WSJTX_INSTALL_RESULT="declined"
+      exec 3<&-
+      return 0
+    fi
+    case "${wsjtx_answer}" in
+      y|Y|yes|YES|Yes)
+        exec 3<&-
+        log_info "Installing WSJT-X and its runtime dependencies"
+        if sh "${INSTALL_DIR}/install/install_wsjtx.sh" </dev/null; then
+          WSJTX_INSTALL_RESULT="installed"
+        else
+          WSJTX_INSTALL_RESULT="failed"
+          echo "Warning: optional WSJT-X installation failed; continuing with the Pi-Sat core installation." >&2
+          echo "Retry with: sh \"${INSTALL_DIR}/install/install_wsjtx.sh\"" >&2
+        fi
+        return 0
+        ;;
+      ""|n|N|no|NO|No)
+        log_info "Skipping optional WSJT-X installation."
+        WSJTX_INSTALL_RESULT="declined"
+        exec 3<&-
+        return 0
+        ;;
+      *)
+        echo "Please answer y or n."
+        ;;
+    esac
+  done
+}
+
 if [ "$(id -u)" -eq 0 ]; then
-  echo "Run this installer as the normal Pi user, not with sudo."
+  echo "Run this script as the normal Pi user, not with sudo."
   exit 1
 fi
 
 if ! command -v sudo >/dev/null 2>&1; then
   echo "sudo is required."
   exit 1
+fi
+
+# Uninstallation must not enter the installer or its service-restoration trap.
+if [ "${UNINSTALL}" -eq 1 ]; then
+  uninstall_pi_sat
+  exit 0
 fi
 
 cleanup_temp_files() {
@@ -127,6 +239,9 @@ else
 fi
 
 cd "${INSTALL_DIR}"
+
+log_step "Installing optional WSJT-X"
+install_optional_wsjtx
 
 log_step "Ensuring local runtime files"
 created_runtime_file=0
@@ -293,3 +408,6 @@ echo "Logs:    journalctl -u ${SERVICE_NAME} -f"
 echo "Default URL: https://$(hostname -I | awk '{print $1}')"
 echo "Custom ports / HTTP opt-out: see [server] in pi-sat-controller.conf."
 echo "First HTTPS start generates a self-signed certificate using OpenSSL if none exists."
+if [ "${WSJTX_INSTALL_RESULT}" = "failed" ]; then
+  echo "WSJT-X: optional installation did not complete; retry after reviewing the warning above."
+fi

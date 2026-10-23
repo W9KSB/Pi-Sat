@@ -21,7 +21,7 @@ compatibility problems or hardware-specific behavior in
 [GitHub Issues](https://github.com/W9KSB/Pi-Sat/issues).
 
 <p align="center">
-  <img alt="Dashboard" src="https://www.w9ksb.com/wp-content/uploads/2026/06/Dashboard.jpg">
+  <img alt="Main Page" src="https://www.w9ksb.com/wp-content/uploads/2026/10/Screenshot-2026-10-23-at-2.31.43-PM.png">
 </p>
 
 ## Features
@@ -36,7 +36,7 @@ compatibility problems or hardware-specific behavior in
 - Optional live Robot24/36/72, Martin M1/M2, and PD120/180 SSTV decoding from the existing native IC-9700 SUB/RX audio stream using SSTVFlow
 - Optional APRS decoding from a selectable side of the native IC-9700 RX audio
   stream, plus manual APRS transmit of a beacon, status line, or message
-- Optional [FT4 / FT8 module](docs/ft4-ft8-module.md) using stock WSJT-X on the
+- Optional [FT4 / FT8 module](https://github.com/W9KSB/Pi-Sat/wiki/FT4-FT8-Module) using stock WSJT-X on the
   same host, with native SUB receive audio, Pi-Sat-controlled transmit,
   automatic QSO sequencing, an audio passband display, and ADIF contact export
 - Systemd-based Pi service install and update flow
@@ -81,6 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/W9KSB/Pi-Sat/main/install/install_p
 - grants the service user serial-device access for local USB/serial radios and rotators
 - installs the bundled SSTVFlow Python decoder from `vendor/sstvflow`
 - installs Dire Wolf for the optional APRS receiver
+- asks whether to install WSJT-X and audio dependencies for FT4/FT8 (default: No)
 - installs the `pi-sat` systemd service
 - starts the service
 
@@ -109,6 +110,19 @@ sudo systemctl status pi-sat
 sudo systemctl restart pi-sat
 journalctl -u pi-sat -f
 ```
+
+### Uninstall the Service
+
+From the Pi-Sat installation directory, run as the normal Pi user:
+
+```sh
+sh install/install_pi.sh --uninstall
+```
+
+This stops and disables Pi-Sat and removes its installed systemd unit and
+managed Python override. The installation folder, configuration, station data,
+and shared packages remain. See [Installation](https://github.com/W9KSB/Pi-Sat/wiki/Installation#uninstalling-the-service)
+for details.
 
 ## Manual Installation and Updates
 

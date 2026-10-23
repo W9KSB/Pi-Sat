@@ -1,0 +1,405 @@
+.satellite-page-stack {
+  display: grid;
+  gap: 1rem;
+}
+
+.satellite-control-card {
+  overflow: visible;
+}
+
+.satellite-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.85rem 1rem;
+}
+
+.satellite-add-container {
+  position: relative;
+}
+
+.satellite-add-container[open] {
+  flex: 1 0 100%;
+}
+
+.satellite-add-container > summary {
+  list-style: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.satellite-add-container > summary::-webkit-details-marker {
+  display: none;
+}
+
+.satellite-add-container > summary::marker {
+  content: "";
+}
+
+.satellite-add-form {
+  display: grid;
+  grid-template-columns: minmax(8.5rem, 0.6fr) minmax(14rem, 1fr) auto;
+  grid-template-rows: auto auto;
+  align-items: end;
+  gap: 0.35rem 0.75rem;
+  width: 100%;
+  margin-top: 0.85rem;
+  padding: 0.9rem;
+  border: 1px solid #344658;
+  border-radius: 0.45rem;
+  background: #0d151e;
+}
+
+.satellite-add-form label[for="my-satellite-norad"] {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.satellite-add-form #my-satellite-norad {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.satellite-add-form label[for="my-satellite-name"] {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.satellite-add-form #my-satellite-name {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.satellite-add-form button {
+  grid-column: 3;
+  grid-row: 2;
+}
+
+.satellite-options-form {
+  display: grid;
+  gap: 0.35rem;
+  width: min(25rem, 100%);
+}
+
+.satellite-options-form .input-group {
+  flex-wrap: nowrap;
+}
+
+.satellite-options-form #min-pass-elevation {
+  min-width: 5.5rem;
+}
+
+.satellite-refresh-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin-left: auto;
+}
+
+.satellite-control-status {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem 1.5rem;
+  margin-top: 0.9rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #273646;
+}
+
+.satellite-control-status .command-status {
+  flex: 1 1 24rem;
+  margin-top: 0;
+  text-align: right;
+}
+
+.satellite-list-section {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.satellite-list-heading p {
+  color: var(--app-muted);
+  font-size: 0.86rem;
+}
+
+.my-satellite-list {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.satellite-empty-state {
+  padding: 1.1rem;
+  border: 1px dashed #344658;
+  border-radius: 0.45rem;
+  color: var(--app-muted);
+  background: #0c1218;
+}
+
+.managed-satellite-container {
+  overflow: hidden;
+  border: 1px solid #2a3a4b;
+  border-radius: 0.45rem;
+  background: #0b1219;
+}
+
+.managed-satellite-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.8rem 0.95rem;
+  list-style: none;
+  cursor: pointer;
+  color: #f2f6fa;
+}
+
+.managed-satellite-summary::-webkit-details-marker {
+  display: none;
+}
+
+.managed-satellite-summary::marker {
+  content: "";
+}
+
+.managed-satellite-summary:hover {
+  background: #111e2a;
+}
+
+.managed-satellite-summary:focus-visible {
+  outline: 2px solid #69a5de;
+  outline-offset: -3px;
+}
+
+.managed-satellite-expand-icon {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 1.15rem;
+  height: 1.15rem;
+}
+
+.managed-satellite-expand-icon::before {
+  width: 0.42rem;
+  height: 0.42rem;
+  border-right: 2px solid #8da2b7;
+  border-bottom: 2px solid #8da2b7;
+  content: "";
+  transform: rotate(-45deg);
+  transition: transform 140ms ease;
+}
+
+.managed-satellite-container[open] .managed-satellite-expand-icon::before {
+  transform: rotate(45deg);
+}
+
+.managed-satellite-heading {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.7rem;
+}
+
+.managed-satellite-name {
+  overflow-wrap: anywhere;
+  font-weight: 650;
+}
+
+.managed-satellite-norad {
+  color: var(--app-muted);
+  font: 0.72rem/1.3 Consolas, "Courier New", monospace;
+}
+
+.managed-satellite-profile-count {
+  flex: 0 0 auto;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid #37516a;
+  border-radius: 999px;
+  color: #cfe2f3;
+  background: #122437;
+  font-size: 0.72rem;
+}
+
+.managed-satellite-summary .my-satellite-track-now {
+  flex: 0 0 auto;
+  min-width: 6.7rem;
+  font-weight: 600;
+}
+
+.managed-satellite-container[open] > .managed-satellite-summary {
+  border-bottom: 1px solid #314356;
+  background: #142536;
+}
+
+.managed-satellite-detail-slot {
+  background: #0f1822;
+}
+
+.selected-my-satellite-detail {
+  padding: 1rem;
+}
+
+.satellite-detail-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  margin-bottom: 0.85rem;
+}
+
+.satellite-detail-overview {
+  padding: 0.8rem;
+}
+
+.satellite-detail-identity {
+  min-width: 0;
+}
+
+.satellite-detail-actions {
+  flex: 0 0 auto;
+}
+
+.selected-my-satellite-detail .satellite-detail-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.85rem;
+}
+
+.satellite-detail-panel {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #2d3e50;
+  border-radius: 0.45rem;
+  background: #0b131b;
+}
+
+.satellite-detail-panel-header {
+  padding: 0.65rem 0.8rem;
+  border-bottom: 1px solid #2d3e50;
+  background: #13202c;
+}
+
+.satellite-detail-panel-body {
+  padding: 0.8rem;
+}
+
+.selected-my-satellite-detail .profile-item {
+  grid-template-columns: minmax(9rem, 1fr);
+  gap: 0.35rem;
+  border-radius: 0.3rem;
+}
+
+.satellite-custom-transponder {
+  margin-top: 0.9rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #263646;
+}
+
+.satellite-custom-transponder > summary {
+  cursor: pointer;
+}
+
+.satellite-custom-transponder .form-control,
+.satellite-custom-transponder .form-select {
+  min-width: 0;
+}
+
+@media (max-width: 991.98px) {
+  .satellite-refresh-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .selected-my-satellite-detail .satellite-detail-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 767.98px) {
+  .satellite-toolbar {
+    align-items: stretch;
+  }
+
+  .satellite-add-container,
+  .satellite-options-form,
+  .satellite-refresh-actions {
+    width: 100%;
+  }
+
+  .satellite-add-form {
+    grid-template-columns: 1fr;
+    grid-template-rows: none;
+  }
+
+  .satellite-add-form label[for="my-satellite-norad"],
+  .satellite-add-form #my-satellite-norad,
+  .satellite-add-form label[for="my-satellite-name"],
+  .satellite-add-form #my-satellite-name,
+  .satellite-add-form button {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .satellite-add-form button {
+    justify-self: start;
+  }
+
+  .satellite-refresh-actions > .btn {
+    flex: 1 1 12rem;
+  }
+
+  .satellite-control-status {
+    display: block;
+  }
+
+  .satellite-control-status .command-status {
+    margin-top: 0.4rem;
+    text-align: left;
+  }
+
+  .managed-satellite-summary {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+  }
+
+  .managed-satellite-heading,
+  .managed-satellite-profile-count {
+    grid-column: 2;
+  }
+
+  .managed-satellite-profile-count {
+    justify-self: start;
+    margin-top: 0.15rem;
+  }
+
+  .managed-satellite-summary .my-satellite-track-now {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+  }
+
+  .satellite-detail-top {
+    display: block;
+  }
+
+  .satellite-detail-actions {
+    margin-top: 0.65rem;
+  }
+}
+
+@media (max-width: 430px) {
+  .managed-satellite-summary {
+    gap: 0.55rem;
+    padding: 0.75rem;
+  }
+
+  .managed-satellite-profile-count {
+    display: none;
+  }
+
+  .managed-satellite-summary .my-satellite-track-now {
+    min-width: 0;
+    padding-inline: 0.55rem;
+    font-size: 0.78rem;
+  }
+}

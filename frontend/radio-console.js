@@ -1,4 +1,4 @@
-/* Radio-page presentation. The session and audio belong to the app, not a tab. */
+/* Native radio-console presentation. The session and audio persist across tabs. */
 (() => {
   'use strict';
   const root = document.getElementById('radio-console');
@@ -51,7 +51,7 @@
         ${button('SUB · RX', 'listen', 'data-value="SUB" aria-pressed="true"')}
         ${button('Both', 'listen', 'data-value="BOTH" aria-pressed="false" title="Dual audio: MAIN left, SUB right; requires stereo and both receivers active"')}</div>
       ${button('Dualwatch —', 'dualwatch', 'id="rc-dualwatch" data-radio title="Turn the radio SUB receiver on or off"')}
-      <button id="rc-power" type="button" class="rc-button rc-power" data-action="power"><span aria-hidden="true">⏻</span> Connect</button></div>
+      <button id="rc-power" type="button" class="rc-button rc-power" data-action="power" hidden><span aria-hidden="true">⏻</span> Connect</button></div>
     <div class="rc-tracking rc-panel" aria-label="Satellite tracking">
       <span class="rc-tracking-satellite"><span id="rc-tracking-label" class="rc-tracking-label">Currently tracking:</span>
         <strong id="rc-tracking-name">None</strong></span>
@@ -92,7 +92,7 @@
         aria-label="Tuning Tone" aria-pressed="false" title="Click to transmit a steady 600 Hz tone in USB/LSB; click again to stop">Tuning<br>Tone</button>
     </div>${pathPanel('SUB', 'RX')}</div>
     <footer class="rc-audio rc-panel"><div class="rc-volume"><label for="rc-volume">MONITOR VOLUME</label><input id="rc-volume" type="range" min="0" max="100" value="70"><output id="rc-volume-value">70%</output></div>
-      <span id="radio-audio-status" role="status">Audio off · starts with Connect</span>
+      <span id="radio-audio-status" role="status">Audio off · starts with Radio on the top toolbar</span>
       <span class="rc-persistent">Audio follows you across tabs</span></footer>
     <details class="rc-microphone rc-panel" id="rc-microphone-panel"><summary>Advanced Settings</summary>
       <div class="rc-advanced-columns">
@@ -101,7 +101,7 @@
         ${button('Refresh microphones', 'mic-refresh')}
         <label>Browser mic gain<input id="rc-mic-gain" type="range" min="0" max="200" value="100"><output id="rc-mic-gain-value">100%</output></label>
         <label>Mic level<meter id="rc-mic-meter" min="0" max="1" value="0" high="0.95" optimum="0.4"></meter><output id="rc-mic-level">Mic off</output></label>
-      </div><p id="rc-mic-requirements">Connect starts the microphone and streams it to Pi-Sat; capture does not key PTT.</p>
+      </div><p id="rc-mic-requirements">Radio on the top toolbar starts the microphone and streams it to Pi-Sat; capture does not key PTT.</p>
       <div class="rc-mic-settings">
         <div class="rc-mic-mode" role="group" aria-label="Radio microphone input source">
           <span>Radio mic input</span>
@@ -407,6 +407,7 @@
       const wasConnected = Boolean(state.connected);
       const wasDualwatch = state.dualwatch;
       Object.assign(state, update);
+      window.PiSatInterface?.renderRadio(state);
       if (state.dualwatch === true && wasDualwatch !== true) scopeSyncQueued = true;
       if (Boolean(state.connected) !== wasConnected) {
         scopeSyncQueued = true;
@@ -502,7 +503,7 @@
       } else {
         $('rc-status').textContent = state.last_error || (!state.enabled ? 'Enable advanced Icom radio control in Settings.'
           : connected ? `Single radio owner · network control${audioAvailable ? ' and audio' : ' · audio reconnecting'} · MAIN = TX · SUB = RX`
-            : 'Radio off. Press Connect to start control and audio.');
+            : 'Radio off. Use Radio on the top toolbar to start control and audio.');
       }
       $('rc-ptt-state').textContent = !connected ? 'PTT · UNKNOWN'
         : releasing ? 'PTT · RELEASING'
@@ -521,7 +522,7 @@
         ? 'Microphone blocked on HTTP. Open Pi-Sat using HTTPS or localhost; RX audio still works on HTTP.'
         : radioMicStream ? 'Microphone capture is on and streaming to Pi-Sat; it does not key PTT.'
           : radioMicStarting ? 'Waiting for microphone permission…'
-            : 'Connect starts the microphone and streams it to Pi-Sat; capture does not key PTT.';
+            : 'Radio on the top toolbar starts the microphone and streams it to Pi-Sat; capture does not key PTT.';
       const micConfig = state.microphone;
       const sourceNames = ['MIC', 'ACC', 'MIC+ACC', 'USB', 'MIC+USB', 'LAN'];
       const micSourceName = code => Number.isInteger(code) ? (sourceNames[code] || `Code ${code}`) : '—';

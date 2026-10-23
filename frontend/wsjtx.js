@@ -12,7 +12,15 @@
   const resetButton = byId('wsjtx-reset');
   const engineSelect = byId('wsjtx-engine');
   const decodeDepthSelect = byId('wsjtx-decode-depth');
+  const modeButtons = [
+    { button: byId('wsjtx-mode-ft4'), mode: 'FT4' },
+    { button: byId('wsjtx-mode-ft8'), mode: 'FT8' },
+  ].filter(item => item.button);
   let snapshot = null;
+  let configuredMode = '';
+  let modeSettingsLoaded = false;
+  let modeSaving = false;
+  let modeError = '';
   let selectedEngineKey = '';
   let manualEngineSelection = false;
   let selectedDecodeKey = '';
@@ -49,6 +57,13 @@
   const flags = decode => [decode.low_confidence ? 'Low confidence' : '', decode.off_air ? 'Off-air / replay' : ''].filter(Boolean).join(' · ');
   const transmission = entry => entry.transmitted === true || entry.direction === 'tx';
   const transmissionKey = entry => `tx:${entry.key}`;
+  const normalizeMode = value => {
+    const mode = String(value || '').toUpperCase();
+    return mode === 'FT4' || mode === 'FT8' ? mode : '';
+  };
+  const reportedMode = () => normalizeMode(snapshot?.engine?.tx?.mode || client()?.status?.mode);
+  const modeLocked = () => snapshot?.engine?.running === true || client()?.connected === true;
+  const selectedMode = () => reportedMode() || configuredMode || 'FT4';
 
   function activityEntries(limit = true) {
     const rx = (snapshot?.decodes || []).filter(entry => entry.client_key === selectedEngineKey);
@@ -121,6 +136,20 @@
     for (const decode of decodes) list.append(decodeRow(decode));
   }
 
+  function renderModeSetting() {
+    const selected = selectedMode();
+    const disabled = modeSaving || !modeSettingsLoaded || modeLocked();
+    for (const { button, mode } of modeButtons) {
+      button.setAttribute('aria-pressed', String(mode === selected));
+      button.disabled = disabled;
+    }
+    text('wsjtx-mode-setting-detail', modeError
+      || (modeSaving ? `Saving ${selectedMode()} mode...`
+        : modeLocked() ? 'Stop RX before changing the FT4 / FT8 mode.'
+          : `${selectedMode()} applies when WSJT-X RX starts.`));
+    byId('wsjtx-mode-setting-detail').dataset.state = modeError ? 'error' : modeSaving ? 'pending' : 'ready';
+  }
+
   function renderEngine() {
     const engine = client();
     const status = engine?.status || {};
@@ -145,7 +174,8 @@
     // Reset is a recovery action: it stays available for a managed engine even
     // while status is stale, so an operator is never locked out of recovery.
     resetButton.disabled = pending || !managed;
-    text('wsjtx-mode', status.mode || '—');
+    text('wsjtx-mode', reportedMode() || configuredMode || '—');
+    renderModeSetting();
     renderQso();
   }
 
@@ -396,6 +426,48 @@
     socket.onerror = () => socket?.close();
   }
 
+  async function loadModeSetting() {
+    try {
+      const response = await fetch('/api/settings', { cache: 'no-store' });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'FT mode settings are unavailable.');
+      configuredMode = normalizeMode(result?.settings?.wsjtx?.mode) || 'FT4';
+      modeSettingsLoaded = true;
+      modeError = '';
+    } catch (error) {
+      modeError = error.message || 'Unable to read the saved FT mode.';
+    }
+    renderModeSetting();
+  }
+
+  async function chooseMode(mode) {
+    if (!normalizeMode(mode) || modeSaving || !modeSettingsLoaded || modeLocked()) return;
+    if (configuredMode === mode) return;
+    modeSaving = true;
+    modeError = '';
+    renderModeSetting();
+    try {
+      const response = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings: { wsjtx: { mode } } }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || 'Unable to save the FT mode.');
+      configuredMode = normalizeMode(result?.settings?.wsjtx?.mode) || mode;
+      text('wsjtx-mode', reportedMode() || configuredMode);
+    } catch (error) {
+      modeError = error.message || 'Unable to save the FT mode.';
+    } finally {
+      modeSaving = false;
+      renderModeSetting();
+    }
+  }
+
+  for (const { button, mode } of modeButtons) {
+    button.addEventListener('click', () => chooseMode(mode));
+  }
+
   engineSelect.addEventListener('change', () => {
     manualEngineSelection = true;
     selectedEngineKey = engineSelect.value;
@@ -520,5 +592,6 @@
   window.addEventListener('resize', renderSpectrum);
   window.PiSatWsjtx = { renderSnapshot, decodeRow, renderTracking };
   void loadState();
+  void loadModeSetting();
   connectEvents();
 })();

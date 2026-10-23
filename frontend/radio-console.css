@@ -1,7 +1,4 @@
 /* Deliberately scoped: the rest of Pi-Sat retains its existing layout/theme. */
-/* The Radio page lets the console use the whole viewport, so the shared header
-   follows it rather than staying at the normal app-shell width. */
-.app-shell:has(#radio-page:not([hidden])) { max-width: none; }
 .radio-console {
   --rc-bg: #080f17; --rc-panel: #111d28; --rc-edge: #304554; --rc-muted: #95a9bd; --rc-blue: #2589ff;
   color: #eaf3ff; font-size: 13px; display: grid; gap: 12px;

@@ -43,7 +43,7 @@ choices without a software update.
 The connector receives this demodulated audio, not raw IF, I/Q, packets, or SSDV
 images. Normal AF consumers, including the built-in SSTV decoder, cannot use
 that shared input normally while the IF path is active. See
-[External DATA Decode](../docs/rx-audio-stream.md) for configuration and restoration
+[External DATA Decode](https://github.com/W9KSB/Pi-Sat/wiki/RX-Audio-Stream) for configuration and restoration
 behavior.
 
 ## Buffering and diagnostics

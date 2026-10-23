@@ -368,8 +368,8 @@ async function fetchJson(url, fallback) {
   }
 }
 
-// The device master switches appear in every page header, so they are addressed
-// by role instead of by element id and are kept in step with each other.
+// Address device switches by role so the shared toolbar retains independent
+// RX, TX and rotator state across page changes.
 const DEVICE_CONTROLS = [
   ['rx', 'RX control', 'rx_enabled'],
   ['tx', 'TX control', 'tx_enabled'],
@@ -392,6 +392,7 @@ function setDeviceControlChecked(control, enabled) {
   deviceControlToggles(control).forEach((toggle) => {
     toggle.checked = enabled;
   });
+  globalThis.PiSatInterface?.renderControlState();
 }
 
 function bindDeviceControlToggles(root) {
@@ -417,26 +418,11 @@ function renderStandardPageHeaders() {
   document.querySelectorAll('.standard-page-header').forEach((header) => {
     const title = header.dataset.pageTitle || '';
     const subtitle = header.dataset.pageSubtitle || '';
-    const secondaryNavigation = secondaryNavigationMarkup(header.dataset.subnav || '');
+    const secondaryNavigation = header.dataset.subnav === 'settings' ? secondaryNavigationMarkup('settings') : '';
     header.innerHTML = `
       <div class="card-body">
-        <div class="standard-header-grid">
-          <div class="standard-header-brand">
-            <div class="brand-lockup">
-              <img class="brand-satellite" src="/assets/pi-sat-satellite.png" alt="" aria-hidden="true">
-              <div>
-                <h1 class="h3 mb-0">${escapeHtml(title)}</h1>
-                <p class="text-body-secondary mb-0">${escapeHtml(subtitle)}</p>
-              </div>
-            </div>
-          </div>
-          <div class="standard-header-nav">
-            <nav class="nav nav-pills gap-2" aria-label="Primary navigation">
-              ${STANDARD_PAGE_NAV}
-            </nav>
-          </div>
-          <div class="standard-header-controls">${deviceControlSwitchesMarkup()}</div>
-        </div>
+        <h1>${escapeHtml(title)}</h1>
+        <p>${escapeHtml(subtitle)}</p>
       </div>
       ${secondaryNavigation}
     `;
@@ -478,6 +464,7 @@ async function loadStatus() {
       rotatorControlEnabled = Boolean(status.devices.rotator_enabled);
     }
     nativeIcomRxActive = status.icom?.enabled === true && status.icom?.rx_native === true;
+    globalThis.PiSatInterface?.applyMode(status.icom?.enabled);
     if (nativeIcomRxActive) {
       manualOffsetsEnabled = true;
       syncRxTx = true;
@@ -501,6 +488,7 @@ function renderRadioState(result) {
 }
 
 async function loadRadioState() {
+  if (globalThis.PiSatInterface && !globalThis.PiSatInterface.nativeEnabled) return null;
   const result = await fetchJson('/api/radio', null);
   if (result) renderRadioState(result);
   return result;
@@ -1161,11 +1149,13 @@ async function selectRadioMicrophone(deviceId) {
 }
 
 function showPage(pageName) {
-  const selectedPage = MODULE_NAMES.includes(pageName)
+  let selectedPage = MODULE_NAMES.includes(pageName)
     ? pageName
     : PAGE_NAMES.includes(pageName)
       ? (pageName === 'modules' ? activeModuleName : pageName)
       : 'home';
+  if (globalThis.PiSatInterface && !globalThis.PiSatInterface.isAvailable(selectedPage)) selectedPage = 'home';
+  globalThis.PiSatInterface?.showPage(selectedPage);
   const primaryPage = MODULE_NAMES.includes(selectedPage) ? 'modules' : selectedPage;
   const primaryPageChanged = primaryPage !== activePrimaryPageName;
   activePrimaryPageName = primaryPage;
@@ -1177,7 +1167,7 @@ function showPage(pageName) {
     view.hidden = view.dataset.moduleView !== selectedPage;
   });
   document.querySelectorAll('[data-page]').forEach((button) => {
-    const active = button.dataset.page === primaryPage;
+    const active = button.dataset.page === selectedPage || (button.dataset.page === 'modules' && primaryPage === 'modules');
     button.classList.toggle('active', active);
     button.setAttribute('aria-current', active ? 'page' : 'false');
   });
@@ -1186,6 +1176,12 @@ function showPage(pageName) {
     button.classList.toggle('active', active);
     button.setAttribute('aria-selected', String(active));
   });
+  const moduleHeader = document.querySelector('#modules-page .standard-page-header');
+  if (moduleHeader && MODULE_NAMES.includes(selectedPage)) {
+    moduleHeader.hidden = !['map', 'qso-finder'].includes(selectedPage);
+    const heading = moduleHeader.querySelector('h1');
+    if (heading) heading.textContent = MODULE_NAV.find(item => item.id === selectedPage)?.label || 'Modules';
+  }
   if (selectedPage === 'settings') {
     setActiveSettingsSection(settingsSectionFromHash());
     if (primaryPageChanged || !document.querySelector('[data-settings-panel]')) loadSettings();
@@ -1213,6 +1209,7 @@ function showPage(pageName) {
 function pageFromHash() {
   const route = window.location.hash.replace(/^#/, '').split('/').filter(Boolean);
   const page = route[0] || 'home';
+  if (page === 'radio') return 'home';
   if (page === 'modules') {
     return MODULE_NAMES.includes(route[1]) ? route[1] : activeModuleName;
   }
@@ -1322,25 +1319,23 @@ async function loadSatellites() {
 }
 
 async function loadSdrFrequency() {
-  const frequencyElement = document.getElementById('rx-frequency');
-  if (!frequencyElement) {
-    return;
-  }
-
-  try {
-    const response = await fetch('/api/devices/sdr/frequency');
-    const result = await response.json();
-
-    if (!result.connected) {
-      frequencyElement.textContent = result.error || 'Not connected';
-      return;
+  if (globalThis.PiSatInterface?.nativeEnabled) return;
+  await Promise.all(['rx', 'tx'].map(async (role) => {
+    const frequencyElement = document.getElementById(`${role}-frequency`);
+    if (!frequencyElement) return;
+    const state = document.getElementById(`${role}-frequency-status`);
+    try {
+      const response = await fetch(`/api/devices/${role === 'rx' ? 'sdr' : 'tx'}/frequency`);
+      if (!response.ok) throw new Error('Read failed');
+      const result = await response.json();
+      const valid = result.connected && Number.isFinite(result.frequency_hz);
+      frequencyElement.textContent = valid ? `${(result.frequency_hz / 1e6).toFixed(6)} MHz` : '—';
+      if (state) state.textContent = result.error || (valid ? 'Device readback' : 'Not connected');
+    } catch (error) {
+      frequencyElement.textContent = '—';
+      if (state) state.textContent = 'Read failed';
     }
-
-    frequencyElement.textContent =
-      `${Number(result.frequency_hz).toLocaleString()} Hz`;
-  } catch (error) {
-    frequencyElement.textContent = 'Read failed';
-  }
+  }));
 }
 
 async function stepSdrFrequency(event) {
@@ -2445,6 +2440,7 @@ function drawQsoLegend(ctx, width, height, opportunity) {
 }
 
 function renderRotator(result) {
+  globalThis.PiSatInterface?.renderRotator(result);
   const stateLabel = document.getElementById('rotator-state-label');
   stateLabel.textContent = result.tracking_message
     || result.state_label
@@ -2534,6 +2530,11 @@ async function loadSettings() {
     currentSecretStatus = result.secret_status || {};
     catDevicesCache = Array.isArray(result.cat_devices) ? result.cat_devices : [];
     form.replaceChildren();
+    form.appendChild(
+      buildSettingsExperienceSelector(
+        settingsExperienceModeFromSettings(currentSettingsState),
+      ),
+    );
     const panelHost = document.createElement('div');
     panelHost.className = 'settings-panels';
     const panels = new Map(SETTINGS_NAV.map(({ id }) => {
@@ -2560,6 +2561,10 @@ async function loadSettings() {
       safety: 'other',
     };
     const appendToSettingsPanel = (source, element) => {
+      element.dataset.settingsSource = source;
+      if (['aprs', 'wsjtx', 'sstv'].includes(source)) {
+        element.dataset.settingsExperience = 'native';
+      }
       panels.get(settingsPanelBySource[source] || 'other').appendChild(element);
     };
     const orderedSections = ['server', 'station', 'tle', 'device_roles', 'rotator', 'automation', 'aprs', 'wsjtx', 'sstv', 'safety'];
@@ -2599,6 +2604,7 @@ async function loadSettings() {
 
       appendToSettingsPanel(section, fieldset);
     });
+    setSettingsExperienceMode(settingsExperienceModeFromForm(form));
     setActiveSettingsSection(activeSettingsSection);
     applyCatDeviceConnectivityState();
     applyConnectivityState();
@@ -2612,6 +2618,136 @@ async function loadSettings() {
   }
 }
 
+function buildSettingsExperienceSelector(mode) {
+  const section = document.createElement('section');
+  section.className = 'settings-mode-selector';
+  section.setAttribute('aria-labelledby', 'settings-experience-question');
+
+  const heading = document.createElement('h2');
+  heading.id = 'settings-experience-question';
+  heading.textContent = 'Remotely operating an Icom IC-9700?';
+
+  const description = document.createElement('p');
+  description.textContent = 'Choose Native. For other radios or SDR setups, choose Legacy.';
+
+  const fieldset = document.createElement('fieldset');
+  const legend = document.createElement('legend');
+  legend.className = 'visually-hidden';
+  legend.textContent = 'Settings experience';
+
+  const options = document.createElement('div');
+  options.className = 'settings-mode-options';
+  [
+    {
+      value: 'native',
+      title: 'Native · Icom IC-9700',
+      copy: 'Yes, I remotely operate an Icom IC-9700.',
+      detail: 'LAN connection · MAIN / SUB · spectrum and waterfall · native modules',
+    },
+    {
+      value: 'legacy',
+      title: 'Legacy · Other radio setups',
+      copy: 'I use separate radios, an SDR plus a radio, or another supported setup.',
+      detail: 'Independent RX / TX roles · generic Hamlib and SDR devices',
+    },
+  ].forEach(({ value, title, copy, detail }) => {
+    const label = document.createElement('label');
+    label.className = 'settings-mode-choice';
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = 'settings-experience';
+    input.dataset.settingsExperienceInput = 'true';
+    input.value = value;
+    input.checked = mode === value;
+    input.addEventListener('change', () => {
+      if (input.checked) {
+        setSettingsExperienceMode(value);
+      }
+    });
+
+    const content = document.createElement('span');
+    const strong = document.createElement('strong');
+    strong.textContent = title;
+    const summary = document.createElement('span');
+    summary.textContent = copy;
+    const small = document.createElement('small');
+    small.textContent = detail;
+    content.append(strong, summary, small);
+    label.append(input, content);
+    options.appendChild(label);
+  });
+
+  fieldset.append(legend, options);
+  section.append(heading, description, fieldset);
+  return section;
+}
+
+function settingsExperienceModeFromSettings(settings = {}) {
+  if (Object.hasOwn(settings?.icom || {}, 'enabled')) {
+    return String(settings.icom.enabled).toLowerCase() === 'true' ? 'native' : 'legacy';
+  }
+  const nativeRole = [settings?.rx?.device_id, settings?.tx?.device_id]
+    .some((deviceId) => String(deviceId || '') === NATIVE_ICOM_DEVICE_ID);
+  return nativeRole ? 'native' : 'legacy';
+}
+
+function settingsExperienceModeFromForm(form = document.getElementById('settings-form')) {
+  const selected = form?.querySelector('[data-settings-experience-input]:checked')?.value;
+  return selected === 'native' ? 'native' : 'legacy';
+}
+
+function setSettingsExperienceMode(mode) {
+  const form = document.getElementById('settings-form');
+  if (!form) {
+    return;
+  }
+  const normalized = mode === 'native' ? 'native' : 'legacy';
+  form.dataset.settingsExperience = normalized;
+  form.querySelectorAll('[data-settings-experience-input]').forEach((input) => {
+    input.checked = input.value === normalized;
+  });
+  form.querySelectorAll('[data-settings-experience]').forEach((element) => {
+    element.hidden = element.dataset.settingsExperience !== normalized;
+  });
+
+  const enabledToggle = form.querySelector('input[type="checkbox"][name="icom.enabled"]');
+  if (enabledToggle) {
+    enabledToggle.checked = normalized === 'native';
+  }
+  const enabledDraft = form.querySelector('input[type="hidden"][name="icom.enabled"]');
+  if (enabledDraft) {
+    enabledDraft.value = normalized === 'native' ? 'true' : 'false';
+  }
+  refreshRoleDeviceSelectors();
+}
+
+function applySettingsExperienceDraft(settings, mode) {
+  if (!settings.icom) {
+    settings.icom = {};
+  }
+  settings.icom.enabled = mode === 'native' ? 'true' : 'false';
+  if (mode !== 'native') {
+    return;
+  }
+  settings.rx = {
+    ...(settings.rx || {}),
+    device_id: NATIVE_ICOM_DEVICE_ID,
+    target_vfo: 'SUB',
+  };
+  settings.tx = {
+    ...(settings.tx || {}),
+    device_id: NATIVE_ICOM_DEVICE_ID,
+    target_vfo: 'MAIN',
+  };
+}
+
+function settingsExperienceValidationError(settings, mode) {
+  if (mode !== 'legacy') return '';
+  const nativeRoles = ['rx', 'tx'].filter(role => settings[role]?.device_id === NATIVE_ICOM_DEVICE_ID);
+  if (!nativeRoles.length) return '';
+  return `Settings not saved. Choose a generic device for ${nativeRoles.map(role => role.toUpperCase()).join(' and ')} in Legacy mode, or select Native for IC-9700 control.`;
+}
+
 function buildMyDevicesSection(icomKeys, icomSettings, rxSettings, txSettings, catDevices) {
   const section = document.createElement('section');
   section.className = 'my-devices-settings';
@@ -2623,10 +2759,15 @@ function buildMyDevicesSection(icomKeys, icomSettings, rxSettings, txSettings, c
   const nativeKeys = icomKeys.filter((key) => !hiddenSettingsKeys.icom?.has(key));
   const native = buildSettingsSection('icom', nativeKeys, icomSettings);
   native.classList.add('native-icom-settings');
+  native.dataset.settingsExperience = 'native';
   native.querySelector('legend').textContent = 'Icom IC-9700';
+  const enabledRow = native.querySelector('[data-setting-key="enabled"]');
+  if (enabledRow) {
+    enabledRow.hidden = true;
+  }
   const nativeNote = document.createElement('div');
   nativeNote.className = 'automation-settings-note settings-row-wide';
-  nativeNote.textContent = 'First-class Pi-Sat network control for Radio, spectrum, audio and satellite tracking through one shared native CI-V core.';
+  nativeNote.textContent = 'One native IC-9700 provides the radio connection, spectrum, audio, and module support. RX uses SUB; TX uses MAIN.';
   native.insertBefore(nativeNote, native.children[1] || null);
   section.appendChild(native);
 
@@ -2634,6 +2775,8 @@ function buildMyDevicesSection(icomKeys, icomSettings, rxSettings, txSettings, c
 
   const otherDevices = document.createElement('details');
   otherDevices.className = 'other-devices-settings';
+  otherDevices.dataset.settingsExperience = 'legacy';
+  otherDevices.open = true;
   const summary = document.createElement('summary');
   summary.textContent = 'Other Devices';
   otherDevices.append(summary, buildCatDevicesSection(catDevices));
@@ -2697,7 +2840,13 @@ function buildCatDeviceCard(device) {
   const title = document.createElement('div');
   title.className = 'cat-device-card-title';
   title.textContent = device.name || 'New Device';
-  header.appendChild(title);
+
+  const removeButton = document.createElement('button');
+  removeButton.type = 'button';
+  removeButton.className = 'btn btn-outline-danger btn-sm cat-device-remove';
+  removeButton.textContent = 'Remove';
+  removeButton.addEventListener('click', () => removeCatDevice(card));
+  header.append(title, removeButton);
   card.appendChild(header);
 
   const body = document.createElement('div');
@@ -2709,7 +2858,10 @@ function buildCatDeviceCard(device) {
   const topGrid = document.createElement('div');
   topGrid.className = 'cat-device-top-grid';
   topGrid.append(
-    buildCatDeviceField('Name', 'name', device.name || '', { inputClass: 'compact-input' }),
+    buildCatDeviceField('Name', 'name', device.name || '', {
+      inputClass: 'compact-input',
+      placeholder: 'Enter device name',
+    }),
     buildCatDeviceField('Device ID', 'device_id', device.device_id || '', { inputClass: 'compact-input' }),
     buildCatDeviceField('Connectivity', 'connectivity', device.connectivity || '', { type: 'connectivity' }),
     buildCatDeviceField('Timeout (s)', 'timeout_s', device.timeout_s || '2.0', { inputMode: 'decimal', compactClass: 'settings-row-compact-sm' }),
@@ -2752,13 +2904,7 @@ function buildCatDeviceCard(device) {
   testButton.textContent = 'Test Radio';
   testButton.addEventListener('click', () => testCatDevice(card));
 
-  const removeButton = document.createElement('button');
-  removeButton.type = 'button';
-  removeButton.className = 'btn btn-outline-danger btn-sm';
-  removeButton.textContent = 'Remove';
-  removeButton.addEventListener('click', () => removeCatDevice(card));
-
-  buttons.append(saveButton, testButton, removeButton);
+  buttons.append(saveButton, testButton);
   actions.appendChild(buttons);
 
   const status = document.createElement('div');
@@ -2823,6 +2969,9 @@ function buildCatDeviceField(label, key, value, options = {}) {
     control = document.createElement('input');
     control.className = `form-control ${options.inputClass || ''}`.trim();
     control.value = value;
+    if (options.placeholder) {
+      control.placeholder = options.placeholder;
+    }
     if (options.inputMode) {
       control.inputMode = options.inputMode;
     }
@@ -2879,6 +3028,7 @@ function markCatDeviceDirty(card) {
 
 function buildRoleAssignmentSection(section, sectionSettings) {
   const fieldset = document.createElement('fieldset');
+  fieldset.dataset.settingsExperience = 'legacy';
   const legend = document.createElement('legend');
   legend.textContent = formatSectionLegend(section);
   fieldset.appendChild(legend);
@@ -2899,6 +3049,18 @@ function buildDeviceRolesSection(rxSettings, txSettings) {
   const legend = document.createElement('legend');
   legend.textContent = 'Device Roles';
   fieldset.appendChild(legend);
+
+  const nativeNote = document.createElement('div');
+  nativeNote.className = 'automation-settings-note settings-row-wide';
+  nativeNote.dataset.settingsExperience = 'native';
+  nativeNote.textContent = 'Native mode fixes RX to SUB and TX to MAIN. Use the tests below without changing the saved role drafts.';
+  fieldset.appendChild(nativeNote);
+
+  const legacyNote = document.createElement('div');
+  legacyNote.className = 'automation-settings-note settings-row-wide';
+  legacyNote.dataset.settingsExperience = 'legacy';
+  legacyNote.textContent = 'Assign the configured device for each role, then test the selected device.';
+  fieldset.appendChild(legacyNote);
 
   const layout = document.createElement('div');
   layout.className = 'device-roles-layout';
@@ -3070,9 +3232,12 @@ async function loadAutomationScripts() {
   return result?.scripts || [];
 }
 
+let expandedManagedSatelliteNorad = null;
+
 function ensureManagedSatelliteSelection() {
   if (!managedSatellitesCache.length) {
     selectedManagedSatelliteNorad = null;
+    expandedManagedSatelliteNorad = null;
     return;
   }
   const stillExists = managedSatellitesCache.some(
@@ -3081,6 +3246,57 @@ function ensureManagedSatelliteSelection() {
   if (!stillExists) {
     selectedManagedSatelliteNorad = Number(managedSatellitesCache[0].norad_id);
   }
+  const expandedStillExists = managedSatellitesCache.some(
+    (satellite) => Number(satellite.norad_id) === Number(expandedManagedSatelliteNorad)
+  );
+  if (!expandedStillExists) {
+    expandedManagedSatelliteNorad = null;
+  }
+}
+
+function expandManagedSatellite(noradId) {
+  const id = Number(noradId);
+  const list = document.getElementById('my-satellite-list');
+  const detail = document.getElementById('selected-my-satellite-detail');
+  if (!list || !detail) {
+    return;
+  }
+  list.querySelectorAll('.managed-satellite-container[open]').forEach((container) => {
+    if (Number(container.dataset.noradId) !== id) {
+      container.open = false;
+    }
+  });
+  const item = list.querySelector(`.managed-satellite-container[data-norad-id="${id}"]`);
+  const slot = item?.querySelector('[data-managed-satellite-detail-slot]');
+  if (!item || !slot) {
+    return;
+  }
+  expandedManagedSatelliteNorad = id;
+  selectedManagedSatelliteNorad = id;
+  item.open = true;
+  slot.appendChild(detail);
+  detail.hidden = false;
+  updateManagedSatelliteDataAction();
+  renderManagedSatelliteDetail();
+}
+
+function updateManagedSatelliteDataAction() {
+  const button = document.getElementById('refresh-transponder-data-btn');
+  if (!button) {
+    return;
+  }
+  const satellite = managedSatellitesCache.find(
+    (item) => Number(item.norad_id) === Number(expandedManagedSatelliteNorad)
+  );
+  button.disabled = !satellite;
+  button.onclick = satellite
+    ? () => updateFrequencyProfiles(satellite.norad_id)
+    : null;
+  const label = satellite
+    ? `Update transponder data for ${satellite.name}`
+    : 'Open a satellite to update its transponder data';
+  button.title = label;
+  button.setAttribute('aria-label', `${label}.`);
 }
 
 function renderManagedSatelliteList() {
@@ -3088,55 +3304,85 @@ function renderManagedSatelliteList() {
   if (!list) {
     return;
   }
+  const detail = document.getElementById('selected-my-satellite-detail');
+  const detailReserve = document.getElementById('selected-my-satellite-detail-reserve');
+  if (detail && detailReserve) {
+    detailReserve.appendChild(detail);
+    detail.hidden = true;
+  }
   list.replaceChildren();
+  updateManagedSatelliteDataAction();
+
   if (!managedSatellitesCache.length) {
     const empty = document.createElement('div');
-    empty.className = 'text-body-secondary small';
+    empty.className = 'satellite-empty-state';
     empty.textContent = 'No tracked satellites yet.';
     list.appendChild(empty);
     return;
   }
 
   managedSatellitesCache.forEach((satellite) => {
-    const profiles = managedSatelliteProfilesByNorad.get(Number(satellite.norad_id)) || [];
-    const item = document.createElement('div');
-    item.className = 'list-group-item my-satellite-row d-flex justify-content-between align-items-start gap-3';
-    if (Number(satellite.norad_id) === Number(selectedManagedSatelliteNorad)) {
-      item.classList.add('active');
-    }
-    const selectButton = document.createElement('button');
-    selectButton.type = 'button';
-    selectButton.className = 'my-satellite-select btn btn-link text-decoration-none text-start p-0';
-    const label = document.createElement('div');
-    label.className = 'text-start';
-    const title = document.createElement('div');
-    title.className = 'fw-semibold';
+    const noradId = Number(satellite.norad_id);
+    const profiles = managedSatelliteProfilesByNorad.get(noradId) || [];
+    const item = document.createElement('details');
+    item.className = 'managed-satellite-container satellite-container';
+    item.dataset.noradId = String(noradId);
+    item.open = Number(expandedManagedSatelliteNorad) === noradId;
+
+    const summary = document.createElement('summary');
+    summary.className = 'managed-satellite-summary';
+    const expandIcon = document.createElement('span');
+    expandIcon.className = 'managed-satellite-expand-icon';
+    expandIcon.setAttribute('aria-hidden', 'true');
+    const heading = document.createElement('span');
+    heading.className = 'managed-satellite-heading';
+    const title = document.createElement('span');
+    title.className = 'managed-satellite-name';
     title.textContent = satellite.name;
-    const subtitle = document.createElement('div');
-    subtitle.className = 'small opacity-75';
+    const subtitle = document.createElement('span');
+    subtitle.className = 'managed-satellite-norad';
     subtitle.textContent = `NORAD ${satellite.norad_id}`;
-    label.append(title, subtitle);
+    heading.append(title, subtitle);
     const badge = document.createElement('span');
-    badge.className = 'badge text-bg-secondary align-self-center';
+    badge.className = 'managed-satellite-profile-count';
     badge.textContent = `${profiles.length} profile${profiles.length === 1 ? '' : 's'}`;
-    selectButton.append(label, badge);
-    selectButton.addEventListener('click', () => {
-      selectedManagedSatelliteNorad = Number(satellite.norad_id);
-      renderManagedSatelliteList();
-      renderManagedSatelliteDetail();
-    });
     const trackButton = document.createElement('button');
     trackButton.type = 'button';
-    trackButton.className = 'btn btn-success btn-sm flex-shrink-0 my-satellite-track-now';
+    trackButton.className = 'btn btn-success btn-sm my-satellite-track-now';
     trackButton.textContent = 'Track Now';
-    trackButton.addEventListener('click', async () => {
-      selectedManagedSatelliteNorad = Number(satellite.norad_id);
-      renderManagedSatelliteList();
-      renderManagedSatelliteDetail();
-      await trackManagedSatelliteNow(satellite.norad_id);
+    trackButton.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      expandManagedSatellite(noradId);
+      await trackManagedSatelliteNow(noradId);
     });
-    item.append(selectButton, trackButton);
+    summary.append(expandIcon, heading, badge, trackButton);
+
+    const detailSlot = document.createElement('div');
+    detailSlot.className = 'managed-satellite-detail-slot';
+    detailSlot.dataset.managedSatelliteDetailSlot = '';
+    item.append(summary, detailSlot);
+    item.addEventListener('toggle', () => {
+      if (!list.contains(item)) {
+        return;
+      }
+      if (item.open) {
+        expandManagedSatellite(noradId);
+      } else if (Number(expandedManagedSatelliteNorad) === noradId) {
+        expandedManagedSatelliteNorad = null;
+        if (detail && detailReserve) {
+          detailReserve.appendChild(detail);
+          detail.hidden = true;
+        }
+        updateManagedSatelliteDataAction();
+      }
+    });
     list.appendChild(item);
+
+    if (item.open && detail) {
+      detailSlot.appendChild(detail);
+      detail.hidden = false;
+    }
   });
 }
 
@@ -3470,7 +3716,7 @@ function collectSectionSettings(section) {
   const form = document.getElementById('settings-form');
   const settings = {};
   Array.from(form.elements).forEach((element) => {
-    if (!element.name || element.type === 'checkbox') {
+    if (!element.name?.includes('.') || element.type === 'checkbox') {
       return;
     }
     const [elementSection, key] = element.name.split('.');
@@ -3479,6 +3725,13 @@ function collectSectionSettings(section) {
     }
     settings[key] = element.value;
   });
+  if (
+    (section === 'rx' || section === 'tx')
+    && settingsExperienceModeFromForm(form) === 'native'
+  ) {
+    settings.device_id = NATIVE_ICOM_DEVICE_ID;
+    settings.target_vfo = section === 'tx' ? 'MAIN' : 'SUB';
+  }
   return settings;
 }
 
@@ -3486,7 +3739,7 @@ function createEmptyCatDevice() {
   const nextNumber = document.querySelectorAll('.cat-device-card').length + 1;
   return {
     device_id: `device-${nextNumber}`,
-    name: `Device ${nextNumber}`,
+    name: '',
     connectivity: '',
     host: '',
     port: '4532',
@@ -3645,7 +3898,10 @@ function updateRoleTestButtons() {
       return;
     }
     const selectedDeviceId = document.querySelector(`select[name="${section}.device_id"]`)?.value || '';
-    if (selectedDeviceId === NATIVE_ICOM_DEVICE_ID) {
+    if (
+      settingsExperienceModeFromForm() === 'native'
+      || selectedDeviceId === NATIVE_ICOM_DEVICE_ID
+    ) {
       button.disabled = false;
       button.title = `Test native IC-9700 ${section === 'rx' ? 'SUB/RX' : 'MAIN/TX'} control and audio without transmitting.`;
       return;
@@ -4262,13 +4518,13 @@ function buildSettingControl(section, key, value) {
   } else if (section === 'wsjtx' && key === 'mode') {
     control = document.createElement('select');
     control.className = 'form-select';
-    ['FT8', 'FT4'].forEach((mode) => {
+    ['FT4', 'FT8'].forEach((mode) => {
       const option = document.createElement('option');
       option.value = mode;
       option.textContent = mode;
       control.appendChild(option);
     });
-    control.value = value || 'FT8';
+    control.value = String(value || '').toUpperCase() === 'FT8' ? 'FT8' : 'FT4';
   } else if (section === 'aprs' && key === 'channel') {
     control = document.createElement('select');
     control.className = 'form-select';
@@ -4463,10 +4719,11 @@ function buildCatDeviceSelect(value, options = {}) {
   const selectedValue = String(value || '');
   const nativeOption = document.createElement('option');
   nativeOption.value = NATIVE_ICOM_DEVICE_ID;
-  const nativeEnabled = String(currentSettingsState?.icom?.enabled || '').toLowerCase() === 'true';
+  const nativeEnabled = settingsExperienceModeFromForm() === 'native';
   nativeOption.textContent = nativeEnabled
     ? 'Icom IC-9700 (Native Pi-Sat)'
-    : 'Icom IC-9700 (Native Pi-Sat - enable above)';
+    : 'Icom IC-9700 (Native Pi-Sat - choose Native above)';
+  nativeOption.disabled = !nativeEnabled;
   control.appendChild(nativeOption);
   const selectableDevices = catDevicesCache.filter((device) => {
     const connectivity = String(device.connectivity || '').toLowerCase();
@@ -4694,7 +4951,7 @@ async function saveSettings(event) {
   const settings = {};
 
   Array.from(form.elements).forEach((element) => {
-    if (!element.name) {
+    if (!element.name?.includes('.')) {
       return;
     }
     if (element.type === 'checkbox') {
@@ -4709,6 +4966,17 @@ async function saveSettings(event) {
     }
     settings[section][key] = element.value;
   });
+  const experienceMode = settingsExperienceModeFromForm(form);
+  const experienceError = settingsExperienceValidationError(settings, experienceMode);
+  if (experienceError) {
+    status.textContent = experienceError;
+    setActiveSettingsSection('devices');
+    window.location.hash = 'settings/devices';
+    const role = ['rx', 'tx'].find(name => settings[name]?.device_id === NATIVE_ICOM_DEVICE_ID);
+    form.querySelector(`select[name="${role}.device_id"]`)?.focus();
+    return;
+  }
+  applySettingsExperienceDraft(settings, experienceMode);
 
   const orbitalSourceChanged = settings.tle?.source_url !== undefined
     && settings.tle.source_url !== currentSettingsState?.tle?.source_url;
@@ -4981,6 +5249,7 @@ function renderTracking(result) {
     return;
   }
   latestTracking = result;
+  globalThis.PiSatInterface?.renderTracking(result);
   latestTrackingReceivedAtMs = Date.now();
   rememberTrackingProfile(result);
   if (sharedTrackingSelectionDiffers(result)) {
@@ -5558,78 +5827,66 @@ function drawPassArc() {
   const width = canvas.width;
   const height = canvas.height;
   ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = '#091320';
-  ctx.fillRect(0, 0, width, height);
-  ctx.strokeStyle = '#2d5872';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(0.5, 0.5, width - 1, height - 1);
-
   const pass = getActiveOrNextPass();
+  const state = document.getElementById('pass-progress-state');
+  const countdown = document.getElementById('pass-countdown');
   if (!pass) {
     updateLiveTrackingTitle(null);
-    ctx.fillStyle = '#b2c1cd';
-    ctx.font = '12px Arial';
-    ctx.fillText('No pass data available', 12, 24);
+    if (state) state.textContent = 'No upcoming pass';
+    if (countdown) countdown.textContent = '';
     return;
   }
-
-  const baseY = height - 18;
-  const startX = 18;
-  const endX = width - 18;
-  const peakX = (startX + endX) / 2;
-  const peakHeight = Math.max(16, Math.min(56, Number(pass.max_elevation_deg) * 0.52));
-  const peakY = baseY - peakHeight;
-
-  ctx.strokeStyle = '#325f7f';
-  ctx.beginPath();
-  ctx.moveTo(startX, baseY);
-  ctx.lineTo(endX, baseY);
-  ctx.stroke();
-
-  ctx.strokeStyle = '#2bb7ff';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(startX, baseY);
-  ctx.quadraticCurveTo(peakX, peakY, endX, baseY);
-  ctx.stroke();
-
   const nowMs = Date.now();
   const aosMs = new Date(pass.aos_utc).getTime();
   const losMs = new Date(pass.los_utc).getTime();
-  const progress = Math.max(0, Math.min(1, (nowMs - aosMs) / Math.max(1, losMs - aosMs)));
-  const satX = startX + (endX - startX) * progress;
-  const satT = progress;
-  const satY = ((1 - satT) * (1 - satT) * baseY) + (2 * (1 - satT) * satT * peakY) + (satT * satT * baseY);
-  ctx.fillStyle = '#ffd45b';
-  ctx.beginPath();
-  ctx.arc(satX, satY, 4, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = '#5fd0ff';
-  ctx.font = '10px Arial';
-  ctx.textAlign = 'left';
-  ctx.fillText('AOS', startX, 16);
-  ctx.fillStyle = '#9ecbf1';
-  ctx.fillText(formatTimeOnly(new Date(pass.aos_utc), false), startX, 28);
-  ctx.fillStyle = '#5fd0ff';
+  if (!Number.isFinite(aosMs) || !Number.isFinite(losMs) || losMs <= aosMs) return;
+  const maximumMs = Date.parse(pass.max_utc);
+  const peakAt = Number.isFinite(maximumMs) ? Math.max(.05, Math.min(.95, (maximumMs - aosMs) / (losMs - aosMs))) : .5;
+  const progress = Math.max(0, Math.min(1, (nowMs - aosMs) / (losMs - aosMs)));
+  const point = t => passArcPoint(t, peakAt, width, height);
+  const trace = (end, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const first = point(0);
+    ctx.moveTo(first.x, first.y);
+    for (let step = 1; step <= Math.ceil(end * 160); step++) {
+      const p = point(Math.min(end, step / 160));
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+  };
+  trace(1, '#40566b');
+  const active = nowMs >= aosMs && nowMs <= losMs;
+  if (active) {
+    trace(progress, '#7fc3ff');
+    const p = point(progress);
+    ctx.strokeStyle = '#7091aa';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath(); ctx.moveTo(p.x, p.y + 5); ctx.lineTo(p.x, height - 16); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#90cfff'; ctx.strokeStyle = '#e5f4ff';
+    ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  }
+  ctx.fillStyle = '#a7b8c9'; ctx.font = '10px Segoe UI';
+  ctx.textAlign = 'left'; ctx.fillText(`AOS  ${formatTimeOnly(new Date(aosMs), false)}`, 8, height - 2);
   ctx.textAlign = 'center';
-  ctx.fillText('MAX', peakX, 16);
-  ctx.fillStyle = '#9ecbf1';
-  ctx.fillText(`${Number(pass.max_elevation_deg).toFixed(0)} deg`, peakX, 28);
-  ctx.fillStyle = '#ff7777';
-  ctx.textAlign = 'right';
-  ctx.fillText('LOS', endX, 16);
-  ctx.fillStyle = '#ff9e9e';
-  ctx.fillText(formatTimeOnly(new Date(pass.los_utc), false), endX, 28);
-
+  ctx.fillText(`${Number(pass.max_elevation_deg).toFixed(0)}° MAX`, width * peakAt, 11);
+  ctx.fillText(`MAX  ${Number.isFinite(maximumMs) ? formatTimeOnly(new Date(maximumMs), false) : '—'}`, width * peakAt, height - 2);
+  ctx.textAlign = 'right'; ctx.fillText(`LOS  ${formatTimeOnly(new Date(losMs), false)}`, width - 8, height - 2);
   const secondsToLos = Math.max(0, Math.floor((losMs - nowMs) / 1000));
-  updateLiveTrackingTitle(nowMs >= aosMs && nowMs <= losMs ? secondsToLos : null);
-  ctx.textAlign = 'center';
-  ctx.font = '10px Arial';
-  ctx.fillStyle = '#a4b9ca';
-  ctx.fillText('W', startX, height - 6);
-  ctx.fillText('N', peakX, height - 6);
-  ctx.fillText('E', endX, height - 6);
+  if (state) state.textContent = active ? 'Pass in progress' : nowMs < aosMs ? 'Upcoming pass' : 'Pass complete';
+  if (countdown) countdown.textContent = active ? `LOS in ${formatCountdown(secondsToLos)}` : nowMs < aosMs ? `AOS in ${formatCountdown((aosMs - nowMs) / 1000)}` : '';
+  const name = document.getElementById('pass-satellite-name');
+  if (name) name.textContent = pass.satellite_name || latestTracking?.satellite_name || 'No satellite selected';
+  updateLiveTrackingTitle(active ? secondsToLos : null);
+}
+
+function passArcPoint(progress, peakAt, width, height) {
+  const t = Math.max(0, Math.min(1, progress));
+  const phase = t <= peakAt ? t / peakAt : (1 - t) / (1 - peakAt);
+  return { x: 8 + (width - 16) * t, y: height - 18 - (height - 33) * Math.sin(phase * Math.PI / 2) };
 }
 
 function updateLiveTrackingTitle(secondsToLos) {
@@ -5637,11 +5894,7 @@ function updateLiveTrackingTitle(secondsToLos) {
   if (!title) {
     return;
   }
-  if (Number.isFinite(secondsToLos)) {
-    title.textContent = `Live Tracking - LOS: ${formatCountdown(secondsToLos)}`;
-    return;
-  }
-  title.textContent = 'Live Tracking';
+  title.textContent = 'Satellite tracking map';
 }
 
 function formatCountdown(seconds) {

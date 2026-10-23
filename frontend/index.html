@@ -7,6 +7,10 @@
     <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
     <link rel="stylesheet" href="/style.css?v=20261008-wsjtx-tx1">
     <link rel="stylesheet" href="/radio-console.css?v=20261009-tuning-tone1">
+    <link rel="stylesheet" href="/interface.css?v=20261023-ui1">
+    <link rel="stylesheet" href="/modules.css?v=20261023-ui1">
+    <link rel="stylesheet" href="/settings.css?v=20261023-ui1">
+    <link rel="stylesheet" href="/satellites.css?v=20261023-ui1">
   </head>
   <body>
     <main class="container-fluid py-3 app-shell">
@@ -26,7 +30,6 @@
               <div class="home-header-nav">
                 <nav class="nav nav-pills gap-2" aria-label="Primary navigation">
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="home">Home</button>
-                  <button type="button" class="btn btn-outline-primary nav-button" data-page="radio">Radio</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="satellites">Satellites</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="modules">Modules</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="monitor">Monitor</button>
@@ -177,7 +180,7 @@
                             </div>
                           </div>
                           <p id="virtual-rit-native-note" class="virtual-rit-native-note mb-0" hidden>
-                            RIT is controlled natively from the Radio page.
+                            RIT is controlled natively from the radio console on Home.
                           </p>
                         </section>
                       </div>
@@ -266,13 +269,13 @@
           <section class="col-12 col-lg-4">
             <div class="card h-100">
               <div class="card-header">
-                <h2 class="h5 mb-0">Debug Controls</h2>
+                <h2 class="h5 mb-0">Log types</h2>
               </div>
               <div class="card-body">
                 <div class="monitor-controls">
                   <label class="form-check form-switch mb-0">
                     <input class="form-check-input" type="checkbox" role="switch" id="monitor-general-debug" checked>
-                    <span class="form-check-label monitor-label-general">General debug</span>
+                    <span class="form-check-label monitor-label-general">General logs</span>
                   </label>
                   <label class="form-check form-switch mb-0">
                     <input class="form-check-input" type="checkbox" role="switch" id="monitor-wsjtx-debug">
@@ -331,169 +334,165 @@
       <section class="page-view" id="satellites-page" data-page-view="satellites" hidden>
         <header class="card app-header mb-3 standard-page-header" data-page-title="Satellites" data-page-subtitle="Manage tracked satellites and frequency profiles"></header>
 
-        <div class="row g-3">
-          <section class="col-12">
-            <div class="card">
-              <div class="card-header">
-                <h2 class="h5 mb-0">My Satellites</h2>
-              </div>
-              <div class="card-body">
-                <form id="my-satellite-form" class="row g-2 align-items-end mb-3">
-                  <div class="col-12 col-sm-4 col-xl-3">
+        <div class="satellite-page-stack">
+          <section class="card satellite-control-card">
+            <div class="card-body">
+              <div class="satellite-toolbar">
+                <details id="add-satellite-container" class="satellite-add-container">
+                  <summary class="btn btn-primary">+ Add Satellite</summary>
+                  <form id="my-satellite-form" class="satellite-add-form">
                     <label class="form-label" for="my-satellite-norad">NORAD ID</label>
                     <input id="my-satellite-norad" class="form-control" name="norad_id" inputmode="numeric" placeholder="44909">
-                  </div>
-                  <div class="col-12 col-sm-5 col-xl-5">
                     <label class="form-label" for="my-satellite-name">Custom name</label>
                     <input id="my-satellite-name" class="form-control" name="name" placeholder="Optional">
-                  </div>
-                  <div class="col-12 col-sm-3 col-xl-2 d-grid">
                     <button type="submit" class="btn btn-primary">Add</button>
-                  </div>
-                  <div class="col-12 col-xl-2 d-grid">
-                    <button type="button" class="btn btn-outline-info" id="refresh-passes-btn">Refresh Satellite Passes</button>
-                  </div>
-                </form>
-
-                <form id="my-satellite-options" class="row g-2 align-items-end">
-                  <div class="col-12 col-lg-4 col-xl-3">
-                    <label class="form-label" for="min-pass-elevation">Minimum pass elevation</label>
-                    <div class="input-group">
-                      <input
-                        id="min-pass-elevation"
-                        class="form-control"
-                        name="min_pass_elevation_deg"
-                        type="number"
-                        min="0"
-                        max="90"
-                        step="0.1"
-                        inputmode="decimal"
-                        placeholder="10.0"
-                        aria-label="Minimum elevation in degrees for Next 15 Passes"
-                      >
-                      <span class="input-group-text">deg</span>
-                    </div>
-                  </div>
-                  <div class="col-12 col-lg-3 col-xl-2 d-grid">
-                    <button type="submit" class="btn btn-outline-primary">Save</button>
-                  </div>
-                  <div class="col-12 col-xl-7">
-                    <p class="source-note mb-0">Frequency profile updates use the public SatNOGS DB API.</p>
-                    <p id="my-satellite-status" class="command-status mb-0"></p>
-                  </div>
-                </form>
-              </div>
-            </div>
-          </section>
-
-          <section class="col-12 col-xl-4">
-            <div class="card h-100">
-              <div class="card-header">
-                <h2 class="h5 mb-0">Tracked Satellites</h2>
-              </div>
-              <div class="card-body">
-                <div id="my-satellite-list" class="list-group my-satellite-list"></div>
-              </div>
-            </div>
-          </section>
-
-          <section class="col-12 col-xl-8">
-            <div class="card h-100">
-              <div class="card-header">
-                <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
-                  <div>
-                    <h2 class="h5 mb-0">Satellite Details</h2>
-                    <p id="selected-my-satellite-meta" class="text-body-secondary mb-0 small"></p>
-                  </div>
-                  <div class="btn-group flex-wrap" role="group" aria-label="Satellite actions">
-                    <button type="button" class="btn btn-outline-primary btn-sm" id="selected-my-satellite-update-btn">Update Profiles</button>
-                    <button type="button" class="btn btn-outline-danger btn-sm" id="selected-my-satellite-remove-btn">Remove</button>
-                  </div>
-                </div>
-              </div>
-              <div class="card-body">
-                <div id="selected-my-satellite-name" class="h5 mb-2">Select a satellite to view its profiles.</div>
-                <div class="satellite-detail-grid">
-                  <section>
-                    <h3 class="h6 mb-2">Frequency Profiles</h3>
-                    <div id="selected-my-satellite-profiles" class="profile-list"></div>
-                  </section>
-                  <section>
-                    <h3 class="h6 mb-2">Known Passes <span class="text-body-secondary">(48h)</span></h3>
-                    <div id="selected-my-satellite-passes" class="satellite-pass-list"></div>
-                  </section>
-                </div>
-                <details id="custom-transponder-section" class="mt-3" hidden>
-                  <summary class="h6">Add Custom Transponder</summary>
-                  <p class="text-body-secondary small mt-2 mb-2">Add a frequency profile for the selected satellite. Custom profiles are preserved when updating from SatNOGS. For a single frequency, leave the upper limit blank.</p>
-                  <form id="custom-transponder-form">
-                    <fieldset id="custom-transponder-fields" disabled>
-                      <legend class="visually-hidden">Custom transponder details</legend>
-                      <div class="row g-2">
-                        <div class="col-12 col-md-8">
-                          <label class="form-label" for="custom-transponder-name">Profile name</label>
-                          <input id="custom-transponder-name" class="form-control" maxlength="120" required>
-                        </div>
-                        <div class="col-12 col-md-4">
-                          <label class="form-label" for="custom-transponder-type">Profile type</label>
-                          <select id="custom-transponder-type" class="form-select">
-                            <option value="fm">FM repeater</option>
-                            <option value="linear">Linear transponder</option>
-                            <option value="rx_only">Receive only</option>
-                          </select>
-                        </div>
-                        <div class="col-6 col-md-4">
-                          <label class="form-label" for="custom-transponder-downlink-low">Downlink / lower (MHz)</label>
-                          <input id="custom-transponder-downlink-low" class="form-control" type="number" min="0.000001" step="0.000001" required>
-                        </div>
-                        <div class="col-6 col-md-4">
-                          <label class="form-label" for="custom-transponder-downlink-high">Upper limit (MHz)</label>
-                          <input id="custom-transponder-downlink-high" class="form-control" type="number" min="0.000001" step="0.000001" placeholder="Optional">
-                        </div>
-                        <div class="col-12 col-md-4">
-                          <label class="form-label" for="custom-transponder-downlink-mode">Downlink mode</label>
-                          <select id="custom-transponder-downlink-mode" class="form-select">
-                            <option>FM</option><option>USB</option><option>LSB</option><option>CW</option><option>CW-R</option><option>AM</option><option>DV</option><option>DD</option><option>FM-DATA</option><option>USB-DATA</option><option>LSB-DATA</option>
-                          </select>
-                        </div>
-                      </div>
-                      <fieldset id="custom-transponder-uplink-fields" class="mt-2">
-                        <legend class="visually-hidden">Uplink details</legend>
-                        <div class="row g-2">
-                          <div class="col-6 col-md-4">
-                            <label class="form-label" for="custom-transponder-uplink-low">Uplink / lower (MHz)</label>
-                            <input id="custom-transponder-uplink-low" class="form-control" type="number" min="0.000001" step="0.000001" required>
-                          </div>
-                          <div class="col-6 col-md-4">
-                            <label class="form-label" for="custom-transponder-uplink-high">Upper limit (MHz)</label>
-                            <input id="custom-transponder-uplink-high" class="form-control" type="number" min="0.000001" step="0.000001" placeholder="Optional">
-                          </div>
-                          <div class="col-12 col-md-4">
-                            <label class="form-label" for="custom-transponder-uplink-mode">Uplink mode</label>
-                            <select id="custom-transponder-uplink-mode" class="form-select">
-                              <option>FM</option><option>USB</option><option>LSB</option><option>CW</option><option>CW-R</option><option>AM</option><option>DV</option><option>DD</option><option>FM-DATA</option><option>USB-DATA</option><option>LSB-DATA</option>
-                            </select>
-                          </div>
-                          <div class="col-12 col-md-4">
-                            <label class="form-label" for="custom-transponder-tone">Uplink CTCSS (Hz)</label>
-                            <input id="custom-transponder-tone" class="form-control" type="number" min="50" max="300" step="0.1" placeholder="Optional">
-                          </div>
-                          <div class="col-12 col-md-8 d-flex align-items-end">
-                            <div class="form-check mb-2">
-                              <input id="custom-transponder-inverted" class="form-check-input" type="checkbox">
-                              <label class="form-check-label" for="custom-transponder-inverted">Inverting transponder</label>
-                            </div>
-                          </div>
-                        </div>
-                      </fieldset>
-                      <button id="custom-transponder-save-btn" class="btn btn-primary mt-3" type="submit">Add Custom Transponder</button>
-                    </fieldset>
-                    <p id="custom-transponder-status" class="command-status mb-0 mt-2" role="status" aria-live="polite"></p>
                   </form>
                 </details>
+
+                <form id="my-satellite-options" class="satellite-options-form">
+                  <label class="form-label" for="min-pass-elevation">Minimum pass elevation</label>
+                  <div class="input-group">
+                    <input
+                      id="min-pass-elevation"
+                      class="form-control"
+                      name="min_pass_elevation_deg"
+                      type="number"
+                      min="0"
+                      max="90"
+                      step="0.1"
+                      inputmode="decimal"
+                      placeholder="10.0"
+                      aria-label="Minimum elevation in degrees for known passes"
+                    >
+                    <span class="input-group-text">deg</span>
+                    <button type="submit" class="btn btn-outline-primary">Save</button>
+                  </div>
+                </form>
+
+                <div class="satellite-refresh-actions" role="group" aria-label="Satellite data refresh">
+                  <button type="button" class="btn btn-outline-primary" id="refresh-transponder-data-btn" disabled>Update Transponder Data</button>
+                  <button type="button" class="btn btn-outline-info" id="refresh-passes-btn">Refresh Passes</button>
+                </div>
+              </div>
+              <div class="satellite-control-status">
+                <p class="source-note mb-0">Frequency profile updates use the public SatNOGS DB API.</p>
+                <p id="my-satellite-status" class="command-status mb-0"></p>
               </div>
             </div>
           </section>
+
+          <section class="satellite-list-section" aria-labelledby="my-satellites-heading">
+            <div class="satellite-list-heading">
+              <div>
+                <h2 class="h5 mb-1" id="my-satellites-heading">My Satellites</h2>
+                <p class="mb-0">Open a satellite to review its profiles and known passes.</p>
+              </div>
+            </div>
+            <div id="my-satellite-list" class="my-satellite-list"></div>
+          </section>
+
+          <div id="selected-my-satellite-detail-reserve" hidden>
+            <article id="selected-my-satellite-detail" class="selected-my-satellite-detail satellite-detail-content">
+              <div class="satellite-detail-top satellite-detail-panel satellite-detail-overview">
+                <div class="satellite-detail-identity">
+                  <h3 id="selected-my-satellite-name" class="h5 mb-1">Select a satellite to view its profiles.</h3>
+                  <p id="selected-my-satellite-meta" class="text-body-secondary mb-0"></p>
+                </div>
+                <div class="btn-group flex-wrap satellite-detail-actions" role="group" aria-label="Satellite actions">
+                  <button type="button" class="btn btn-outline-primary btn-sm" id="selected-my-satellite-update-btn">Update Profiles</button>
+                  <button type="button" class="btn btn-outline-danger btn-sm" id="selected-my-satellite-remove-btn">Remove</button>
+                </div>
+              </div>
+
+              <div class="satellite-detail-grid">
+                <section class="satellite-detail-panel">
+                  <header class="satellite-detail-panel-header">
+                    <h3 class="h6 mb-0">Frequency Profiles</h3>
+                  </header>
+                  <div class="satellite-detail-panel-body">
+                    <div id="selected-my-satellite-profiles" class="profile-list"></div>
+                    <details id="custom-transponder-section" class="satellite-custom-transponder" hidden>
+                      <summary class="h6">Add Custom Transponder</summary>
+                      <p class="text-body-secondary small mt-2 mb-2">Add a frequency profile for the selected satellite. Custom profiles are preserved when updating from SatNOGS. For a single frequency, leave the upper limit blank.</p>
+                      <form id="custom-transponder-form">
+                        <fieldset id="custom-transponder-fields" disabled>
+                          <legend class="visually-hidden">Custom transponder details</legend>
+                          <div class="row g-2">
+                            <div class="col-12 col-md-8">
+                              <label class="form-label" for="custom-transponder-name">Profile name</label>
+                              <input id="custom-transponder-name" class="form-control" maxlength="120" required>
+                            </div>
+                            <div class="col-12 col-md-4">
+                              <label class="form-label" for="custom-transponder-type">Profile type</label>
+                              <select id="custom-transponder-type" class="form-select">
+                                <option value="fm">FM repeater</option>
+                                <option value="linear">Linear transponder</option>
+                                <option value="rx_only">Receive only</option>
+                              </select>
+                            </div>
+                            <div class="col-6 col-md-4">
+                              <label class="form-label" for="custom-transponder-downlink-low">Downlink / lower (MHz)</label>
+                              <input id="custom-transponder-downlink-low" class="form-control" type="number" min="0.000001" step="0.000001" required>
+                            </div>
+                            <div class="col-6 col-md-4">
+                              <label class="form-label" for="custom-transponder-downlink-high">Upper limit (MHz)</label>
+                              <input id="custom-transponder-downlink-high" class="form-control" type="number" min="0.000001" step="0.000001" placeholder="Optional">
+                            </div>
+                            <div class="col-12 col-md-4">
+                              <label class="form-label" for="custom-transponder-downlink-mode">Downlink mode</label>
+                              <select id="custom-transponder-downlink-mode" class="form-select">
+                                <option>FM</option><option>USB</option><option>LSB</option><option>CW</option><option>CW-R</option><option>AM</option><option>DV</option><option>DD</option><option>FM-DATA</option><option>USB-DATA</option><option>LSB-DATA</option>
+                              </select>
+                            </div>
+                          </div>
+                          <fieldset id="custom-transponder-uplink-fields" class="mt-2">
+                            <legend class="visually-hidden">Uplink details</legend>
+                            <div class="row g-2">
+                              <div class="col-6 col-md-4">
+                                <label class="form-label" for="custom-transponder-uplink-low">Uplink / lower (MHz)</label>
+                                <input id="custom-transponder-uplink-low" class="form-control" type="number" min="0.000001" step="0.000001" required>
+                              </div>
+                              <div class="col-6 col-md-4">
+                                <label class="form-label" for="custom-transponder-uplink-high">Upper limit (MHz)</label>
+                                <input id="custom-transponder-uplink-high" class="form-control" type="number" min="0.000001" step="0.000001" placeholder="Optional">
+                              </div>
+                              <div class="col-12 col-md-4">
+                                <label class="form-label" for="custom-transponder-uplink-mode">Uplink mode</label>
+                                <select id="custom-transponder-uplink-mode" class="form-select">
+                                  <option>FM</option><option>USB</option><option>LSB</option><option>CW</option><option>CW-R</option><option>AM</option><option>DV</option><option>DD</option><option>FM-DATA</option><option>USB-DATA</option><option>LSB-DATA</option>
+                                </select>
+                              </div>
+                              <div class="col-12 col-md-4">
+                                <label class="form-label" for="custom-transponder-tone">Uplink CTCSS (Hz)</label>
+                                <input id="custom-transponder-tone" class="form-control" type="number" min="50" max="300" step="0.1" placeholder="Optional">
+                              </div>
+                              <div class="col-12 col-md-8 d-flex align-items-end">
+                                <div class="form-check mb-2">
+                                  <input id="custom-transponder-inverted" class="form-check-input" type="checkbox">
+                                  <label class="form-check-label" for="custom-transponder-inverted">Inverting transponder</label>
+                                </div>
+                              </div>
+                            </div>
+                          </fieldset>
+                          <button id="custom-transponder-save-btn" class="btn btn-primary mt-3" type="submit">Add Custom Transponder</button>
+                        </fieldset>
+                        <p id="custom-transponder-status" class="command-status mb-0 mt-2" role="status" aria-live="polite"></p>
+                      </form>
+                    </details>
+                  </div>
+                </section>
+
+                <section class="satellite-detail-panel">
+                  <header class="satellite-detail-panel-header">
+                    <h3 class="h6 mb-0">Known Passes <span class="text-body-secondary">(48h)</span></h3>
+                  </header>
+                  <div class="satellite-detail-panel-body">
+                    <div id="selected-my-satellite-passes" class="satellite-pass-list"></div>
+                  </div>
+                </section>
+              </div>
+            </article>
+          </div>
         </div>
       </section>
 
@@ -644,210 +643,326 @@
             </div>
           </section>
 
-          <section class="module-view" id="audio-stream-page" data-module-view="audio-stream" role="tabpanel" aria-labelledby="modules-nav-audio-stream" hidden>
-            <div class="audio-stream-toolbar card">
-              <div class="card-body">
-                <div class="d-flex flex-wrap align-items-center justify-content-between gap-3">
-                  <div class="d-flex flex-wrap align-items-center gap-2">
-                    <h2 class="h5 mb-0">External DATA Decode</h2>
-                    <span id="audio-stream-state" class="audio-stream-state-badge">Disabled</span>
-                  </div>
-                  <div class="d-flex flex-wrap align-items-center gap-2">
-                    <label for="audio-stream-demodulation" class="small">Demodulation</label>
-                    <select id="audio-stream-demodulation" class="form-select form-select-sm w-auto" disabled>
-                      <option value="FM">FM</option>
-                      <option value="USB">USB (Upper Sideband)</option>
-                    </select>
-                    <button type="button" id="audio-stream-enable" class="btn btn-primary" aria-pressed="false" disabled>Enable</button>
-                  </div>
-                </div>
-                <p class="small text-body-secondary mt-3 mb-2">External DATA Decode uses the IC-9700's IF output instead of its normal filtered AF audio. Select FM or USB (upper sideband) to match the transmission. While enabled, Pi-Sat selects SUB FM-DATA/FIL1 or USB-DATA/FIL1, software-demodulates the IF stream, and sends 48 kHz mono audio to the external Windows client. Disable streaming before changing demodulation.</p>
-                <p class="small text-body-secondary mb-2">Normal Pi-Sat receive audio is temporarily replaced by this data path. Disabling External DATA Decode restores normal AF audio operation.</p>
-                <p id="audio-stream-detail" class="text-body-secondary small mb-0">External DATA Decode is disabled.</p>
+          <section class="module-view module-native-page external-decode-page" id="audio-stream-page" data-module-view="audio-stream" role="tabpanel" aria-labelledby="modules-nav-audio-stream" hidden>
+            <header class="module-page-heading">
+              <div>
+                <h1>External DATA Decode</h1>
+                <p>Software-demodulate the native IC-9700 SUB IF for an external decoder.</p>
               </div>
-            </div>
-            <div class="row g-3">
-              <section class="col-12 col-xl-5">
-                <div class="card h-100"><div class="card-header"><h3 class="h6 mb-0">Server</h3></div><div class="card-body"><dl class="audio-stream-readouts mb-0">
-                  <div><dt>Status</dt><dd id="audio-stream-running">--</dd></div>
-                  <div><dt>Bind address</dt><dd id="audio-stream-address">--</dd></div>
-                  <div><dt>Port</dt><dd id="audio-stream-port">--</dd></div>
-                  <div><dt>Connected clients</dt><dd id="audio-stream-listeners">0</dd></div>
-                  <div><dt>Client limit</dt><dd id="audio-stream-client-limit">--</dd></div>
-                  <div><dt>Audio source</dt><dd id="audio-stream-source">Normal AF audio</dd></div>
-                </dl></div></div>
+              <span id="audio-stream-state" class="module-status-chip" data-state="disabled">Disabled</span>
+            </header>
+
+            <section class="module-control-strip external-stream-controls" aria-labelledby="external-stream-control-title">
+              <div class="module-control-copy">
+                <h2 id="external-stream-control-title">Stream control</h2>
+                <p id="audio-stream-detail" role="status" aria-live="polite">External DATA Decode is disabled.</p>
+              </div>
+              <div class="external-stream-actions">
+                <button type="button" id="audio-stream-start" class="module-button module-button-primary" disabled>Start Stream</button>
+                <button type="button" id="audio-stream-stop" class="module-button module-button-danger" disabled>Stop Stream</button>
+              </div>
+            </section>
+
+            <div class="module-two-column module-external-layout">
+              <section class="module-panel" aria-labelledby="external-stream-status-title">
+                <header><h2 id="external-stream-status-title">Stream status</h2></header>
+                <div class="module-panel-body">
+                  <dl class="module-definition-list">
+                    <div><dt>Status</dt><dd id="audio-stream-running">--</dd></div>
+                    <div><dt>Bind address</dt><dd id="audio-stream-address">--</dd></div>
+                    <div><dt>Port</dt><dd id="audio-stream-port">--</dd></div>
+                    <div><dt>Connected clients</dt><dd id="audio-stream-listeners">0</dd></div>
+                    <div><dt>Client limit</dt><dd id="audio-stream-client-limit">--</dd></div>
+                    <div><dt>Audio source</dt><dd id="audio-stream-source">Normal AF audio</dd></div>
+                  </dl>
+                  <p class="module-help">Starting replaces normal receive audio with the configured SUB IF data path. Stopping restores normal AF audio.</p>
+                </div>
               </section>
-              <section class="col-12 col-xl-7">
-                <div class="card h-100"><div class="card-header"><h3 class="h6 mb-0">Stream Statistics</h3></div><div class="card-body"><dl class="audio-stream-readouts mb-0">
-                  <div><dt>Audio frames sent</dt><dd id="audio-stream-frames">0</dd></div>
-                  <div><dt>Audio bytes sent</dt><dd id="audio-stream-bytes">0</dd></div>
-                  <div><dt>Accepted connections</dt><dd id="audio-stream-accepted">0</dd></div>
-                  <div><dt>Refused connections</dt><dd id="audio-stream-refused">0</dd></div>
-                  <div><dt>Source packets dropped</dt><dd id="audio-stream-source-drops">0</dd></div>
-                  <div><dt>Stream queue drops</dt><dd id="audio-stream-drops">0</dd></div>
-                  <div><dt>Last error</dt><dd id="audio-stream-error">None</dd></div>
-                </dl></div></div>
+
+              <section class="module-panel" aria-labelledby="external-stream-statistics-title">
+                <header><h2 id="external-stream-statistics-title">Stream statistics</h2></header>
+                <div class="module-panel-body">
+                  <dl class="module-statistics">
+                    <div><dt>Audio frames</dt><dd id="audio-stream-frames">0</dd></div>
+                    <div><dt>Audio bytes</dt><dd id="audio-stream-bytes">0</dd></div>
+                    <div><dt>Accepted</dt><dd id="audio-stream-accepted">0</dd></div>
+                    <div><dt>Refused</dt><dd id="audio-stream-refused">0</dd></div>
+                    <div><dt>Source drops</dt><dd id="audio-stream-source-drops">0</dd></div>
+                    <div><dt>Queue drops</dt><dd id="audio-stream-drops">0</dd></div>
+                    <div class="module-stat-wide"><dt>Last error</dt><dd id="audio-stream-error">None</dd></div>
+                  </dl>
+                </div>
               </section>
             </div>
-            <p class="small text-body-secondary mt-3 mb-0">Connect the IC-9700 and set its receive sample rate to 48 kHz before enabling. The existing external Windows client connects to this server. Connection settings remain in <code>[audio_stream]</code> in the Pi-Sat config file.</p>
+            <p class="module-footnote">The IC-9700 must be connected with a 48 kHz receive sample rate. Stream connection settings remain in <code>[audio_stream]</code> in the Pi-Sat configuration file.</p>
           </section>
 
-          <section class="module-view" id="sstv-decoder-page" data-module-view="sstv-decoder" role="tabpanel" aria-labelledby="modules-nav-sstv-decoder" hidden>
-            <div class="sstv-toolbar card">
-              <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
-                <div>
-                  <div class="d-flex flex-wrap align-items-center gap-2">
-                    <h2 class="h5 mb-0">SSTV Decoder</h2>
-                    <span id="sstv-state" class="sstv-state-badge">Disabled</span>
-                  </div>
-                  <p id="sstv-detail" class="text-body-secondary small mb-0 mt-2">Decoder is off. Radio audio continues normally.</p>
-                </div>
-                <div class="d-flex align-items-center gap-2 flex-shrink-0">
-                  <input type="range" class="form-range module-level-slider" id="sstv-rx-gain" min="-30" max="12" step="1" value="-6" title="Decoder input level" aria-label="Decoder input level">
-                  <output class="small text-body-secondary module-level-value" id="sstv-rx-gain-value" for="sstv-rx-gain">-6 dB</output>
-                  <button type="button" id="sstv-enable" class="btn btn-primary" aria-pressed="false">Enable</button>
-                </div>
+          <section class="module-view module-native-page sstv-native-page" id="sstv-decoder-page" data-module-view="sstv-decoder" role="tabpanel" aria-labelledby="modules-nav-sstv-decoder" hidden>
+            <header class="module-page-heading">
+              <div>
+                <h1>SSTV Decoder</h1>
+                <p>Receive live images, decode a recording, and review the image gallery.</p>
               </div>
-            </div>
-            <div class="row g-3">
-              <section class="col-12 col-xl-8">
-                <div class="card h-100"><div class="card-header d-flex justify-content-between gap-2"><h3 class="h6 mb-0">Live Decode</h3><span id="sstv-progress-label" class="small text-body-secondary">0%</span></div><div class="card-body">
-                  <div id="sstv-active-indicator" class="sstv-active-indicator mb-3" role="status" aria-live="polite" hidden><span class="sstv-active-dot" aria-hidden="true"></span><strong>Image decoding in progress</strong><span id="sstv-active-mode"></span></div>
-                  <div class="progress sstv-progress" role="progressbar" aria-label="SSTV decode progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="sstv-progress" class="progress-bar" style="width: 0%"></div></div>
-                  <div id="sstv-canvas-wrap" class="sstv-canvas-wrap mt-3"><canvas id="sstv-canvas" aria-label="Live SSTV image"></canvas><p id="sstv-canvas-empty" class="text-body-secondary mb-0">Enable the decoder to listen for an SSTV transmission.</p></div>
-                </div></div>
+              <span id="sstv-state" class="module-status-chip">Disabled</span>
+            </header>
+
+            <section class="module-control-strip sstv-stream-controls" aria-labelledby="sstv-stream-control-title">
+              <div class="module-control-copy">
+                <h2 id="sstv-stream-control-title">Live receiver</h2>
+                <p id="sstv-detail" role="status" aria-live="polite">Decoder is off. Radio audio continues normally.</p>
+              </div>
+              <div class="module-level-controls">
+                <label for="sstv-rx-gain">Decoder input</label>
+                <input type="range" class="module-level-slider" id="sstv-rx-gain" min="-30" max="12" step="1" value="-6">
+                <output class="module-level-value" id="sstv-rx-gain-value" for="sstv-rx-gain">-6 dB</output>
+                <button type="button" id="sstv-enable" class="module-button module-button-primary" aria-pressed="false">Enable</button>
+              </div>
+            </section>
+
+            <div class="module-sstv-layout">
+              <section class="module-panel sstv-live-panel" aria-labelledby="sstv-live-title">
+                <header><h2 id="sstv-live-title">Live decode</h2><span id="sstv-progress-label">0%</span></header>
+                <div class="module-panel-body">
+                  <div id="sstv-active-indicator" class="sstv-active-indicator" role="status" aria-live="polite" hidden>
+                    <span class="sstv-active-dot" aria-hidden="true"></span><strong>Image decoding in progress</strong><span id="sstv-active-mode"></span>
+                  </div>
+                  <div class="sstv-progress-row">
+                    <div class="progress sstv-progress" role="progressbar" aria-label="SSTV decode progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                      <div id="sstv-progress" class="progress-bar" style="width: 0%"></div>
+                    </div>
+                  </div>
+                  <div id="sstv-canvas-wrap" class="sstv-canvas-wrap">
+                    <canvas id="sstv-canvas" aria-label="Live SSTV image"></canvas>
+                    <p id="sstv-canvas-empty">Enable the decoder to listen for an SSTV transmission.</p>
+                  </div>
+                  <p class="module-help">Automatic mode detection: Robot24/36/72, Martin M1/M2, and PD120/180.</p>
+                </div>
               </section>
-              <section class="col-12 col-xl-4"><div class="card h-100"><div class="card-header"><h3 class="h6 mb-0">Decoder Status</h3></div><div class="card-body"><dl class="sstv-readouts mb-0">
-                <div><dt>Mode</dt><dd id="sstv-mode">--</dd></div><div><dt>Line</dt><dd id="sstv-line">--</dd></div><div><dt>Quality</dt><dd id="sstv-quality">--</dd></div><div><dt>Audio losses</dt><dd id="sstv-losses">0</dd></div><div><dt>Queued audio</dt><dd id="sstv-queued-audio">0.0 s</dd></div><div><dt>Audio source</dt><dd id="sstv-source">Native IC-9700 SUB/RX PCM</dd></div><div><dt>Engine</dt><dd id="sstv-engine">SSTVFlow 0.2.0</dd></div><div><dt>Decoder level</dt><dd id="sstv-decoder-level">silent</dd></div><div><dt>Clipped samples</dt><dd id="sstv-clipped-samples">0</dd></div><div><dt>Audio capture</dt><dd id="sstv-capture-status">No errors</dd></div>
-              </dl><p class="small text-body-secondary mt-3 mb-0">SSTVFlow decodes Robot24/36/72, Martin M1/M2, and PD120/180 from SUB/RX audio.</p></div></div></section>
+
+              <section class="module-panel" aria-labelledby="sstv-status-title">
+                <header><h2 id="sstv-status-title">Decoder status</h2></header>
+                <div class="module-panel-body">
+                  <dl class="module-definition-list">
+                    <div><dt>Mode</dt><dd id="sstv-mode">--</dd></div>
+                    <div><dt>Line</dt><dd id="sstv-line">--</dd></div>
+                    <div><dt>Quality</dt><dd id="sstv-quality">--</dd></div>
+                    <div><dt>Audio losses</dt><dd id="sstv-losses">0</dd></div>
+                    <div><dt>Queued audio</dt><dd id="sstv-queued-audio">0.0 s</dd></div>
+                    <div><dt>Audio source</dt><dd id="sstv-source">Native IC-9700 SUB/RX PCM</dd></div>
+                    <div><dt>Engine</dt><dd id="sstv-engine">SSTVFlow 0.2.0</dd></div>
+                    <div><dt>Decoder level</dt><dd id="sstv-decoder-level">silent</dd></div>
+                    <div><dt>Clipped samples</dt><dd id="sstv-clipped-samples">0</dd></div>
+                    <div><dt>Audio capture</dt><dd id="sstv-capture-status">No errors</dd></div>
+                  </dl>
+                  <p class="module-help">Disable stops live reception and finishes queued audio before saving the current image.</p>
+                </div>
+              </section>
             </div>
-            <section class="card sstv-upload-card"><div class="card-header"><h3 class="h6 mb-0">Decode a recording</h3></div><div class="card-body">
-              <form id="sstv-upload-form" class="row g-2 align-items-end">
-                <div class="col-12 col-lg"><label class="form-label small" for="sstv-upload-file">MP3 or WAV recording</label><input class="form-control" id="sstv-upload-file" name="file" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav,audio/x-wav" required></div>
-                <div class="col-12 col-lg-auto"><button class="btn btn-outline-info" id="sstv-upload-submit" type="submit">Decode recording</button></div>
-              </form>
-              <p id="sstv-upload-status" class="small text-body-secondary mb-0 mt-2" role="status" aria-live="polite">The audio file is temporary and is deleted after processing.</p>
-            </div></section>
-            <section class="card"><div class="card-header d-flex justify-content-between gap-2"><h3 class="h6 mb-0">Recent Images</h3><span class="small text-body-secondary">Latest 25 captures</span></div><div class="card-body"><div id="sstv-gallery" class="sstv-gallery"><p class="text-body-secondary mb-0">No SSTV images yet.</p></div></div></section>
-            <dialog id="sstv-image-dialog" class="sstv-image-dialog"><form method="dialog" class="d-flex justify-content-end"><button class="btn btn-sm btn-outline-light" aria-label="Close image">Close</button></form><img id="sstv-large-image" alt="Completed SSTV decode"><div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3"><p id="sstv-large-meta" class="small text-body-secondary mb-0"></p><a id="sstv-large-download" class="btn btn-sm btn-outline-info" href="#" download>Download</a></div></dialog>
+
+            <section class="module-panel sstv-upload-card" aria-labelledby="sstv-upload-title">
+              <header><h2 id="sstv-upload-title">Decode a recording</h2></header>
+              <div class="module-panel-body">
+                <form id="sstv-upload-form" class="module-recording-row">
+                  <label for="sstv-upload-file">MP3 or WAV recording</label>
+                  <input id="sstv-upload-file" name="file" type="file" accept=".mp3,.wav,audio/mpeg,audio/wav,audio/x-wav" required>
+                  <button id="sstv-upload-submit" class="module-button" type="submit">Decode recording</button>
+                </form>
+                <p id="sstv-upload-status" class="module-help" role="status" aria-live="polite">The audio file is temporary and is deleted after processing.</p>
+              </div>
+            </section>
+
+            <section class="module-panel sstv-gallery-panel" aria-labelledby="sstv-gallery-title">
+              <header><h2 id="sstv-gallery-title">Recent images</h2><span>Latest 25 captures</span></header>
+              <div class="module-panel-body">
+                <div id="sstv-gallery" class="sstv-gallery"><p>No SSTV images yet.</p></div>
+              </div>
+            </section>
+
+            <dialog id="sstv-image-dialog" class="sstv-image-dialog" aria-labelledby="sstv-image-dialog-title">
+              <div class="module-dialog-heading">
+                <h2 id="sstv-image-dialog-title">SSTV image</h2>
+                <form method="dialog"><button type="submit" class="module-button">Close</button></form>
+              </div>
+              <img id="sstv-large-image" alt="Completed SSTV decode">
+              <div class="module-dialog-footer">
+                <p id="sstv-large-meta"></p>
+                <a id="sstv-large-download" class="module-button" href="#" download>Download</a>
+              </div>
+            </dialog>
           </section>
 
-          <section class="module-view" id="aprs-page" data-module-view="aprs" role="tabpanel" aria-labelledby="modules-nav-aprs" hidden>
-            <div class="aprs-toolbar card">
-              <div class="card-body d-flex flex-wrap align-items-center justify-content-between gap-3">
-                <div>
-                  <div class="d-flex flex-wrap align-items-center gap-2">
-                    <h2 class="h5 mb-0">APRS</h2>
-                    <span id="aprs-state" class="aprs-state-badge">Disabled</span>
-                  </div>
-                  <p id="aprs-detail" class="text-body-secondary small mb-0 mt-2">Decoder is off. Radio audio continues normally.</p>
-                </div>
-                <div class="d-flex align-items-center gap-2 flex-shrink-0">
-                  <input type="range" class="form-range module-level-slider" id="aprs-rx-gain" min="-30" max="12" step="1" value="-6"
-                         title="Decoder input level" aria-label="Decoder input level">
-                  <output class="small text-body-secondary module-level-value" id="aprs-rx-gain-value" for="aprs-rx-gain">-6 dB</output>
-                  <button type="button" id="aprs-enable" class="btn btn-primary" aria-pressed="false">Enable</button>
-                </div>
+          <section class="module-view module-native-page aprs-native-page" id="aprs-page" data-module-view="aprs" role="tabpanel" aria-labelledby="modules-nav-aprs" hidden>
+            <header class="module-page-heading">
+              <div>
+                <h1>APRS</h1>
+                <p>Receive packets, inspect traffic, and use the complete manual transmit workflow.</p>
               </div>
-            </div>
+              <span id="aprs-state" class="module-status-chip">Disabled</span>
+            </header>
 
-            <div class="aprs-split">
-              <section class="aprs-panel card">
-                <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
-                  <h3 class="h6 mb-0">Received Packets</h3>
-                  <span id="aprs-retained" class="small text-body-secondary">0 / 25</span>
-                </div>
-                <div class="card-body aprs-packet-scroll">
-                  <div id="aprs-packets" class="aprs-packets">
-                    <p class="text-body-secondary mb-0">Enable the decoder to listen for APRS traffic.</p>
-                  </div>
-                </div>
-              </section>
+            <section class="module-control-strip aprs-stream-controls" aria-labelledby="aprs-stream-control-title">
+              <div class="module-control-copy">
+                <h2 id="aprs-stream-control-title">Receive</h2>
+                <p id="aprs-detail" role="status" aria-live="polite">Decoder is off. Radio audio continues normally.</p>
+              </div>
+              <div class="module-level-controls">
+                <label for="aprs-rx-gain">Decoder input</label>
+                <input type="range" class="module-level-slider" id="aprs-rx-gain" min="-30" max="12" step="1" value="-6">
+                <output class="module-level-value" id="aprs-rx-gain-value" for="aprs-rx-gain">-6 dB</output>
+                <button type="button" id="aprs-enable" class="module-button module-button-primary" aria-pressed="false">Enable</button>
+              </div>
+            </section>
 
-              <section class="aprs-panel card">
-                <div class="card-header d-flex flex-wrap align-items-center justify-content-between gap-2">
-                  <h3 class="h6 mb-0">Transmit</h3>
-                  <div class="form-check form-switch d-flex align-items-center gap-2 mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="aprs-arm" aria-label="Arm APRS transmit">
-                    <label class="form-check-label small" for="aprs-arm">Arm</label>
+            <div class="aprs-native-layout">
+              <div class="aprs-receive-column">
+                <section class="module-panel aprs-receive-panel" aria-labelledby="aprs-receive-title">
+                  <header><h2 id="aprs-receive-title">Received packets</h2><span id="aprs-retained">0 / 25 retained</span></header>
+                  <div class="module-panel-body aprs-packet-scroll">
+                    <div id="aprs-packets" class="aprs-packets">
+                      <p>Enable the decoder to listen for APRS traffic.</p>
+                    </div>
                   </div>
-                </div>
-                <div class="card-body">
-                  <div class="aprs-tx-actions">
-                    <button type="button" class="btn btn-outline-info" id="aprs-send-beacon" disabled>Send Beacon</button>
-                    <button type="button" class="btn btn-outline-info" id="aprs-send-status" disabled>Custom Message</button>
-                    <button type="button" class="btn btn-outline-info" id="aprs-send-message" disabled>Direct Message</button>
+                </section>
+
+                <section class="module-panel aprs-diagnostics-panel" aria-labelledby="aprs-diagnostics-title">
+                  <header><h2 id="aprs-diagnostics-title">Receiver diagnostics</h2></header>
+                  <div class="module-panel-body">
+                    <dl class="aprs-diagnostics-grid">
+                      <div><dt>Audio source</dt><dd id="aprs-source">Native IC-9700 RX PCM</dd></div>
+                      <div><dt>Engine</dt><dd id="aprs-engine">Dire Wolf</dd></div>
+                      <div><dt>Packets</dt><dd id="aprs-count">0 received</dd></div>
+                      <div><dt>Decoder input</dt><dd id="aprs-input">No audio yet</dd></div>
+                      <div><dt>Channel levels</dt><dd id="aprs-levels">Left silent, right silent</dd></div>
+                      <div><dt>Decoder level</dt><dd id="aprs-decoder-level">silent</dd></div>
+                      <div><dt>Decoder link</dt><dd id="aprs-kiss">Not connected</dd></div>
+                    </dl>
+                    <details class="aprs-raw aprs-decoder-log">
+                      <summary>Decoder log</summary>
+                      <button type="button" class="module-button module-button-quiet" id="aprs-log-refresh">Refresh</button>
+                      <pre id="aprs-decoder-log">Enable the decoder to collect its output.</pre>
+                    </details>
+                    <p class="module-footnote">APRS decoding powered by Dire Wolf by John Langner (WB2OSZ).</p>
                   </div>
-                  <div class="aprs-tx-fields">
-                    <input type="text" class="form-control form-control-sm" id="aprs-tx-addressee" maxlength="9" placeholder="Callsign" aria-label="APRS message addressee" disabled>
-                    <input type="text" class="form-control form-control-sm" id="aprs-tx-text" maxlength="67" placeholder="Message" aria-label="APRS message text" disabled>
-                  </div>
-                  <dl class="module-readouts mt-3 mb-0">
+                </section>
+              </div>
+
+              <section class="module-panel aprs-transmit-panel" aria-labelledby="aprs-transmit-title">
+                <header>
+                  <h2 id="aprs-transmit-title">Transmit</h2>
+                  <label class="module-switch" for="aprs-arm">
+                    <input type="checkbox" role="switch" id="aprs-arm" aria-label="Arm APRS transmit">
+                    <span>Arm transmit</span>
+                  </label>
+                </header>
+                <div class="module-panel-body">
+                  <dl class="aprs-tx-status">
                     <div><dt>Status</dt><dd id="aprs-tx-state">Disarmed</dd></div>
                     <div><dt>Last transmit</dt><dd id="aprs-tx-last">Never</dd></div>
                   </dl>
-                  <p id="aprs-tx-detail" class="small text-body-secondary mt-2 mb-0"></p>
+                  <p id="aprs-tx-detail" class="aprs-tx-feedback" role="status" aria-live="polite">Arm transmit to enable the three manual actions.</p>
+
+                  <label class="module-field" for="aprs-tx-text">
+                    <span>Message</span>
+                    <textarea id="aprs-tx-text" maxlength="67" placeholder="Custom status or direct message" disabled></textarea>
+                  </label>
+                  <div class="aprs-message-meta">
+                    <label class="module-field aprs-addressee" for="aprs-tx-addressee">
+                      <span>Direct message callsign</span>
+                      <input type="text" id="aprs-tx-addressee" maxlength="9" placeholder="Callsign-SSID" disabled>
+                    </label>
+                    <span id="aprs-tx-character-count" class="aprs-character-count">0 / 67</span>
+                  </div>
+
+                  <div class="aprs-tx-actions">
+                    <button type="button" class="module-button" id="aprs-send-beacon" disabled>
+                      <strong>Send Beacon</strong><small>Position &amp; symbol</small>
+                    </button>
+                    <button type="button" class="module-button" id="aprs-send-status" disabled>
+                      <strong>Custom Message</strong><small>APRS status packet</small>
+                    </button>
+                    <button type="button" class="module-button" id="aprs-send-message" disabled>
+                      <strong>Direct Message</strong><small>Addressed packet</small>
+                    </button>
+                  </div>
+                  <p class="module-footnote">Custom status packets are limited to 62 characters. Direct messages are limited to 67.</p>
                 </div>
               </section>
             </div>
-
-            <section class="aprs-meta card">
-              <div class="card-body">
-                <dl class="module-readouts mb-0">
-                  <div><dt>Audio source</dt><dd id="aprs-source">Native IC-9700 RX PCM</dd></div>
-                  <div><dt>Engine</dt><dd id="aprs-engine">Dire Wolf</dd></div>
-                  <div><dt>Packets</dt><dd id="aprs-count">0 received</dd></div>
-                  <div><dt>Decoder input</dt><dd id="aprs-input">No audio yet</dd></div>
-                  <div><dt>Channel levels</dt><dd id="aprs-levels">Left silent, right silent</dd></div>
-                  <div><dt>Decoder level</dt><dd id="aprs-decoder-level">silent</dd></div>
-                  <div><dt>Decoder link</dt><dd id="aprs-kiss">Not connected</dd></div>
-                </dl>
-                <p class="small text-body-secondary mt-3 mb-0">APRS decoding powered by Dire Wolf by John Langner (WB2OSZ).</p>
-                <details class="aprs-raw mt-2">
-                  <summary>Decoder log</summary>
-                  <button type="button" class="btn btn-sm btn-outline-info my-2" id="aprs-log-refresh">Refresh</button>
-                  <pre id="aprs-decoder-log" class="mb-0">Enable the decoder to collect its output.</pre>
-                </details>
-              </div>
-            </section>
           </section>
 
-          <section class="module-view wsjtx-view" id="wsjtx-page" data-module-view="ft4-ft8" role="tabpanel" aria-labelledby="modules-nav-ft4-ft8" hidden>
-            <div class="card wsjtx-pass-strip" aria-label="Satellite pass context">
-              <div><span id="wsjtx-tracking-label" class="text-body-secondary">Currently tracking:</span> <strong id="wsjtx-tracking-name">None</strong></div>
+          <section class="module-view module-native-page digital-native-page wsjtx-view" id="wsjtx-page" data-module-view="ft4-ft8" role="tabpanel" aria-labelledby="modules-nav-ft4-ft8" hidden>
+            <header class="module-page-heading">
+              <div>
+                <h1>FT4 / FT8</h1>
+                <p>Receive digital activity, hold audio offsets, and complete the QSO transmit workflow.</p>
+              </div>
+              <div class="module-heading-status"><span id="wsjtx-mode" class="module-status-chip">—</span><span id="wsjtx-state" class="module-status-chip" role="status">Loading</span></div>
+            </header>
+
+            <section class="module-control-strip digital-toolbar" aria-labelledby="digital-toolbar-title">
+              <div class="digital-engine-status">
+                <h2 id="digital-toolbar-title" class="visually-hidden">Digital mode controls</h2>
+                <div id="wsjtx-mode-selector" class="digital-mode-selector" role="group" aria-label="Digital mode">
+                  <span>Mode</span>
+                  <button id="wsjtx-mode-ft4" type="button" data-wsjtx-mode="FT4" aria-pressed="true" disabled>FT4</button>
+                  <button id="wsjtx-mode-ft8" type="button" data-wsjtx-mode="FT8" aria-pressed="false" disabled>FT8</button>
+                </div>
+              </div>
+              <div class="wsjtx-listener-controls">
+                <label for="wsjtx-engine">Engine<select id="wsjtx-engine" aria-label="WSJT-X engine" disabled><option value="">No engine</option></select></label>
+                <label for="wsjtx-decode-depth">Decode speed<select id="wsjtx-decode-depth" aria-label="WSJT-X decode speed" disabled><option value="fast">Fast</option><option value="normal">Normal</option><option value="deep">Deep</option></select></label>
+                <div class="digital-listener-actions">
+                  <button id="wsjtx-enable" class="module-button module-button-primary" type="button" aria-pressed="false" disabled>Start RX</button>
+                  <button id="wsjtx-reset" class="module-button" type="button" disabled>Reset</button>
+                </div>
+              </div>
+              <div class="digital-toolbar-detail">
+                <p id="wsjtx-detail" role="status" aria-live="polite">Loading WSJT-X listener status.</p>
+                <p id="wsjtx-mode-setting-detail">FT mode applies when managed WSJT-X RX starts.</p>
+                <p id="wsjtx-decode-depth-detail">Decode speed applies when RX starts.</p>
+              </div>
+            </section>
+
+            <div class="module-pass-strip" aria-label="Satellite pass context">
+              <div><span id="wsjtx-tracking-label">Currently tracking:</span> <strong id="wsjtx-tracking-name">None</strong></div>
               <div class="wsjtx-pass-metrics"><span>Az <b id="wsjtx-tracking-az">—</b></span><span>El <b id="wsjtx-tracking-el">—</b></span><span>LOS <b id="wsjtx-tracking-los">—</b></span></div>
             </div>
-            <div class="card wsjtx-toolbar">
-              <div class="card-body">
-                <div class="wsjtx-toolbar-main">
-                  <div class="d-flex flex-wrap align-items-center gap-2"><h2 class="h5 mb-0">FT4 / FT8</h2><span id="wsjtx-mode" class="wsjtx-badge">—</span><span id="wsjtx-state" class="wsjtx-badge" role="status">Loading</span></div>
-                  <div class="wsjtx-listener-controls"><label for="wsjtx-engine" class="small text-body-secondary">Engine</label><select id="wsjtx-engine" class="form-select form-select-sm" aria-label="WSJT-X engine" disabled><option value="">No engine</option></select><label for="wsjtx-decode-depth" class="small text-body-secondary">Decode speed</label><select id="wsjtx-decode-depth" class="form-select form-select-sm" aria-label="WSJT-X decode speed" disabled><option value="fast">Fast</option><option value="normal">Normal</option><option value="deep">Deep</option></select><button id="wsjtx-enable" class="btn btn-primary" type="button" aria-pressed="false" disabled>Start RX</button><button id="wsjtx-reset" class="btn btn-outline-warning" type="button" disabled>Reset</button></div>
+
+            <section class="module-panel wsjtx-spectrum-panel" aria-labelledby="wsjtx-spectrum-title">
+              <header class="wsjtx-spectrum-controls">
+                <div><h2 id="wsjtx-spectrum-title">Digital audio</h2><span id="wsjtx-spectrum-span">0–3000 Hz · estimated SSB width</span></div>
+                <label for="wsjtx-offset">Hold TX offset <input id="wsjtx-offset" type="number" min="200" max="2950" step="1" value="1500" disabled><span>Hz</span></label>
+              </header>
+              <div class="module-panel-body">
+                <div id="wsjtx-spectrum-hit" class="wsjtx-spectrum-hit" role="slider" tabindex="0" aria-label="Held transmit audio offset" aria-valuemin="200" aria-valuemax="2950" aria-valuenow="1500" aria-disabled="true">
+                  <canvas id="wsjtx-spectrum" class="wsjtx-spectrum" width="1200" height="130" aria-hidden="true"></canvas><canvas id="wsjtx-waterfall" class="wsjtx-waterfall" width="1200" height="80" aria-hidden="true"></canvas>
+                  <span id="wsjtx-rx-marker" class="wsjtx-offset-marker wsjtx-rx-marker"><b>RX</b></span><span id="wsjtx-tx-marker" class="wsjtx-offset-marker wsjtx-tx-marker"><b>TX</b></span>
                 </div>
-                <p id="wsjtx-detail" class="small text-body-secondary mt-2 mb-0">Loading WSJT-X listener status.</p><p id="wsjtx-decode-depth-detail" class="small text-body-secondary mt-1 mb-0">Decode speed applies when RX starts.</p>
+                <p id="wsjtx-spectrum-detail" class="module-help">Waiting for receive audio. Click the passband to set your held TX offset.</p>
               </div>
-            </div>
-            <section class="card wsjtx-spectrum-panel" aria-label="Digital audio passband">
-              <div class="card-header wsjtx-spectrum-controls"><div><h3 class="h6 mb-0">Digital audio</h3><span id="wsjtx-spectrum-span" class="small text-body-secondary">0–3000 Hz · estimated SSB width</span></div><div class="d-flex align-items-center gap-2"><label for="wsjtx-offset" class="small">Hold TX offset</label><input id="wsjtx-offset" class="form-control form-control-sm" type="number" min="200" max="2950" step="1" value="1500" disabled><span class="small">Hz</span></div></div>
-              <div id="wsjtx-spectrum-hit" class="wsjtx-spectrum-hit" role="slider" tabindex="0" aria-label="Held transmit audio offset" aria-valuemin="200" aria-valuemax="2950" aria-valuenow="1500" aria-disabled="true">
-                <canvas id="wsjtx-spectrum" class="wsjtx-spectrum" width="1200" height="130" aria-hidden="true"></canvas><canvas id="wsjtx-waterfall" class="wsjtx-waterfall" width="1200" height="80" aria-hidden="true"></canvas>
-                <span id="wsjtx-rx-marker" class="wsjtx-offset-marker wsjtx-rx-marker"><b>RX</b></span><span id="wsjtx-tx-marker" class="wsjtx-offset-marker wsjtx-tx-marker"><b>TX</b></span>
-              </div><p id="wsjtx-spectrum-detail" class="small text-body-secondary px-3 py-2 mb-0">Waiting for receive audio. Click the passband to set your held TX offset.</p>
             </section>
+
             <div class="wsjtx-split">
-              <section class="card wsjtx-activity-panel">
-                <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2"><h3 class="h6 mb-0">Band Activity</h3><div class="d-flex align-items-center gap-2"><span id="wsjtx-count" class="small text-body-secondary">0 messages</span><button id="wsjtx-clear" type="button" class="btn btn-sm btn-outline-secondary">Clear view</button></div></div>
+              <section class="module-panel wsjtx-activity-panel" aria-labelledby="wsjtx-activity-title">
+                <header><h2 id="wsjtx-activity-title">Band activity</h2><div class="digital-activity-actions"><span id="wsjtx-count">0 messages</span><button id="wsjtx-clear" type="button" class="module-button module-button-quiet">Clear view</button></div></header>
                 <div class="wsjtx-decode-head" aria-hidden="true"><span>UTC</span><span>SNR</span><span>DT</span><span>Hz</span><span>Mode</span><span>Message</span></div>
-                <div id="wsjtx-decodes" class="wsjtx-decodes" aria-label="Received decodes"><p class="text-body-secondary p-3 mb-0">Loading received activity.</p></div>
+                <div id="wsjtx-decodes" class="wsjtx-decodes" aria-label="Received decodes"><p>Loading received activity.</p></div>
               </section>
               <div class="wsjtx-operating-column">
-                <section class="card wsjtx-qso-panel"><div class="card-header d-flex justify-content-between align-items-center"><h3 class="h6 mb-0">QSO / Transmit</h3><span id="wsjtx-tx-state" class="wsjtx-badge" role="status">TX off</span></div><div class="card-body">
-                  <div class="wsjtx-calls"><div><span class="small text-body-secondary">My call</span><strong id="wsjtx-my-call">—</strong><small id="wsjtx-my-grid" class="text-body-secondary">—</small></div><div><span class="small text-body-secondary">Target call</span><strong id="wsjtx-target-call">—</strong><small id="wsjtx-target-grid" class="text-body-secondary">Double-click a decode</small></div></div>
-                  <div class="wsjtx-tx-controls"><button id="wsjtx-tx-enable" class="btn btn-primary" type="button" aria-pressed="false" disabled>Enable TX</button><button id="wsjtx-halt" class="btn btn-outline-danger" type="button" disabled>Halt TX</button><button id="wsjtx-cq" class="btn btn-outline-secondary" type="button" disabled>Call CQ</button></div>
-                  <div class="d-flex justify-content-between align-items-center gap-2 mb-2"><label class="form-check-label"><input id="wsjtx-auto" class="form-check-input me-2" type="checkbox" checked disabled>Auto sequence</label><span id="wsjtx-retries" class="small text-body-secondary">Retries 0 / 3</span></div>
-                  <fieldset id="wsjtx-messages" class="wsjtx-messages" disabled><legend class="visually-hidden">Transmit message</legend></fieldset>
-                  <p id="wsjtx-qso-detail" class="small text-body-secondary mt-2 mb-0" role="status">Start RX to begin a QSO.</p><p id="wsjtx-next-slot" class="small text-body-secondary mt-1 mb-0"></p>
-                </div></section>
-                <section class="card"><div class="card-header d-flex justify-content-between align-items-center"><h3 class="h6 mb-0">QSO Log</h3><a id="wsjtx-adif" class="small" href="/api/wsjtx/qso/adif" download>Export ADIF</a></div><div id="wsjtx-contacts" class="wsjtx-contacts" aria-label="Completed contacts"><p class="text-body-secondary p-3 mb-0">No completed contacts yet.</p></div></section>
+                <section class="module-panel wsjtx-qso-panel" aria-labelledby="wsjtx-qso-title">
+                  <header><h2 id="wsjtx-qso-title">QSO / Transmit</h2><span id="wsjtx-tx-state" class="module-status-chip" role="status">TX off</span></header>
+                  <div class="module-panel-body">
+                    <div class="wsjtx-calls"><div><span>My call</span><strong id="wsjtx-my-call">—</strong><small id="wsjtx-my-grid">—</small></div><div><span>Target call</span><strong id="wsjtx-target-call">—</strong><small id="wsjtx-target-grid">Double-click a decode</small></div></div>
+                    <div class="wsjtx-tx-controls"><button id="wsjtx-tx-enable" class="module-button module-button-primary" type="button" aria-pressed="false" disabled>Enable TX</button><button id="wsjtx-halt" class="module-button module-button-danger" type="button" disabled>Halt TX</button><button id="wsjtx-cq" class="module-button" type="button" disabled>Call CQ</button></div>
+                    <div class="digital-sequence-controls"><label><input id="wsjtx-auto" type="checkbox" checked disabled>Auto sequence</label><span id="wsjtx-retries">Retries 0 / 3</span></div>
+                    <fieldset id="wsjtx-messages" class="wsjtx-messages" disabled><legend class="visually-hidden">Transmit message</legend></fieldset>
+                    <p id="wsjtx-qso-detail" class="module-help" role="status" aria-live="polite">Start RX to begin a QSO.</p><p id="wsjtx-next-slot" class="wsjtx-next-slot"></p>
+                  </div>
+                </section>
+                <section class="module-panel" aria-labelledby="wsjtx-log-title">
+                  <header><h2 id="wsjtx-log-title">QSO Log</h2><a id="wsjtx-adif" href="/api/wsjtx/qso/adif" download>Export ADIF</a></header>
+                  <div id="wsjtx-contacts" class="wsjtx-contacts" aria-label="Completed contacts"><p>No completed contacts yet.</p></div>
+                </section>
               </div>
             </div>
           </section>
@@ -857,20 +972,18 @@
       <section class="page-view" id="settings-page" data-page-view="settings" hidden>
         <header class="card app-header mb-3 standard-page-header" data-page-title="Settings" data-page-subtitle="Configuration is saved to pi-sat-controller.conf" data-subnav="settings"></header>
 
-        <div class="row g-3">
-          <section class="col-12">
-            <div class="card">
-              <div class="card-body">
-                <form id="settings-form" class="settings-form"></form>
-                  <div class="d-flex justify-content-end gap-2 mt-3">
-                    <button type="button" class="btn btn-outline-info" id="refresh-tle-btn">Force Update Orbital Data</button>
-                    <button type="submit" form="settings-form" class="btn btn-primary">Save Settings</button>
-                  </div>
-                <p id="settings-status" class="command-status mb-0"></p>
+        <section class="card settings-page-card" aria-label="Pi-Sat settings">
+          <div class="card-body">
+            <form id="settings-form" class="settings-form"></form>
+            <div class="settings-footer">
+              <p id="settings-status" class="command-status mb-0">Changes are saved to pi-sat-controller.conf.</p>
+              <div class="settings-footer-actions">
+                <button type="button" class="btn btn-outline-info" id="refresh-tle-btn">Force Update Orbital Data</button>
+                <button type="submit" form="settings-form" class="btn btn-primary">Save Settings</button>
               </div>
             </div>
-          </section>
-        </div>
+          </div>
+        </section>
       </section>
 
       <section class="page-view" id="radio-page" data-page-view="radio" hidden>
@@ -887,11 +1000,12 @@
       <a href="https://github.com/w9ksb" target="_blank" rel="noopener noreferrer">github.com/w9ksb</a>
     </footer>
     <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
-    <script src="/app.js?v=20261009-custom-transponder1"></script>
-    <script src="/radio-console.js?v=20261009-tuning-tone1"></script>
-    <script src="/audio-stream.js?v=20260928-external-data1"></script>
-    <script src="/sstv.js?v=20261008-wsjtx-tx1"></script>
-    <script src="/aprs.js?v=20260914-aprs4"></script>
-    <script src="/wsjtx.js?v=20261022-wsjtx-tx1"></script>
+    <script type="application/json" data-native-src="/radio-console.js?v=20261023-ui1"></script>
+    <script type="application/json" data-native-src="/audio-stream.js?v=20261023-ui1"></script>
+    <script type="application/json" data-native-src="/sstv.js?v=20261023-ui1"></script>
+    <script type="application/json" data-native-src="/aprs.js?v=20261023-ui1"></script>
+    <script type="application/json" data-native-src="/wsjtx.js?v=20261023-ui1"></script>
+    <script src="/interface.js?v=20261023-ui1"></script>
+    <script src="/app.js?v=20261023-ui1"></script>
   </body>
 </html>
