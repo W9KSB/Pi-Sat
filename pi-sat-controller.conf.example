@@ -117,6 +117,8 @@ tx_codec = lpcm16_mono
 full_duplex = true
 scope_enabled = true
 debug_logging = false
+# Generated tuning tone amplitude, 0 to 100 percent.
+tuning_tone_level_percent = 75
 
 [scope]
 # Display levels are relative dB, with a minimum 10 dB window per receiver.

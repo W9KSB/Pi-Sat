@@ -1145,24 +1145,24 @@
   outline-offset: -2px;
 }
 
-#modules-page .wsjtx-spectrum,
+#modules-page .wsjtx-frequency-scale,
 #modules-page .wsjtx-waterfall {
   display: block;
   width: 100%;
 }
 
-#modules-page .wsjtx-spectrum {
-  height: 6.6rem;
+#modules-page .wsjtx-frequency-scale {
+  height: 24px;
 }
 
 #modules-page .wsjtx-waterfall {
-  height: 4rem;
+  height: 260px;
   border-top: 1px solid #26394a;
 }
 
 #modules-page .wsjtx-offset-marker {
   position: absolute;
-  top: 0;
+  top: 24px;
   bottom: 0;
   border-left: 2px solid;
   pointer-events: none;
@@ -1344,6 +1344,7 @@
 
 #modules-page .digital-sequence-controls {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
@@ -1362,6 +1363,21 @@
 #modules-page .digital-sequence-controls input {
   margin: 0;
   accent-color: var(--module-accent);
+}
+
+#modules-page .digital-sequence-controls select {
+  min-height: 1.8rem;
+  padding: 0.2rem 0.35rem;
+  border: 1px solid var(--module-line);
+  border-radius: 4px;
+  background: var(--module-panel-deep);
+  color: #c2d5e3;
+  font: inherit;
+  color-scheme: dark;
+}
+
+#modules-page .digital-sequence-controls select:disabled {
+  opacity: 0.55;
 }
 
 #modules-page .wsjtx-messages {

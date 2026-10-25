@@ -11,13 +11,16 @@ from typing import Any
 import numpy as np
 
 
-_WINDOW_SAMPLES = 4096
-_MAX_BINS = 512
-_UPDATE_SECONDS = 0.2
+_TARGET_BIN_HZ = 3.0
+_MIN_FFT_SIZE = 1024
+_MAX_FFT_SIZE = 65536
+_MAX_BINS = 1024
+_UPDATE_SECONDS = 0.5
 _STALE_SECONDS = 2.0
 _FLOOR_DBFS = -100.0
 _FALLBACK_SPAN_HZ = 3000.0
 _MAX_SSB_BANDWIDTH_HZ = 3600.0
+_MAX_AVERAGING_GAP_SECONDS = 1.5
 
 
 class WsjtxAudioSpectrum:
@@ -32,14 +35,31 @@ class WsjtxAudioSpectrum:
     def __init__(self, *, get_controller: Callable[[], Any]) -> None:
         self._get_controller = get_controller
         self._lock = threading.Lock()
-        self._window = np.hanning(_WINDOW_SAMPLES)
-        self._window_sum = float(self._window.sum())
-        self._samples = np.empty(0, dtype=np.float64)
+        self._compute_lock = threading.Lock()
+        self._buffer: np.ndarray | None = None
+        self._capacity = 0
+        self._write_index = 0
+        self._sample_count = 0
         self._sample_rate = 0
-        self._levels: np.ndarray | None = None
-        self._last_fft_at: float | None = None
+        self._fft_size = 0
+        self._window: np.ndarray | None = None
+        self._window_sum = 0.0
+        self._power: np.ndarray | None = None
+        self._previous_power: np.ndarray | None = None
+        self._last_frame_at: float | None = None
+        self._averaging_seconds = 0.0
+        self._bins_cache: list[float] | None = None
+        self._bins_cache_key: tuple[int, float] | None = None
+        self._last_compute_attempt_at: float | None = None
+        self._computed_data_generation: int | None = None
+        self._data_generation = 0
+        self._buffer_epoch = 0
         self._last_input_at: float | None = None
         self._generation = 0
+        self._timestamp_ms: int | None = None
+        self._fft_compute_ms: float | None = None
+        self._averaging_frames = 0
+        self._display_error = ""
 
     def feed(self, pcm: bytes, sample_rate: int) -> None:
         if type(sample_rate) is not int or not 1000 <= sample_rate <= 192000:
@@ -48,80 +68,248 @@ class WsjtxAudioSpectrum:
             raise ValueError("Spectrum audio must contain complete S16LE mono samples")
         if not pcm:
             return
-        # Take only the newest window before allocating the floating-point copy.
-        samples = np.frombuffer(pcm, dtype="<i2")[-_WINDOW_SAMPLES:].astype(np.float64)
+        samples = np.frombuffer(pcm, dtype="<i2")
         now = time.monotonic()
         with self._lock:
-            if (sample_rate != self._sample_rate or
-                    (self._last_input_at is not None and now - self._last_input_at > _STALE_SECONDS)):
+            if sample_rate != self._sample_rate:
                 self._clear_locked()
                 self._sample_rate = sample_rate
+                self._fft_size = self._size_for_rate(sample_rate)
+                self._capacity = self._fft_size
+                self._buffer = np.empty(self._capacity, dtype=np.int16)
+            elif (self._last_input_at is not None
+                  and now - self._last_input_at > _STALE_SECONDS):
+                self._clear_locked(preserve_buffer=True)
+            if self._buffer is None:
+                return
             self._last_input_at = now
-            self._samples = np.concatenate((self._samples, samples))[-_WINDOW_SAMPLES:]
-            if len(self._samples) < _WINDOW_SAMPLES:
+            count = min(len(samples), self._capacity)
+            if not count:
                 return
-            if self._last_fft_at is not None and now - self._last_fft_at < _UPDATE_SECONDS:
-                return
-            magnitude = np.abs(np.fft.rfft(self._samples * self._window))
-            magnitude *= 2.0 / (32768.0 * self._window_sum)
-            # DC and Nyquist have no negative-frequency counterpart.
-            magnitude[[0, -1]] *= 0.5
-            self._levels = np.clip(20.0 * np.log10(np.maximum(magnitude, 1e-5)), _FLOOR_DBFS, 0.0)
-            self._last_fft_at = now
-            self._generation += 1
+            newest = samples[-count:]
+            if count == self._capacity:
+                self._buffer[:] = newest
+                self._write_index = 0
+                self._sample_count = self._capacity
+            else:
+                first = min(count, self._capacity - self._write_index)
+                self._buffer[self._write_index:self._write_index + first] = newest[:first]
+                remaining = count - first
+                if remaining:
+                    self._buffer[:remaining] = newest[first:]
+                self._write_index = (self._write_index + count) % self._capacity
+                self._sample_count = min(self._capacity, self._sample_count + count)
+            self._data_generation += 1
 
     def snapshot(self) -> dict[str, Any]:
         bandwidth, filter_number, connected, mode, reported_width = self._radio_metadata()
         now = time.monotonic()
-        with self._lock:
-            estimated = bandwidth is None
-            span = bandwidth if bandwidth is not None else _FALLBACK_SPAN_HZ
-            if self._sample_rate:
-                span = min(span, self._sample_rate / 2.0)
-            age = None if self._last_fft_at is None else max(0.0, now - self._last_fft_at)
-            available = connected and self._levels is not None and age is not None and age <= _STALE_SECONDS
-            bins = self._display_bins_locked(span) if available else []
-            return {
-                "available": available,
-                "span_hz": span,
-                "bandwidth_hz": bandwidth,
-                "reported_bandwidth_hz": reported_width,
-                "receive_mode": mode,
-                "ssb_compatible": mode in ("USB", "LSB", "USB-DATA", "LSB-DATA") if mode else None,
-                "filter": filter_number,
-                "estimated": estimated,
-                "sample_rate": self._sample_rate,
-                "fft_size": _WINDOW_SAMPLES,
-                "bin_hz": span / (len(bins) - 1) if len(bins) > 1 else 0.0,
-                "bins": bins,
-                "generation": self._generation,
-                "age_seconds": round(age, 3) if age is not None else None,
-                "source": "Pi-Sat SUB AF",
-            }
+        if self._compute_lock.acquire(blocking=False):
+            try:
+                try:
+                    self._compute_if_due(now)
+                except Exception:
+                    with self._lock:
+                        self._average_failure_locked("Spectrum computation unavailable")
+            finally:
+                self._compute_lock.release()
+        try:
+            with self._lock:
+                return self._snapshot_locked(
+                    bandwidth, filter_number, connected, mode, reported_width, now,
+                )
+        except Exception:
+            with self._lock:
+                self._average_failure_locked("Spectrum display unavailable")
+                return self._snapshot_locked(
+                    bandwidth, filter_number, connected, mode, reported_width, now,
+                )
 
     def reset(self) -> None:
         with self._lock:
             self._clear_locked()
             self._sample_rate = 0
+            self._fft_size = 0
 
-    def _clear_locked(self) -> None:
-        self._samples = np.empty(0, dtype=np.float64)
-        self._levels = None
-        self._last_fft_at = None
+    @staticmethod
+    def _size_for_rate(sample_rate: int) -> int:
+        needed = max(1, math.ceil(sample_rate / _TARGET_BIN_HZ))
+        size = 1 << (needed - 1).bit_length()
+        return max(_MIN_FFT_SIZE, min(_MAX_FFT_SIZE, size))
+
+    def _clear_locked(self, *, preserve_buffer: bool = False) -> None:
+        if not preserve_buffer:
+            self._buffer = None
+            self._capacity = 0
+        self._write_index = 0
+        self._sample_count = 0
+        self._power = None
+        self._previous_power = None
+        self._last_frame_at = None
+        self._averaging_seconds = 0.0
+        self._bins_cache = None
+        self._bins_cache_key = None
+        self._last_compute_attempt_at = None
+        self._computed_data_generation = None
+        self._data_generation += 1
+        self._buffer_epoch += 1
         self._last_input_at = None
         self._generation += 1
+        self._timestamp_ms = None
+        self._fft_compute_ms = None
+        self._averaging_frames = 0
+        self._display_error = ""
+
+    def _ring_copy_locked(self) -> np.ndarray:
+        assert self._buffer is not None
+        if self._sample_count < self._capacity:
+            return self._buffer[:self._sample_count].copy()
+        output = np.empty(self._capacity, dtype=np.int16)
+        tail = self._capacity - self._write_index
+        output[:tail] = self._buffer[self._write_index:]
+        output[tail:] = self._buffer[:self._write_index]
+        return output
+
+    def _compute_if_due(self, now: float) -> None:
+        with self._lock:
+            if (self._sample_count < self._capacity or self._capacity == 0 or
+                    self._computed_data_generation == self._data_generation):
+                return
+            if (self._last_compute_attempt_at is not None
+                    and now - self._last_compute_attempt_at < _UPDATE_SECONDS):
+                return
+            self._last_compute_attempt_at = now
+            samples = self._ring_copy_locked()
+            sample_rate, fft_size = self._sample_rate, self._fft_size
+            data_generation, buffer_epoch = self._data_generation, self._buffer_epoch
+        try:
+            if self._window is None or len(self._window) != fft_size:
+                self._window = np.hanning(fft_size)
+                self._window_sum = float(self._window.sum())
+            values = samples.astype(np.float64)
+            magnitude = np.abs(np.fft.rfft(values * self._window))
+            magnitude *= 2.0 / (32768.0 * self._window_sum)
+            magnitude[[0, -1]] *= 0.5
+            power = np.square(magnitude)
+            compute_ms = max(0.0, (time.monotonic() - now) * 1000.0)
+            timestamp_ms = int(time.time() * 1000)
+            with self._lock:
+                if (self._sample_rate != sample_rate or self._fft_size != fft_size
+                        or self._buffer_epoch != buffer_epoch):
+                    return
+                elapsed = None if self._last_frame_at is None else now - self._last_frame_at
+                self._averaging_seconds = fft_size / sample_rate
+                if (self._previous_power is not None
+                        and self._previous_power.shape == power.shape
+                        and elapsed is not None and 0 <= elapsed <= _MAX_AVERAGING_GAP_SECONDS):
+                    self._power = (self._previous_power + power) * 0.5
+                    self._averaging_frames = 2
+                    self._averaging_seconds += elapsed
+                else:
+                    self._power = power
+                    self._averaging_frames = 1
+                self._previous_power = power
+                self._last_frame_at = now
+                self._computed_data_generation = data_generation
+                self._fft_compute_ms = round(compute_ms, 3)
+                self._timestamp_ms = timestamp_ms
+                self._generation += 1
+                self._bins_cache = None
+                self._bins_cache_key = None
+                self._display_error = ""
+        except Exception:
+            with self._lock:
+                if self._buffer_epoch == buffer_epoch:
+                    self._average_failure_locked("Spectrum computation unavailable")
+
+    def _average_failure_locked(self, detail: str) -> None:
+        self._power = None
+        self._previous_power = None
+        self._last_frame_at = None
+        self._averaging_seconds = 0.0
+        self._bins_cache = None
+        self._bins_cache_key = None
+        self._computed_data_generation = self._data_generation
+        self._generation += 1
+        self._timestamp_ms = None
+        self._fft_compute_ms = None
+        self._averaging_frames = 0
+        self._display_error = detail
+
+    def _snapshot_locked(
+        self, bandwidth: float | None, filter_number: int | None,
+        connected: bool, mode: str | None, reported_width: float | None,
+        now: float,
+    ) -> dict[str, Any]:
+        estimated = bandwidth is None
+        span = bandwidth if bandwidth is not None else _FALLBACK_SPAN_HZ
+        if self._sample_rate:
+            span = min(span, self._sample_rate / 2.0)
+        age = None if self._last_input_at is None else max(0.0, now - self._last_input_at)
+        available = bool(
+            connected and self._sample_count >= self._capacity
+            and self._power is not None and self._timestamp_ms is not None
+            and age is not None and age <= _STALE_SECONDS
+        )
+        bins = self._display_bins_locked(span) if available else []
+        resolution = (
+            self._sample_rate / self._fft_size if self._sample_rate and self._fft_size else 0.0
+        )
+        return {
+            "available": available,
+            "span_hz": span,
+            "bandwidth_hz": bandwidth,
+            "reported_bandwidth_hz": reported_width,
+            "receive_mode": mode,
+            "ssb_compatible": mode in ("USB", "LSB", "USB-DATA", "LSB-DATA") if mode else None,
+            "filter": filter_number,
+            "estimated": estimated,
+            "sample_rate": self._sample_rate,
+            "fft_size": self._fft_size,
+            "frame_seconds": round(self._fft_size / self._sample_rate, 3) if self._sample_rate else 0.0,
+            "fft_resolution_hz": round(resolution, 3),
+            "bin_hz": span / (len(bins) - 1) if len(bins) > 1 else 0.0,
+            "display_bin_hz": (
+                round(span / (len(bins) - 1), 3) if len(bins) > 1 else 0.0
+            ),
+            "bins": list(bins),
+            "generation": self._generation,
+            "timestamp_ms": self._timestamp_ms,
+            "age_seconds": round(age, 3) if age is not None else None,
+            "averaging_frames": self._averaging_frames,
+            "averaging_seconds": round(self._averaging_seconds, 3),
+            "fft_compute_ms": self._fft_compute_ms,
+            "detail": self._display_error,
+            "source": "Pi-Sat SUB AF",
+        }
 
     def _display_bins_locked(self, span: float) -> list[float]:
-        count = min(len(self._levels), math.floor(span * _WINDOW_SAMPLES / self._sample_rate) + 1)
+        if self._power is None:
+            return []
+        cache_key = (self._generation, span)
+        if self._bins_cache is not None and self._bins_cache_key == cache_key:
+            return self._bins_cache
+        levels = np.clip(
+            10.0 * np.log10(np.maximum(self._power, 1e-10)),
+            _FLOOR_DBFS, 0.0,
+        )
+        count = min(
+            len(levels),
+            math.floor(span * self._fft_size / self._sample_rate) + 1,
+        )
         displayed = min(_MAX_BINS, count)
         if displayed < 2:
-            return [round(float(self._levels[0]), 2)]
-        frequencies = np.arange(count) * self._sample_rate / _WINDOW_SAMPLES
+            result = [round(float(levels[0]), 2)]
+            self._bins_cache, self._bins_cache_key = result, cache_key
+            return result
+        frequencies = np.arange(count) * self._sample_rate / self._fft_size
         buckets = np.rint(frequencies * (displayed - 1) / span).astype(np.intp)
         output = np.full(displayed, _FLOOR_DBFS)
         # Preserve narrow signals when several FFT bins share a display pixel.
-        np.maximum.at(output, buckets, self._levels[:count])
-        return np.round(output, 2).tolist()
+        np.maximum.at(output, buckets, levels[:count])
+        result = np.round(output, 2).tolist()
+        self._bins_cache, self._bins_cache_key = result, cache_key
+        return result
 
     def _radio_metadata(self) -> tuple[float | None, int | None, bool, str | None, float | None]:
         try:

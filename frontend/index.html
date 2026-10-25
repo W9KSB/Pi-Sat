@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Pi-Sat Controller</title>
     <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
-    <link rel="stylesheet" href="/style.css?v=20261008-wsjtx-tx1">
+    <link rel="stylesheet" href="/style.css?v=20261023-signal-waterfall1">
     <link rel="stylesheet" href="/radio-console.css?v=20261009-tuning-tone1">
     <link rel="stylesheet" href="/interface.css?v=20261023-ui1">
-    <link rel="stylesheet" href="/modules.css?v=20261023-ui1">
+    <link rel="stylesheet" href="/modules.css?v=20261023-signal-waterfall1">
     <link rel="stylesheet" href="/settings.css?v=20261023-ui1">
     <link rel="stylesheet" href="/satellites.css?v=20261023-ui1">
   </head>
@@ -930,15 +930,16 @@
 
             <section class="module-panel wsjtx-spectrum-panel" aria-labelledby="wsjtx-spectrum-title">
               <header class="wsjtx-spectrum-controls">
-                <div><h2 id="wsjtx-spectrum-title">Digital audio</h2><span id="wsjtx-spectrum-span">0–3000 Hz · estimated SSB width</span></div>
+                <div><h2 id="wsjtx-spectrum-title">Signal waterfall</h2><span id="wsjtx-spectrum-span">0–3000 Hz · estimated SSB width</span></div>
                 <label for="wsjtx-offset">Hold TX offset <input id="wsjtx-offset" type="number" min="200" max="2950" step="1" value="1500" disabled><span>Hz</span></label>
               </header>
               <div class="module-panel-body">
                 <div id="wsjtx-spectrum-hit" class="wsjtx-spectrum-hit" role="slider" tabindex="0" aria-label="Held transmit audio offset" aria-valuemin="200" aria-valuemax="2950" aria-valuenow="1500" aria-disabled="true">
-                  <canvas id="wsjtx-spectrum" class="wsjtx-spectrum" width="1200" height="130" aria-hidden="true"></canvas><canvas id="wsjtx-waterfall" class="wsjtx-waterfall" width="1200" height="80" aria-hidden="true"></canvas>
+                  <canvas id="wsjtx-frequency-scale" class="wsjtx-frequency-scale" width="1200" height="24" aria-hidden="true"></canvas>
+                  <canvas id="wsjtx-waterfall" class="wsjtx-waterfall" width="1200" height="260" aria-hidden="true"></canvas>
                   <span id="wsjtx-rx-marker" class="wsjtx-offset-marker wsjtx-rx-marker"><b>RX</b></span><span id="wsjtx-tx-marker" class="wsjtx-offset-marker wsjtx-tx-marker"><b>TX</b></span>
                 </div>
-                <p id="wsjtx-spectrum-detail" class="module-help">Waiting for receive audio. Click the passband to set your held TX offset.</p>
+                <p id="wsjtx-spectrum-detail" class="module-help">Waiting for receive audio. The waterfall shows signal energy; decoded messages appear below.</p>
               </div>
             </section>
 
@@ -954,7 +955,7 @@
                   <div class="module-panel-body">
                     <div class="wsjtx-calls"><div><span>My call</span><strong id="wsjtx-my-call">—</strong><small id="wsjtx-my-grid">—</small></div><div><span>Target call</span><strong id="wsjtx-target-call">—</strong><small id="wsjtx-target-grid">Double-click a decode</small></div></div>
                     <div class="wsjtx-tx-controls"><button id="wsjtx-tx-enable" class="module-button module-button-primary" type="button" aria-pressed="false" disabled>Enable TX</button><button id="wsjtx-halt" class="module-button module-button-danger" type="button" disabled>Halt TX</button><button id="wsjtx-cq" class="module-button" type="button" disabled>Call CQ</button></div>
-                    <div class="digital-sequence-controls"><label><input id="wsjtx-auto" type="checkbox" checked disabled>Auto sequence</label><span id="wsjtx-retries">Retries 0 / 3</span></div>
+                    <div class="digital-sequence-controls"><label><input id="wsjtx-auto" type="checkbox" checked disabled>Auto sequence</label><label for="wsjtx-tx-slot">TX Slot<select id="wsjtx-tx-slot" title="Auto replies in the opposite slot. Even is the first period; Odd is the second." disabled><option value="auto" selected>Auto</option><option value="odd">Odd</option><option value="even">Even</option></select></label><span id="wsjtx-retries">Retries 0 / 3</span></div>
                     <fieldset id="wsjtx-messages" class="wsjtx-messages" disabled><legend class="visually-hidden">Transmit message</legend></fieldset>
                     <p id="wsjtx-qso-detail" class="module-help" role="status" aria-live="polite">Start RX to begin a QSO.</p><p id="wsjtx-next-slot" class="wsjtx-next-slot"></p>
                   </div>
@@ -1000,12 +1001,12 @@
       <a href="https://github.com/w9ksb" target="_blank" rel="noopener noreferrer">github.com/w9ksb</a>
     </footer>
     <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
-    <script type="application/json" data-native-src="/radio-console.js?v=20261023-ui1"></script>
+    <script type="application/json" data-native-src="/radio-console.js?v=20261023-tone-level1"></script>
     <script type="application/json" data-native-src="/audio-stream.js?v=20261023-ui1"></script>
     <script type="application/json" data-native-src="/sstv.js?v=20261023-ui1"></script>
     <script type="application/json" data-native-src="/aprs.js?v=20261023-ui1"></script>
-    <script type="application/json" data-native-src="/wsjtx.js?v=20261023-ui1"></script>
+    <script type="application/json" data-native-src="/wsjtx.js?v=20261023-signal-waterfall1"></script>
     <script src="/interface.js?v=20261023-ui1"></script>
-    <script src="/app.js?v=20261023-ui1"></script>
+    <script src="/app.js?v=20261023-tone-level1"></script>
   </body>
 </html>

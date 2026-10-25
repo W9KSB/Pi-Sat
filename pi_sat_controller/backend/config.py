@@ -153,6 +153,7 @@ class IcomConfig:
     full_duplex: bool
     scope_enabled: bool
     debug_logging: bool
+    tuning_tone_level_percent: int = 75
 
 
 @dataclass(frozen=True)
@@ -327,6 +328,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> AppConfig:
             full_duplex=_get_bool(parser, "icom", "full_duplex", True),
             scope_enabled=_get_bool(parser, "icom", "scope_enabled", True),
             debug_logging=_get_bool(parser, "icom", "debug_logging", False),
+            tuning_tone_level_percent=_get_tuning_tone_level(parser),
         ),
         aprs=AprsConfig(
             mycall=_get_text(parser, "aprs", "mycall", ""),
@@ -607,6 +609,13 @@ def _get_aprs_channel(parser: ConfigParser) -> str:
 APRS_RX_GAIN_DEFAULT_DB = RX_GAIN_DEFAULT_DB
 
 
+def _get_tuning_tone_level(parser: ConfigParser) -> int:
+    level = _get_int(parser, "icom", "tuning_tone_level_percent", 75)
+    if not 0 <= level <= 100:
+        raise ValueError("[icom] tuning_tone_level_percent must be between 0 and 100")
+    return level
+
+
 def _get_rx_gain_db(parser: ConfigParser, section: str) -> float:
     """Level trim applied only to one module's copy of the receive audio.
 
@@ -788,6 +797,7 @@ SETTINGS_SCHEMA: dict[str, list[str]] = {
         "manual_offset_readback_active_pass_only",
     ],
     "icom": [
+        "tuning_tone_level_percent",
         "enabled",
         "connectivity",
         "host",
@@ -958,6 +968,7 @@ def load_settings(path: Path | str = DEFAULT_CONFIG_PATH) -> dict[str, dict[str,
                 settings["rotator"][key] = default
     if "icom" in settings:
         icom_defaults = {
+            "tuning_tone_level_percent": "75",
             "enabled": "false",
             "control_port": "50001",
             "serial_port": "50002",

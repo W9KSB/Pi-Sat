@@ -264,6 +264,7 @@ class IcomRadioController:
         self._tuning_tone_routes: tuple[int, int] | None = None
         self._tuning_tone_generation = 0
         self._tuning_tone_error: str | None = None
+        self._tuning_tone_level_percent = 75
         # --- Transport diagnostics: bounded counters, never per-packet logging.
         self._civ_counts: dict[str, int] = {}
         self._transceive_counts: dict[str, int] = {}
@@ -328,6 +329,7 @@ class IcomRadioController:
             and self._transmit_stream_claim == ("tuning-tone", self._tuning_tone_token)
         )
         payload["tuning_tone_error"] = self._tuning_tone_error
+        payload["tuning_tone_level_percent"] = self._tuning_tone_level_percent
         return payload
 
     def _publish_snapshot_locked(self) -> dict[str, Any]:
@@ -684,14 +686,23 @@ class IcomRadioController:
                 self._snapshot_cache["tuning_tone_error"] = self._tuning_tone_error
 
     @staticmethod
-    def _tuning_tone_pcm(sample_rate: int, sample_offset: int, samples: int) -> bytes:
-        """Mono S16_LE note at 6.25% peak, with continuous phase and a 5 ms attack."""
+    def _tuning_tone_pcm(sample_rate: int, sample_offset: int, samples: int,
+                         level_percent: int = 75) -> bytes:
+        """Scaled mono S16_LE note, with continuous phase and a 5 ms attack."""
         ramp_samples = max(1, sample_rate // 200)
         return b"".join(struct.pack("<h", round(
-            2048 * min(1.0, (sample_offset + index) / ramp_samples) * math.sin(
+            32767 * level_percent / 100 * min(1.0, (sample_offset + index) / ramp_samples) * math.sin(
                 2 * math.pi * 600 * (sample_offset + index) / sample_rate
             )
         )) for index in range(samples))
+
+    def set_tuning_tone_level(self, level_percent: int) -> dict[str, Any]:
+        """Set only the generated tone's amplitude, including while it is active."""
+        if type(level_percent) is not int or not 0 <= level_percent <= 100:
+            raise ValueError("Tuning tone level must be an integer from 0 to 100 percent")
+        with self._lock:
+            self._tuning_tone_level_percent = level_percent
+            return self._publish_snapshot_locked()
 
     def set_tuning_tone(self, enabled: bool) -> dict[str, Any]:
         """Toggle a continuous audio note using the shared transmit owner."""
@@ -752,13 +763,18 @@ class IcomRadioController:
         try:
             # An integral number of tone cycles can repeat without a phase
             # jump, avoiding waveform calculations for every frame on the Pi.
-            steady_pcm = (self._tuning_tone_pcm(sample_rate, samples, samples)
-                          if 600 * samples % sample_rate == 0 else None)
+            cached_level = None
+            steady_pcm = None
             while not stop.is_set():
                 if self.config.sample_rate != sample_rate or self._stop.is_set():
                     raise IcomRadioError("Radio audio session changed; tuning tone stopped")
+                level = self._tuning_tone_level_percent
+                if cached_level != level:
+                    steady_pcm = (self._tuning_tone_pcm(sample_rate, samples, samples, level)
+                                  if 600 * samples % sample_rate == 0 else None)
+                    cached_level = level
                 pcm = (steady_pcm if sample_offset and steady_pcm is not None
-                       else self._tuning_tone_pcm(sample_rate, sample_offset, samples))
+                       else self._tuning_tone_pcm(sample_rate, sample_offset, samples, level))
                 if stop.is_set():
                     break
                 self.send_audio(pcm, transmit_token=token)

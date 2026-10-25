@@ -21,6 +21,7 @@ _CALL = re.compile(r"(?:[A-Z][A-Z0-9]?|[0-9][A-Z])[0-9][A-Z]{1,3}(?:/[PR])?")
 _GRID = re.compile(r"[A-R]{2}[0-9]{2}")
 _REPORT = re.compile(r"([+-][0-9]{2})")
 _MAX_RETRIES = 3
+_TX_SLOTS = ("auto", "odd", "even")
 
 
 def _now() -> datetime:
@@ -74,6 +75,7 @@ class WsjtxQso:
         self._auto = True
         self._transmitting = self._tx_available = False
         self._detail = "Select a live standard decode or call CQ"
+        self._tx_slot = "auto"
         self._tx_even = True
         self._attempts = 0
         self._engine = self._controller = None
@@ -91,6 +93,10 @@ class WsjtxQso:
         self._time_on = self._report_sent = self._report_received = ""
         self._acknowledged = False
         self._logged = False
+        self._suspended = False
+        self._can_resume = False
+        self._fault_sequence: int | None = None
+        self._final_fault_sequence: int | None = None
         self._transmissions: deque[dict[str, Any]] = deque(maxlen=100)
         try:
             self._read_station()
@@ -129,11 +135,32 @@ class WsjtxQso:
         WSJT-X's ``Tx even/1st`` control selects the period after an odd
         partner period.  The decode timestamp is relative to UTC midnight,
         which keeps this calculation aligned with the protocol rather than
-        with local wall-clock or process start time.
+        with local wall-clock or process start time.  FT4 timestamps are
+        truncated to whole seconds by WSJT-X, so ``:22`` represents the
+        ``:22.5`` slot and must be rounded to the nearest slot boundary before
+        its parity is selected.  A timestamp exactly on a boundary belongs to
+        that starting slot.
         """
         if type(decode_time_ms) is not int or not 0 <= decode_time_ms < 86400000:
             raise ValueError("Decode has no valid native time")
-        return (decode_time_ms // self._period_ms()) % 2 == 1
+        period_ms = self._period_ms()
+        decode_slot = (decode_time_ms + period_ms // 2) // period_ms
+        return decode_slot % 2 == 1
+
+    def _latest_partner_tx_even(self, manager: dict[str, Any]) -> bool | None:
+        """Return Auto parity from the newest live decode of the selected partner."""
+        with self._lock:
+            target, client_key = self._target_call, self._client_key
+        if not target or not client_key:
+            return None
+        for decode in manager.get("decodes", []):
+            try:
+                parsed = self._live_decode(decode, client_key)
+            except ValueError:
+                continue
+            if parsed["sender"] == target:
+                return self._reply_tx_even(decode["time_ms"])
+        return None
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -153,6 +180,8 @@ class WsjtxQso:
                 "auto_sequence": self._auto, "transmitting": self._transmitting,
                 "tx_available": self._tx_available, "retries": max(0, self._attempts - 1),
                 "max_retries": _MAX_RETRIES, "detail": self._detail,
+                "suspended": self._suspended, "can_resume": self._can_resume,
+                "tx_slot": self._tx_slot, "tx_even": self._tx_even,
                 "next_slot_utc": next_slot, "contacts": self.contacts.list(),
                 "transmissions": copy.deepcopy(list(self._transmissions)),
             }
@@ -262,6 +291,9 @@ class WsjtxQso:
             self._attempts = 0
             self._inflight = None
             self._was_transmitting = bool(tx.get("transmitting"))
+            self._suspended = self._can_resume = False
+            self._fault_sequence = None
+            self._final_fault_sequence = None
             self._seen.clear()
             self._seen_order.clear()
             for decode in manager.get("decodes", []):
@@ -274,6 +306,151 @@ class WsjtxQso:
     def _intent_epoch_value(self) -> int:
         with self._lock:
             return self._intent_epoch
+
+    @staticmethod
+    def _fault_has_contract_fields(fault: Any) -> bool:
+        return (
+            isinstance(fault, dict)
+            and type(fault.get("sequence")) is int
+            and isinstance(fault.get("category"), str)
+            and isinstance(fault.get("detail"), str)
+        )
+
+    @classmethod
+    def _fault_is_recoverable(cls, fault: Any) -> bool:
+        return cls._fault_has_contract_fields(fault) and fault.get("recoverable") is True
+
+    @staticmethod
+    def _fault_is_pending(fault: Any, tx: dict[str, Any]) -> bool:
+        return WsjtxQso._fault_has_contract_fields(fault) and tx.get("fault_pending") is True
+
+    @staticmethod
+    def _fault_description(fault: Any) -> str:
+        if not isinstance(fault, dict):
+            return "Managed transmit state is unavailable"
+        detail = str(fault.get("detail") or "").strip()
+        category = str(fault.get("category") or "").strip()
+        return detail or category or "Managed transmit fault"
+
+    def _abort_inflight_locked(self) -> None:
+        interrupted = self._inflight
+        self._inflight = None
+        if interrupted is None:
+            return
+        for transmission in self._transmissions:
+            if transmission.get("key") == interrupted.get("history_key"):
+                transmission.update(
+                    completed=False,
+                    aborted=True,
+                    time_off_utc=_now().isoformat(timespec="milliseconds"),
+                )
+                break
+
+    def _suspend_for_fault(
+        self, engine: Any, fault: dict[str, Any], *, transmitting: bool,
+    ) -> None:
+        sequence = fault["sequence"]
+        with self._lock:
+            if self._suspended and self._final_fault_sequence == sequence:
+                return
+            self._intent_epoch += 1
+            self._enabled = False
+            self._transmitting = False
+            self._tx_available = False
+            self._suspended = True
+            self._can_resume = True
+            self._fault_sequence = sequence
+            self._final_fault_sequence = sequence
+            self._was_transmitting = False
+            self._detail = (
+                f"TX suspended after {self._fault_description(fault)}; "
+                "the same contact can be resumed explicitly"
+            )
+            self._abort_inflight_locked()
+        try:
+            engine.halt_tx()
+        except Exception as error:
+            with self._lock:
+                self._detail += f"; transmit halt failed: {error}"
+        LOGGER.warning("QSO transmit suspended: %s", self._fault_description(fault))
+
+    def _suspend_pending_fault(
+        self, engine: Any, *, fault_sequence: int | None = None,
+        abort_inflight: bool = False,
+    ) -> None:
+        with self._lock:
+            if self._suspended and self._fault_sequence == fault_sequence and not self._can_resume:
+                if abort_inflight:
+                    self._abort_inflight_locked()
+                return
+            self._intent_epoch += 1
+            self._enabled = False
+            self._transmitting = False
+            self._tx_available = False
+            self._suspended = True
+            self._can_resume = False
+            self._fault_sequence = fault_sequence
+            self._was_transmitting = False
+            self._detail = (
+                "TX suspended while the managed engine assesses a transmit failure; "
+                "the contact is retained"
+            )
+            if abort_inflight:
+                self._abort_inflight_locked()
+        try:
+            engine.halt_tx()
+        except Exception as error:
+            with self._lock:
+                self._detail += f"; transmit halt failed: {error}"
+
+    def _resume_context_valid(
+        self,
+        engine: Any,
+        status: dict[str, Any],
+        tx: dict[str, Any],
+        manager: dict[str, Any],
+        controller: Any,
+        *,
+        require_available: bool,
+    ) -> bool:
+        with self._lock:
+            bound_engine = self._engine
+            bound_controller = self._controller
+            engine_generation = self._engine_generation
+            controller_generation = self._controller_generation
+            mode = self._mode
+            client_key = self._client_key
+            tx_offset = self._tx_offset
+        if self.contacts.error or engine is not bound_engine or controller is not bound_controller:
+            return False
+        try:
+            settings_mode = str(self._get_settings().get("mode", "FT8")).upper()
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        if (not status.get("running") or not tx.get("connected") or
+                tx.get("generation") != engine_generation or tx.get("mode") != mode or
+                settings_mode != mode):
+            return False
+        if require_available and (not tx.get("available") or tx.get("fault") is not None):
+            return False
+        fault = tx.get("fault")
+        if fault is not None and not self._fault_is_recoverable(fault):
+            return False
+        if not manager.get("running") or not manager.get("enabled"):
+            return False
+        try:
+            if self._owned_client(manager, tx) != client_key:
+                return False
+            if self._radio_generation(controller) != controller_generation:
+                return False
+            self._offset_valid(tx_offset, self._radio(controller))
+        except (RuntimeError, ValueError):
+            return False
+        return True
+
+    def _set_resume_state(self, can_resume: bool) -> None:
+        with self._lock:
+            self._can_resume = bool(self._suspended and can_resume)
 
     def _configure(self, epoch: int) -> None:
         if not self._intent_is_current(epoch):
@@ -294,7 +471,10 @@ class WsjtxQso:
             self._intent_epoch += 1
             self._enabled = False
             self._detail = detail
-            self._inflight = None
+            self._abort_inflight_locked()
+            self._suspended = self._can_resume = False
+            self._fault_sequence = None
+            self._final_fault_sequence = None
             engine = self._engine
         try:
             (engine or self._get_engine()).halt_tx()
@@ -343,7 +523,8 @@ class WsjtxQso:
                 self._target_call, self._target_grid = parsed["sender"], parsed["grid"]
                 self._report = f"{snr:+03d}"
                 self._rx_offset = decode.get("frequency_hz", 0)
-                self._tx_even = self._reply_tx_even(decode["time_ms"])
+                if self._tx_slot == "auto":
+                    self._tx_even = self._reply_tx_even(decode["time_ms"])
                 self._selected = 1
                 self._intent_epoch += 1
                 epoch = self._intent_epoch
@@ -363,7 +544,9 @@ class WsjtxQso:
                 if self._intent_epoch != start_epoch:
                     raise RuntimeError("Transmit intent was superseded")
                 self._target_call = self._target_grid = ""
-                self._selected, self._tx_even = 6, True
+                self._selected = 6
+                if self._tx_slot == "auto":
+                    self._tx_even = True
                 self._intent_epoch += 1
                 epoch = self._intent_epoch
             self._new_attempt(engine, tx, manager, controller, epoch)
@@ -419,6 +602,116 @@ class WsjtxQso:
                 self._detail = "TX offset applies to the next burst" if transmitting else "TX offset updated"
             return self.snapshot()
 
+    def set_tx_slot(self, slot: str) -> dict[str, Any]:
+        if type(slot) is not str or slot not in _TX_SLOTS:
+            raise ValueError("TX slot must be auto, odd, or even")
+        with self._operation_lock:
+            start_epoch = self._intent_epoch_value()
+            inferred_even = None
+            if slot == "auto":
+                inferred_even = self._latest_partner_tx_even(
+                    self._get_manager().snapshot(),
+                )
+            with self._lock:
+                if self._intent_epoch != start_epoch:
+                    raise RuntimeError("Transmit intent was superseded")
+                self._tx_slot = slot
+                if inferred_even is not None:
+                    self._tx_even = inferred_even
+                elif slot != "auto":
+                    self._tx_even = slot == "even"
+                self._intent_epoch += 1
+                epoch = self._intent_epoch
+                enabled = self._enabled
+                transmitting = self._transmitting
+            if enabled:
+                try:
+                    self._configure(epoch)
+                except Exception as error:
+                    if self._intent_is_current(epoch):
+                        self._halt(f"Could not change the managed transmit slot: {error}")
+                    raise
+            with self._lock:
+                if transmitting:
+                    self._detail = "TX slot applies to the next burst"
+                elif slot == "auto" and inferred_even is None:
+                    self._detail = "Auto TX slot selected; no live partner decode is available"
+                else:
+                    self._detail = f"TX slot set to {slot}"
+            return self.snapshot()
+
+    def _resume_suspended(self, start_epoch: int) -> dict[str, Any]:
+        engine = self._get_engine()
+        status = engine.snapshot()
+        tx = status.get("tx", {})
+        manager = self._get_manager().snapshot()
+        controller = self._get_controller()
+        if not self._resume_context_valid(
+            engine, status, tx, manager, controller, require_available=False,
+        ):
+            detail = "Faulted contact cannot resume because the engine, client, mode, radio, or attempt session changed"
+            self._halt(detail)
+            raise RuntimeError(detail)
+        recover = getattr(engine, "recover_tx", None)
+        if not callable(recover):
+            detail = "Managed WSJT-X TX recovery is unavailable"
+            self._halt(detail)
+            raise RuntimeError(detail)
+        try:
+            recover()
+        except Exception as error:
+            if not self._intent_is_current(start_epoch):
+                raise RuntimeError("Transmit intent was superseded") from error
+            detail = f"Managed WSJT-X TX recovery failed: {error}"
+            refreshed = engine.snapshot()
+            self._set_resume_state(self._resume_context_valid(
+                engine, refreshed, refreshed.get("tx", {}),
+                self._get_manager().snapshot(), controller,
+                require_available=False,
+            ))
+            with self._lock:
+                self._detail = detail
+            raise RuntimeError(detail) from error
+        status = engine.snapshot()
+        tx = status.get("tx", {})
+        manager = self._get_manager().snapshot()
+        if not self._intent_is_current(start_epoch):
+            raise RuntimeError("Transmit intent was superseded")
+        if not self._resume_context_valid(
+            engine, status, tx, manager, controller, require_available=True,
+        ):
+            if self._resume_context_valid(
+                engine, status, tx, manager, controller, require_available=False,
+            ):
+                detail = str((tx.get("fault") or {}).get("detail")
+                             or status.get("detail") or "TX recovery is not ready")
+                self._set_resume_state(not tx.get("fault_pending"))
+                with self._lock:
+                    self._detail = detail
+                raise RuntimeError(detail)
+            detail = "Managed WSJT-X TX recovery completed, but the contact session is no longer resumable"
+            self._halt(detail)
+            raise RuntimeError(detail)
+        radio = self._radio(controller)
+        with self._lock:
+            if self._intent_epoch != start_epoch:
+                raise RuntimeError("Transmit intent was superseded")
+            self._intent_epoch += 1
+            epoch = self._intent_epoch
+            self._suspended = False
+            self._can_resume = False
+            self._fault_sequence = None
+            self._final_fault_sequence = None
+            self._tx_available = True
+            self._was_transmitting = False
+        self._arm(engine, radio, epoch)
+        with self._lock:
+            self._detail = (
+                f"Transmit resumed for {self._target_call or 'CQ'} at message {self._selected}; "
+                "the interrupted burst remains incomplete"
+            )
+        return self.snapshot()
+
     def set_enabled(self, enabled: bool) -> dict[str, Any]:
         if type(enabled) is not bool:
             raise ValueError("enabled must be a boolean")
@@ -429,6 +722,9 @@ class WsjtxQso:
             start_epoch = self._intent_epoch_value()
             with self._lock:
                 already_enabled = self._enabled
+                suspended = self._suspended
+            if suspended:
+                return self._resume_suspended(start_epoch)
             if not already_enabled:
                 self._read_station()
                 engine, tx, manager, controller, radio = self._context()
@@ -468,7 +764,8 @@ class WsjtxQso:
                 stage = 5
             else:
                 return False
-            if type(decode_time_ms) is int and 0 <= decode_time_ms < 86400000:
+            if (self._tx_slot == "auto" and type(decode_time_ms) is int
+                    and 0 <= decode_time_ms < 86400000):
                 # Every valid partner decode determines the immediately
                 # following compatible slot. This matters when decoder output
                 # arrives near the end of the partner's transmission window.
@@ -502,16 +799,74 @@ class WsjtxQso:
         LOGGER.info("QSO contact logged: %s %s", self._target_call, self._mode)
         self._halt(f"Contact with {self._target_call} completed and logged")
 
+    def _process_decodes(
+        self, manager: dict[str, Any], client_key: str, *, passive: bool,
+    ) -> None:
+        for decode in reversed(manager.get("decodes", [])):
+            key = decode.get("key", "")
+            with self._lock:
+                unseen = bool(key) and key not in self._seen
+                if unseen:
+                    self._remember(key)
+            if not unseen:
+                continue
+            try:
+                parsed = self._live_decode(decode, client_key)
+            except ValueError:
+                continue
+            if passive:
+                with self._lock:
+                    advanced = self._apply_reply(
+                        parsed, advance=self._auto,
+                        decode_time_ms=decode.get("time_ms"),
+                    )
+                    if advanced:
+                        self._detail = (
+                            f"Addressed reply from {self._target_call} retained while TX is suspended; "
+                            f"message {self._selected} is ready for explicit resume"
+                        )
+                continue
+            with self._lock:
+                adopt_sender = (
+                    self._auto and not self._target_call and self._selected == 6
+                    and parsed["recipient"] == self._my_call
+                    and parsed["sender"] != self._my_call
+                )
+            if adopt_sender:
+                snr = decode.get("snr_db")
+                if type(snr) is int and -50 <= snr <= 49:
+                    with self._lock:
+                        self._target_call, self._target_grid = parsed["sender"], parsed["grid"]
+                        self._report = f"{snr:+03d}"
+                        self._rx_offset = decode.get("frequency_hz", 0)
+            with self._lock:
+                advanced = self._apply_reply(
+                    parsed, advance=self._auto,
+                    decode_time_ms=decode.get("time_ms"),
+                )
+                epoch = self._intent_epoch
+            if advanced:
+                self._configure(epoch)
+                with self._lock:
+                    self._detail = (
+                        f"Addressed reply from {self._target_call}; "
+                        f"advancing to message {self._selected}"
+                    )
+                    target, selected = self._target_call, self._selected
+                LOGGER.info("QSO addressed RX advanced %s to stage %d", target, selected)
+
     def _poll_once(self) -> None:
         with self._operation_lock:
             engine = self._get_engine()
             status = engine.snapshot()
             tx = status.get("tx", {})
+            fault = tx.get("fault")
             transmitting = bool(tx.get("transmitting"))
             with self._lock:
                 self._transmitting = transmitting
                 self._tx_available = bool(tx.get("available"))
                 enabled = self._enabled
+                suspended = self._suspended
                 was_transmitting = self._was_transmitting
                 bound_engine = self._engine
                 bound_controller = self._controller
@@ -520,6 +875,58 @@ class WsjtxQso:
                 mode = self._mode
                 client_key = self._client_key
                 tx_offset = self._tx_offset
+            if fault is not None:
+                if self._fault_is_pending(fault, tx):
+                    if enabled or suspended:
+                        self._suspend_pending_fault(
+                            engine, fault_sequence=fault["sequence"],
+                            abort_inflight=True,
+                        )
+                    return
+                if self._fault_is_recoverable(fault):
+                    if enabled or suspended:
+                        self._suspend_for_fault(engine, fault, transmitting=transmitting)
+                        manager = self._get_manager().snapshot()
+                        controller = self._get_controller()
+                        can_resume = self._resume_context_valid(
+                            engine, status, tx, manager, controller,
+                            require_available=False,
+                        )
+                        self._set_resume_state(can_resume)
+                        if can_resume:
+                            self._process_decodes(manager, client_key, passive=True)
+                    return
+                if enabled or suspended:
+                    self._halt(
+                        "Managed WSJT-X transmit fault is not recoverable: "
+                        f"{self._fault_description(fault)}"
+                    )
+                return
+            if (enabled or suspended) and not tx.get("available"):
+                manager = self._get_manager().snapshot()
+                controller = self._get_controller()
+                if self._resume_context_valid(
+                    engine, status, tx, manager, controller,
+                    require_available=False,
+                ):
+                    self._suspend_pending_fault(engine)
+                else:
+                    self._halt(
+                        "Engine, native source, mode, or control session changed "
+                        "while TX failure assessment was pending"
+                    )
+                return
+            if suspended:
+                manager = self._get_manager().snapshot()
+                controller = self._get_controller()
+                can_resume = self._resume_context_valid(
+                    engine, status, tx, manager, controller,
+                    require_available=False,
+                )
+                self._set_resume_state(can_resume)
+                if can_resume:
+                    self._process_decodes(manager, client_key, passive=True)
+                return
             if not enabled:
                 with self._lock:
                     self._was_transmitting = transmitting
@@ -603,41 +1010,7 @@ class WsjtxQso:
                     return
             with self._lock:
                 self._was_transmitting = transmitting
-            for decode in reversed(manager.get("decodes", [])):
-                key = decode.get("key", "")
-                with self._lock:
-                    unseen = bool(key) and key not in self._seen
-                    if unseen:
-                        self._remember(key)
-                if not unseen:
-                    continue
-                try:
-                    parsed = self._live_decode(decode, client_key)
-                except ValueError:
-                    continue
-                with self._lock:
-                    adopt_sender = (
-                        self._auto and not self._target_call and self._selected == 6
-                        and parsed["recipient"] == self._my_call
-                        and parsed["sender"] != self._my_call
-                    )
-                if adopt_sender:
-                    snr = decode.get("snr_db")
-                    if type(snr) is int and -50 <= snr <= 49:
-                        with self._lock:
-                            self._target_call, self._target_grid = parsed["sender"], parsed["grid"]
-                            self._report = f"{snr:+03d}"
-                            self._rx_offset = decode.get("frequency_hz", 0)
-                with self._lock:
-                    advanced = self._apply_reply(parsed, advance=self._auto,
-                                                 decode_time_ms=decode.get("time_ms"))
-                    epoch = self._intent_epoch
-                if advanced:
-                    self._configure(epoch)
-                    with self._lock:
-                        self._detail = f"Addressed reply from {self._target_call}; advancing to message {self._selected}"
-                        target, selected = self._target_call, self._selected
-                    LOGGER.info("QSO addressed RX advanced %s to stage %d", target, selected)
+            self._process_decodes(manager, client_key, passive=False)
 
     def start(self) -> None:
         with self._lock:

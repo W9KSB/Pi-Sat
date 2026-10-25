@@ -100,6 +100,7 @@
       <div class="rc-mic-settings"><label>Laptop / USB microphone<select id="rc-mic-device" title="Microphone used for transmit audio; choosing another one reopens capture on it"><option value="">System default microphone</option></select></label>
         ${button('Refresh microphones', 'mic-refresh')}
         <label>Browser mic gain<input id="rc-mic-gain" type="range" min="0" max="200" value="100"><output id="rc-mic-gain-value">100%</output></label>
+        <label>Tuning tone level<input id="rc-tuning-tone-level" type="range" min="0" max="100" step="1" value="75" title="600 Hz transmit audio level. 0% mutes the tone without releasing PTT; voice gain is unchanged."><output id="rc-tuning-tone-level-value">75%</output></label>
         <label>Mic level<meter id="rc-mic-meter" min="0" max="1" value="0" high="0.95" optimum="0.4"></meter><output id="rc-mic-level">Mic off</output></label>
       </div><p id="rc-mic-requirements">Radio on the top toolbar starts the microphone and streams it to Pi-Sat; capture does not key PTT.</p>
       <div class="rc-mic-settings">
@@ -159,6 +160,7 @@
       ? `${data.mode}-DATA` : data.mode;
   }
   let busy = false;
+  let toneLevelSaving = false;
   // A refresh joins an existing radio session; it never connects the radio.
   let wantAudio = true;
   let audioStarting = false;
@@ -555,6 +557,12 @@
         : tuningToneSupported ? 'Click to transmit a steady 600 Hz tone; click again to stop'
           : 'Tuning Tone requires MAIN USB or LSB mode';
       if (state.tuning_tone_error) consoleApi.error(state.tuning_tone_error);
+      const toneLevel = $('rc-tuning-tone-level');
+      toneLevel.disabled = busy || toneLevelSaving || !state.enabled || !streamHealthy || !Number.isInteger(state.tuning_tone_level_percent);
+      if (document.activeElement !== toneLevel && Number.isInteger(state.tuning_tone_level_percent)) {
+        toneLevel.value = String(state.tuning_tone_level_percent);
+        $('rc-tuning-tone-level-value').textContent = `${state.tuning_tone_level_percent}%`;
+      }
       $('rc-dualwatch').setAttribute('aria-pressed', String(state.dualwatch === true));
       const rit = state.sub_rit;
       $('rc-rit-toggle').textContent = rit?.enabled == null ? 'RIT —' : rit.enabled ? 'RIT ON' : 'RIT OFF';
@@ -909,6 +917,25 @@
   $('rc-mic-gain').addEventListener('input', event => {
     applyRadioMicGain(Number(event.target.value) / 100);
     $('rc-mic-gain-value').textContent = `${event.target.value}%`;
+  });
+  $('rc-tuning-tone-level').addEventListener('input', event => {
+    $('rc-tuning-tone-level-value').textContent = `${event.target.value}%`;
+  });
+  $('rc-tuning-tone-level').addEventListener('change', async event => {
+    if (busy || toneLevelSaving || !state.enabled || !streamHealthy) return;
+    const level = Number(event.target.value);
+    toneLevelSaving = true;
+    consoleApi.error('');
+    consoleApi.render({});
+    try {
+      const result = await radioAction('/api/radio/tuning-tone/level', { level_percent: level });
+      if (result) consoleApi.render(result);
+    } finally {
+      toneLevelSaving = false;
+      $('rc-tuning-tone-level').value = String(state.tuning_tone_level_percent ?? 75);
+      $('rc-tuning-tone-level-value').textContent = `${state.tuning_tone_level_percent ?? 75}%`;
+      consoleApi.render({});
+    }
   });
   // Applied on release rather than while dragging: this is a CI-V write.
   $('rc-ref-level').addEventListener('change', async event => {

@@ -1129,10 +1129,10 @@ dd {
 .wsjtx-spectrum-hit { position: relative; overflow: hidden; cursor: crosshair; background: #07131f; touch-action: manipulation; }
 .wsjtx-spectrum-hit[aria-disabled="true"] { cursor: default; }
 .wsjtx-spectrum-hit:focus-visible { outline: 2px solid var(--bs-info); outline-offset: -2px; }
-.wsjtx-spectrum, .wsjtx-waterfall { display: block; width: 100%; }
-.wsjtx-spectrum { height: 130px; }
-.wsjtx-waterfall { height: 80px; }
-.wsjtx-offset-marker { position: absolute; top: 0; bottom: 0; border-left: 2px solid; pointer-events: none; }
+.wsjtx-waterfall, .wsjtx-frequency-scale { display: block; width: 100%; }
+.wsjtx-frequency-scale { height: 24px; }
+.wsjtx-waterfall { height: 260px; }
+.wsjtx-offset-marker { position: absolute; top: 24px; bottom: 0; border-left: 2px solid; pointer-events: none; }
 .wsjtx-offset-marker b { position: absolute; top: 5px; left: 5px; padding: 0.1rem 0.3rem; border-radius: 2px; background: #07131fe6; font: 0.7rem var(--bs-font-monospace); }
 .wsjtx-rx-marker { color: #60e59a; }
 .wsjtx-rx-marker b { top: 27px; }

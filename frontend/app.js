@@ -101,6 +101,7 @@ let radioMicUplinkRetryAt = 0;
 let radioSampleRate = 16000;
 let radioRxChannels = 2;
 const hiddenSettingsKeys = {
+  icom: new Set(['tuning_tone_level_percent']),
   server: new Set(['host', 'port', 'gui_resources_caching', 'https_enabled', 'https_port',
     'tls_certfile', 'tls_keyfile', 'tls_names']),
   station: new Set(['latitude_deg', 'longitude_deg']),

@@ -974,6 +974,8 @@ def _reload_runtime_config_locked() -> list[str]:
         except Exception as exc:
             startup_errors.append(f"Native Icom startup failed: {exc}")
             LOGGER.warning("Native Icom startup failed: %s", exc)
+    if icom_controller is not None:
+        icom_controller.set_tuning_tone_level(getattr(config.icom, "tuning_tone_level_percent", 75))
     _reload_audio_stream_server(config)
     failure_threshold = max(1, config.safety.device_offline_failure_threshold)
     # A selected native route is the sole radio owner.  Generic Hamlib remains
@@ -1869,7 +1871,8 @@ register_settings_api(
 )
 
 register_radio_api(app, get_controller=lambda: icom_controller,
-                   load_scope_settings=load_scope_settings, save_scope_settings=save_scope_settings)
+                   load_scope_settings=load_scope_settings, save_scope_settings=save_scope_settings,
+                   save_tuning_tone_level=lambda level: save_settings({"icom": {"tuning_tone_level_percent": level}}))
 register_wsjtx_api(app, get_manager=lambda: wsjtx_manager, get_engine=lambda: wsjtx_engine,
                    get_qso=lambda: wsjtx_qso, get_spectrum=wsjtx_engine.spectrum.snapshot,
                    save_settings=lambda patch: save_settings(patch))

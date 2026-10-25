@@ -115,6 +115,10 @@ def register_wsjtx_api(
     def set_qso_offset(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         return qso_action("set_offset", payload.get("hz"))
 
+    @app.post("/api/wsjtx/qso/slot")
+    def set_qso_slot(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return qso_action("set_tx_slot", payload.get("slot"))
+
     @app.post("/api/wsjtx/qso/enabled")
     def set_qso_enabled(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         return qso_action("set_enabled", payload.get("enabled"))

@@ -160,10 +160,18 @@ class WsjtxManager:
                 self._enabled, self._running, self._detail = enabled, False, ""
                 for client in self._clients.values():
                     client["connected"] = False
-            if old_socket is not None:
-                old_socket.close()
+            stopped = True
             if old_thread is not None:
                 old_thread.join(timeout=1.5)
+                stopped = not old_thread.is_alive()
+            if stopped and old_socket is not None:
+                old_socket.close()
+            if not stopped:
+                with self._lock:
+                    self._enabled = False
+                    self._detail = "Previous WSJT-X UDP listener did not stop within 1.5 seconds"
+                    self._publish_locked()
+                return self.snapshot()
             with self._lock:
                 if enabled:
                     listener: socket.socket | None = None
@@ -199,32 +207,34 @@ class WsjtxManager:
         return changed
 
     def _receive(self, listener: socket.socket) -> None:
-        while True:
-            with self._lock:
-                if self._socket is not listener:
-                    return
-            try:
-                data, address = listener.recvfrom(MAX_PACKET_BYTES + 1)
-            except socket.timeout:
+        try:
+            while True:
                 with self._lock:
-                    if self._socket is listener and self._expire_locked(time.monotonic()):
-                        self._publish_locked()
-                continue
-            except OSError as exc:
-                with self._lock:
-                    if self._socket is listener:
-                        self._socket = None
-                        self._running = False
-                        self._detail = f"WSJT-X UDP listener stopped: {exc}"
-                        for client in self._clients.values():
-                            client["connected"] = False
-                        self._publish_locked()
-                listener.close()
-                return
-            with self._lock:
-                if self._socket is not listener:
+                    if self._socket is not listener:
+                        return
+                try:
+                    data, address = listener.recvfrom(MAX_PACKET_BYTES + 1)
+                except socket.timeout:
+                    with self._lock:
+                        if self._socket is listener and self._expire_locked(time.monotonic()):
+                            self._publish_locked()
+                    continue
+                except OSError as exc:
+                    with self._lock:
+                        if self._socket is listener:
+                            self._socket = None
+                            self._running = False
+                            self._detail = f"WSJT-X UDP listener stopped: {exc}"
+                            for client in self._clients.values():
+                                client["connected"] = False
+                            self._publish_locked()
                     return
-                self._handle_datagram_locked(data, address)
+                with self._lock:
+                    if self._socket is not listener:
+                        return
+                    self._handle_datagram_locked(data, address)
+        finally:
+            listener.close()
 
     def _clear_client_decodes_locked(self, key: str) -> None:
         self._decodes = deque(decode for decode in self._decodes if decode["client_key"] != key)

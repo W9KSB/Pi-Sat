@@ -25,6 +25,12 @@ from .spectrum import WsjtxAudioSpectrum
 LOGGER = logging.getLogger(__name__)
 
 _DECODE_DEPTH_VALUES = {"fast": 1, "normal": 2, "deep": 3}
+_RECOVERABLE_TX_FAULTS = frozenset({
+    "capture_backlog", "capture_stall", "capture_closed", "capture_exit",
+})
+_TX_LOCKOUT_FAULTS = frozenset({
+    "control", "format", "transport",
+})
 
 
 class WsjtxEngine:
@@ -50,7 +56,7 @@ class WsjtxEngine:
         self._get_controller = get_controller
         self._lock = threading.RLock()
         self._state_lock = threading.RLock()
-        self._tx_operation_lock = threading.Lock()
+        self._tx_operation_lock = threading.RLock()
         self._process: subprocess.Popen | None = None
         self._display_process: subprocess.Popen | None = None
         self._bus_process: subprocess.Popen | None = None
@@ -68,6 +74,14 @@ class WsjtxEngine:
         self._decode_depth = "fast"
         self._pending_tx: tuple[int, str, int, bool] | None = None
         self._tx_epoch = 0
+        self._tx_fault: dict[str, Any] | None = None
+        self._tx_fault_ready = False
+        self._tx_fault_seen_sequence: int | None = None
+        self._tx_fault_rate = 0
+        self._tx_fault_controller = None
+        self._tx_fault_controller_generation: int | None = None
+        self._tx_fault_client_key = ""
+        self._tx_fault_mode = ""
         self._last_radio = None
         self._last_radio_state: dict = {}
         self._last_radio_seen = 0.0
@@ -77,6 +91,7 @@ class WsjtxEngine:
                                     get_started_at=lambda: self._started_at,
                                     get_environment=self._playback_environment)
         self.spectrum = WsjtxAudioSpectrum(get_controller=get_controller)
+        self._spectrum_failed = False
         self._rx_doppler = WsjtxRxDoppler(
             get_controller=get_controller,
             get_tracking_manager=get_rx_tracking_manager,
@@ -89,7 +104,7 @@ class WsjtxEngine:
             get_block_reason=get_block_reason,
             playback_command=self._playback_command,
             get_playback_environment=self._playback_environment,
-            on_pcm=self.spectrum.feed,
+            on_pcm=self._feed_spectrum,
             process_pcm=self._rx_doppler.process_pcm,
             on_batch_end=self._rx_doppler.finish_batch,
             channel="right",
@@ -100,6 +115,332 @@ class WsjtxEngine:
             get_environment=self._playback_environment,
             request_status=self._control.request_status,
         )
+
+    def _reset_tx_fault_state(self) -> None:
+        self._tx_fault = None
+        self._tx_fault_ready = False
+        self._tx_fault_seen_sequence = None
+        self._tx_fault_rate = 0
+        self._tx_fault_controller = None
+        self._tx_fault_controller_generation = None
+        self._tx_fault_client_key = ""
+        self._tx_fault_mode = ""
+
+    @staticmethod
+    def _controller_generation(controller: Any) -> int | None:
+        reader = getattr(controller, "connection_generation", None)
+        value = reader() if callable(reader) else reader
+        return value if type(value) is int else None
+
+    @staticmethod
+    def _bridge_fault(tx_audio: dict[str, Any]) -> dict[str, Any] | None:
+        """Return one validated structured fault from the TX bridge.
+
+        Missing or malformed fault metadata remains fatal. The engine never
+        guesses recoverability from the human-readable detail string.
+        """
+        sequence = tx_audio.get("fault_sequence")
+        category = tx_audio.get("fault_category")
+        if tx_audio.get("state") != "error":
+            return None
+        if sequence is None and not category:
+            return None
+        if type(sequence) is not int or sequence <= 0:
+            return {"sequence": 0, "category": "unknown", "detail": "Invalid TX fault sequence"}
+        if not isinstance(category, str) or not category:
+            category = "unknown"
+        detail = str(tx_audio.get("detail") or "Managed transmit audio failed")
+        return {"sequence": sequence, "category": category, "detail": detail}
+
+    def _store_fault(
+        self, fault: dict[str, Any], *, recoverable: bool, detail: str | None = None,
+        ready: bool = True,
+    ) -> dict[str, Any]:
+        stored = {
+            "sequence": fault["sequence"],
+            "category": fault["category"],
+            "detail": detail or fault["detail"],
+            "recoverable": recoverable,
+        }
+        with self._state_lock:
+            self._tx_fault = stored
+            self._tx_fault_ready = ready
+            self._tx_fault_seen_sequence = fault["sequence"]
+        return stored
+
+    def _publish_pending_fault(
+        self, tx_audio: dict[str, Any], status: dict[str, Any],
+    ) -> None:
+        """Expose a bridge fault before the monitor has completed containment."""
+        fault = self._bridge_fault(tx_audio)
+        if fault is None:
+            return
+        with self._state_lock:
+            current = self._tx_fault
+            seen = self._tx_fault_seen_sequence
+            if ((current is not None and current["sequence"] >= fault["sequence"])
+                    or (seen is not None and fault["sequence"] <= seen)):
+                return
+            # An eligible capture fault remains provisionally recoverable until
+            # containment has safely halted stock transmit and released PTT.
+            # The QSO retains its in-flight context until that verdict is known.
+            candidate = fault["category"] in _RECOVERABLE_TX_FAULTS
+            self._tx_fault = {**fault, "recoverable": candidate}
+            self._tx_fault_ready = False
+            client_key = status.get("client_key")
+            if isinstance(client_key, str) and client_key:
+                self._tx_fault_client_key = client_key
+                self._tx_fault_mode = self._mode
+
+    def _recoverable_tx_fault_is_safe(
+        self, fault: dict[str, Any], tx_audio: dict[str, Any], status: dict[str, Any],
+        controller: Any, radio: dict[str, Any], rx_audio: dict[str, Any],
+    ) -> str | None:
+        if fault["category"] not in _RECOVERABLE_TX_FAULTS | _TX_LOCKOUT_FAULTS:
+            return f"TX fault category {fault['category']!r} is not locally containable"
+        if tx_audio.get("owns_transmit") is not False:
+            return "TX fault containment did not prove transmit ownership was released"
+        if tx_audio.get("ptt_unconfirmed") is not False:
+            return "TX fault containment did not confirm PTT OFF"
+        if tx_audio.get("capture_running") is not False:
+            return "Faulty TX audio capture is still running"
+        if status.get("connected") is not True:
+            return "WSJT-X control status is unavailable after the TX fault"
+        if status.get("tx_enabled") is not False or status.get("transmitting") is not False:
+            return "Stock WSJT-X transmit state did not confirm disabled"
+        if not isinstance(status.get("client_key"), str) or not status["client_key"]:
+            return "The managed WSJT-X client identity is unavailable"
+        if status.get("mode") != self._mode:
+            return "The WSJT-X mode changed during TX fault containment"
+        if rx_audio.get("state") != "running":
+            return "Native receive audio is unavailable after the TX fault"
+        if not isinstance(radio, dict) or radio.get("connected") is not True:
+            return "The native radio is unavailable after the TX fault"
+        for name in ("_process", "_display_process", "_bus_process"):
+            process = getattr(self, name)
+            if process is None or process.poll() is not None:
+                return f"{name.removeprefix('_')} exited during TX fault containment"
+        if controller is None:
+            return "The native radio controller changed during TX fault containment"
+        return None
+
+    def _contain_tx_fault(
+        self, fault: dict[str, Any], expected_generation: int, *,
+        verify_bridge_fault: bool = True,
+    ) -> tuple[bool | None, str]:
+        """Contain a TX-local fault without stopping healthy receive."""
+        with self._lock:
+            with self._tx_operation_lock:
+                current = self._tx_audio.snapshot()
+                current_fault = self._bridge_fault(current)
+                if self._generation != expected_generation or (
+                        verify_bridge_fault and (
+                            current.get("state") != "error"
+                            or current_fault is None
+                            or current_fault["sequence"] != fault["sequence"]
+                            or current_fault["category"] != fault["category"]
+                        )
+                ):
+                    # A fresh start, recovery, or fault superseded the monitor's
+                    # earlier snapshot before this thread owned both operations.
+                    return None, ""
+                problems = []
+                try:
+                    self.halt_tx()
+                except Exception as error:
+                    problems.append(f"transmit halt was not confirmed: {error}")
+                try:
+                    tx_audio = self._tx_audio.stop()
+                    if not isinstance(tx_audio, dict):
+                        tx_audio = self._tx_audio.snapshot()
+                except Exception as error:
+                    problems.append(f"TX audio cleanup was not confirmed: {error}")
+                    tx_audio = self._tx_audio.snapshot()
+                try:
+                    status = self._control.status()
+                except Exception as error:
+                    problems.append(f"WSJT-X status is unavailable: {error}")
+                    status = {}
+                controller = self._get_controller()
+                try:
+                    radio = controller.try_snapshot() if controller is not None else None
+                except Exception as error:
+                    problems.append(f"Native radio status is unavailable: {error}")
+                    radio = None
+                rx_audio = self._audio.snapshot()
+                safety = problems[0] if problems else self._recoverable_tx_fault_is_safe(
+                    fault, tx_audio, status, controller, radio, rx_audio,
+                )
+                if safety:
+                    self._store_fault(fault, recoverable=False, detail=safety)
+                    return False, safety
+                sample_rate = controller.config.sample_rate
+                recoverable = fault["category"] in _RECOVERABLE_TX_FAULTS
+                with self._state_lock:
+                    self._tx_fault_rate = int(sample_rate)
+                    self._tx_fault_controller = controller
+                    self._tx_fault_controller_generation = self._controller_generation(controller)
+                    self._tx_fault_client_key = status["client_key"]
+                    self._tx_fault_mode = self._mode
+                    self._pending_tx = None
+                    self._state = "running"
+                    self._detail = (
+                        f"WSJT-X transmit aborted ({fault['category']}); receive remains active. "
+                        + (
+                            "Explicit capture recovery is required before re-arming."
+                            if recoverable else
+                            "The TX subsystem is locked out until a full TX reset."
+                        )
+                    )
+                self._store_fault(fault, recoverable=recoverable)
+                return True, ""
+
+    def _recovery_problem(self) -> tuple[str, bool]:
+        with self._state_lock:
+            fault = dict(self._tx_fault) if self._tx_fault is not None else None
+            expected_controller = self._tx_fault_controller
+            expected_generation = self._tx_fault_controller_generation
+            expected_client = self._tx_fault_client_key
+            expected_mode = self._tx_fault_mode
+            sample_rate = self._tx_fault_rate
+        if fault is None:
+            return "", False
+        if not fault.get("recoverable"):
+            return "This TX fault requires a full managed WSJT-X reset", True
+        for name in ("_process", "_display_process", "_bus_process"):
+            process = getattr(self, name)
+            if process is None or process.poll() is not None:
+                return f"{name.removeprefix('_')} exited; TX recovery is unavailable", True
+        if self._audio.snapshot().get("state") != "running":
+            return "Native receive audio is unavailable; TX recovery is unavailable", True
+        controller = self._get_controller()
+        if controller is None or controller is not expected_controller:
+            return "The native radio controller changed; TX recovery is unavailable", True
+        if self._controller_generation(controller) != expected_generation:
+            return "The native radio connection changed; TX recovery is unavailable", True
+        try:
+            current_rate = int(controller.config.sample_rate)
+        except (AttributeError, TypeError, ValueError):
+            return "The native radio sample rate is unavailable; TX recovery is unavailable", True
+        if current_rate != sample_rate:
+            return "The native radio sample rate changed; TX recovery is unavailable", True
+        try:
+            radio = controller.try_snapshot()
+        except Exception as error:
+            return f"Native radio status is unavailable: {error}", True
+        if not isinstance(radio, dict) or radio.get("connected") is not True:
+            return "The native radio is disconnected; TX recovery is unavailable", True
+        try:
+            status = self._control.status()
+        except Exception as error:
+            return f"WSJT-X control status is unavailable: {error}", True
+        if (status.get("connected") is not True or status.get("tx_enabled") is not False
+                or status.get("transmitting") is not False):
+            return "WSJT-X control is unavailable or transmit is not confirmed idle", True
+        if status.get("client_key") != expected_client:
+            return "The managed WSJT-X client changed; TX recovery is unavailable", True
+        if status.get("mode") != expected_mode or self._mode != expected_mode:
+            return "The WSJT-X mode changed; TX recovery is unavailable", True
+        if type(sample_rate) is not int or not 8000 <= sample_rate <= 192000:
+            return "The saved TX sample rate is invalid; TX recovery is unavailable", True
+        return "", False
+
+    def recover_tx(self) -> dict[str, Any]:
+        """Perform one explicit, disarmed restart of managed TX capture."""
+        with self._lock:
+            with self._tx_operation_lock:
+                with self._state_lock:
+                    fault = dict(self._tx_fault) if self._tx_fault is not None else None
+                    sample_rate = self._tx_fault_rate
+                    fault_ready = self._tx_fault_ready
+                    recovery_epoch = self._tx_epoch
+                if fault is None:
+                    return self.snapshot()
+                if not fault_ready:
+                    with self._state_lock:
+                        self._detail = "TX recovery is waiting for safe containment"
+                    return self.snapshot()
+                if not fault.get("recoverable"):
+                    with self._state_lock:
+                        self._detail = (
+                            "This TX fault cannot restart capture in place; "
+                            "receive remains unchanged until a full TX reset."
+                        )
+                    return self.snapshot()
+                problem, fatal = self._recovery_problem()
+                if problem:
+                    if fatal:
+                        stored = self._store_fault(fault, recoverable=False, detail=problem)
+                        failures = self._cleanup()
+                        with self._state_lock:
+                            self._state = "error"
+                            self._detail = "; ".join([stored["detail"], *failures])
+                    else:
+                        with self._state_lock:
+                            self._detail = problem
+                    return self.snapshot()
+                try:
+                    self._tx_audio.start(sample_rate)
+                    self._check_tx_epoch(recovery_epoch)
+                    restarted = self._tx_audio.snapshot()
+                    if (restarted.get("capture_running") is not True
+                            or restarted.get("state") == "error"
+                            or restarted.get("enabled") is not False
+                            or restarted.get("transmitting") is not False
+                            or restarted.get("owns_transmit") is not False
+                            or restarted.get("ptt_unconfirmed") is not False
+                            or restarted.get("sample_rate") != sample_rate):
+                        raise RuntimeError("restarted TX capture is not in the disabled state")
+                    post_problem, post_fatal = self._recovery_problem()
+                    if post_problem:
+                        if post_fatal:
+                            stored = self._store_fault(
+                                fault, recoverable=False, detail=post_problem,
+                            )
+                            failures = self._cleanup()
+                            with self._state_lock:
+                                self._state = "error"
+                                self._detail = "; ".join(
+                                    [stored["detail"], *failures],
+                                )
+                            return self.snapshot()
+                        raise RuntimeError(post_problem)
+                    with self._state_lock:
+                        self._check_tx_epoch(recovery_epoch)
+                        self._reset_tx_fault_state()
+                        self._state = "running"
+                        self._detail = (
+                            "WSJT-X transmit audio recovered in the disabled state; "
+                            "the same receive session remains active."
+                        )
+                except Exception as error:
+                    stopped_audio = None
+                    cleanup_error = None
+                    try:
+                        stopped_audio = self._tx_audio.stop()
+                    except Exception as cleanup_failure:
+                        cleanup_error = cleanup_failure
+                    if cleanup_error is not None:
+                        problem = f"TX recovery failed: {error}; cleanup also failed: {cleanup_error}"
+                    else:
+                        problem = f"TX recovery failed: {error}"
+                    if not isinstance(stopped_audio, dict):
+                        stopped_audio = self._tx_audio.snapshot()
+                    fatal = (
+                        stopped_audio.get("owns_transmit") is not False
+                        or stopped_audio.get("ptt_unconfirmed") is not False
+                        or stopped_audio.get("capture_running") is not False
+                    )
+                    with self._state_lock:
+                        self._tx_fault = {**fault, "recoverable": not fatal, "detail": problem}
+                        self._detail = problem
+                    if fatal:
+                        failures = self._cleanup()
+                        with self._state_lock:
+                            self._state = "error"
+                            self._detail = "; ".join([problem, *failures])
+                    return self.snapshot()
+                return self.snapshot()
 
     def _capture_command(self, sample_rate: int) -> list[str]:
         return [self._pacat, "--record", "--raw", "--format=s16le", "--channels=1",
@@ -207,8 +548,8 @@ class WsjtxEngine:
             raise WsjtxControlCancelled("Transmit request was superseded")
 
     def halt_tx(self) -> None:
-        # Invalidate work first. A slow native helper that completes later must
-        # never re-arm the station after this Halt request.
+        # Invalidate work before any I/O. Halt must preempt a slow configuration,
+        # capture restart, or native enable helper holding the operation lock.
         with self._state_lock:
             self._tx_epoch += 1
             self._pending_tx = None
@@ -470,6 +811,7 @@ class WsjtxEngine:
             self._log_file = None
         self._display = ""
         self.spectrum.reset()
+        self._spectrum_failed = False
         self._rx_doppler.reset("Managed receive engine stopped")
         if failures:
             LOGGER.warning("Managed WSJT-X cleanup reported %d failure(s): %s", len(failures), "; ".join(failures))
@@ -533,6 +875,11 @@ class WsjtxEngine:
             pending = self._pending_tx is not None
         stock = self._control.status()
         tx = self._tx_audio.snapshot()
+        self._publish_pending_fault(tx, stock)
+        with self._state_lock:
+            fault = dict(self._tx_fault) if self._tx_fault is not None else None
+            fault_client_key = self._tx_fault_client_key
+            fault_pending = fault is not None and not self._tx_fault_ready
         return {
             "running": running, "state": state, "detail": detail,
             "pid": process.pid if running else None, "display": display,
@@ -542,9 +889,12 @@ class WsjtxEngine:
             "audio": {**self._audio.snapshot(), "doppler": self._rx_doppler.snapshot()},
             "tx": {**tx, "available": self._tx_available(), "connected": stock.get("connected", False),
                    "offset_hz": stock.get("tx_df_hz", 1500), "mode": mode,
-                   "generation": generation, "client_key": stock.get("client_key", ""),
+                   "generation": generation,
+                   "client_key": stock.get("client_key") or fault_client_key,
                    "stock_transmitting": stock.get("transmitting", False),
-                   "configuration_pending": pending},
+                   "configuration_pending": pending,
+                   "fault_pending": fault_pending,
+                   "fault": fault},
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -566,6 +916,7 @@ class WsjtxEngine:
                 with self._state_lock:
                     self._state, self._detail = "error", "; ".join(failures)
                 return self._snapshot_current()
+            self._reset_tx_fault_state()
             with self._state_lock:
                 self._state, self._detail = "starting", "Preparing the managed WSJT-X receive engine."
             try:
@@ -632,6 +983,15 @@ class WsjtxEngine:
                 LOGGER.warning("Managed WSJT-X start failed: %s", self._detail)
             return self._snapshot_current()
 
+    def _feed_spectrum(self, pcm: bytes, sample_rate: int) -> None:
+        if self._spectrum_failed:
+            return
+        try:
+            self.spectrum.feed(pcm, sample_rate)
+        except Exception as error:
+            self._spectrum_failed = True
+            LOGGER.warning("Receive visualization disabled; decoder audio continues: %s", error)
+
     def _monitor(self, stop: threading.Event) -> None:
         while not stop.wait(0.25):
             if stop.is_set():
@@ -639,6 +999,7 @@ class WsjtxEngine:
             with self._state_lock:
                 process, display, bus = self._process, self._display_process, self._bus_process
                 pending = self._pending_tx
+                generation = self._generation
             reason = ""
             if process is not None and process.poll() is not None:
                 reason = f"WSJT-X exited with code {process.returncode}; inspect the engine log."
@@ -652,8 +1013,33 @@ class WsjtxEngine:
                 if audio.get("state") == "error":
                     reason = audio.get("detail") or "Native receive audio bridge failed."
                 elif tx_audio.get("state") == "error":
-                    reason = tx_audio.get("detail") or "Native transmit audio bridge failed."
-                elif pending is not None and not tx_audio["transmitting"] and not self._control.status().get("transmitting"):
+                    fault = self._bridge_fault(tx_audio)
+                    with self._state_lock:
+                        seen_sequence = self._tx_fault_seen_sequence
+                        current_fault = (
+                            dict(self._tx_fault) if self._tx_fault is not None else None
+                        )
+                    if fault is not None and (
+                            seen_sequence is None or fault["sequence"] > seen_sequence):
+                        if fault["category"] in _RECOVERABLE_TX_FAULTS | _TX_LOCKOUT_FAULTS:
+                            contained, safety = self._contain_tx_fault(fault, generation)
+                            if contained:
+                                continue
+                            if contained is None:
+                                continue
+                            reason = safety
+                        else:
+                            stored = self._store_fault(fault, recoverable=False)
+                            reason = stored["detail"]
+                    elif current_fault is not None and current_fault.get("recoverable"):
+                        # The bridge may preserve its diagnostic fields after a
+                        # safe stop. One handled sequence must not stop RX.
+                        continue
+                    else:
+                        reason = tx_audio.get("detail") or "Native transmit audio bridge failed."
+                elif (pending is not None and not tx_audio.get("transmitting")
+                      and not self._control.status().get("transmitting")):
+                    deferred_fault = None
                     with self._tx_operation_lock:
                         with self._state_lock:
                             current_pending = self._pending_tx
@@ -665,7 +1051,21 @@ class WsjtxEngine:
                             except WsjtxControlCancelled:
                                 pass
                             except Exception as error:
-                                reason = f"Transmit preparation failed: {error}"
+                                with self._state_lock:
+                                    sequence = (self._tx_fault_seen_sequence or 0) + 1
+                                fault = {
+                                    "sequence": sequence,
+                                    "category": "control",
+                                    "detail": f"Transmit preparation failed: {error}",
+                                }
+                                deferred_fault = fault
+                    if deferred_fault is not None:
+                        contained, safety = self._contain_tx_fault(
+                            deferred_fault, generation, verify_bridge_fault=False,
+                        )
+                        if contained is None or contained:
+                            continue
+                        reason = safety
             if reason:
                 failures = self._cleanup()
                 with self._state_lock:

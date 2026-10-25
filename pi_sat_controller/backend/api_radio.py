@@ -45,12 +45,14 @@ def register_radio_api(
     get_controller: Callable[[], Any],
     load_scope_settings: Callable[[], dict[str, Any]] | None = None,
     save_scope_settings: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    save_tuning_tone_level: Callable[[int], None] | None = None,
 ) -> None:
     # Count microphone uplinks so closing an RX listener cannot unkey a
     # transmission another session is feeding.
     microphone_sessions = 0
     webrtc_audio = WebrtcAudioTransport(get_controller=get_controller)
     scope_lock = RLock()
+    tone_level_lock = RLock()
     restored_session: tuple[Any, int] | None = None
     restored_sides: set[str] = set()
 
@@ -194,6 +196,28 @@ def register_radio_api(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/api/radio/tuning-tone/level")
+    def set_tuning_tone_level(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
+        with tone_level_lock:
+            return apply_tuning_tone_level(payload)
+
+    def apply_tuning_tone_level(payload: dict[str, Any]) -> dict[str, object]:
+        controller = get_controller()
+        if controller is None:
+            raise HTTPException(status_code=409, detail="Advanced Icom control is disabled.")
+        try:
+            result = controller.set_tuning_tone_level(payload.get("level_percent"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if save_tuning_tone_level is not None:
+            try:
+                save_tuning_tone_level(result["tuning_tone_level_percent"])
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Tuning tone level applied, but could not be saved: {exc}") from exc
+        return {"ok": True, "tuning_tone_level_percent": result["tuning_tone_level_percent"]}
 
     @app.post("/api/radio/filter")
     def set_filter(payload: dict[str, Any] = Body(...)) -> dict[str, object]:

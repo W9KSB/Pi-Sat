@@ -40,6 +40,10 @@
   const seenDecodeKeys = new Set();
   const engineHistory = new Map();
   let spectrumGeneration = null;
+  let spectrumLayout = '';
+  let waterfallAt = null;
+  let spectrumRow = null;
+  let spectrumRowPixels = null;
   let spectrumSpan = 3000;
   let actionError = '';
 
@@ -54,7 +58,11 @@
   };
   const client = () => snapshot?.clients?.find(item => item.key === selectedEngineKey);
   const stale = () => unavailable || !receivedAt || Date.now() - receivedAt > STALE_AFTER_MS;
-  const flags = decode => [decode.low_confidence ? 'Low confidence' : '', decode.off_air ? 'Off-air / replay' : ''].filter(Boolean).join(' · ');
+  const flags = decode => [
+    decode.low_confidence ? 'Low confidence' : '',
+    decode.off_air ? 'Off-air / replay' : '',
+    decode.aborted ? 'Aborted / incomplete' : '',
+  ].filter(Boolean).join(' · ');
   const transmission = entry => entry.transmitted === true || entry.direction === 'tx';
   const transmissionKey = entry => `tx:${entry.key}`;
   const normalizeMode = value => {
@@ -181,21 +189,27 @@
 
   function renderQso() {
     const qso = snapshot?.qso;
+    const resumable = qso?.suspended === true && qso?.can_resume === true;
     const disabled = pending || stale() || qso?.tx_available !== true;
     text('wsjtx-my-call', qso?.my_call || '—');
     text('wsjtx-my-grid', qso?.my_grid || '—');
     text('wsjtx-target-call', qso?.target_call || '—');
     text('wsjtx-target-grid', qso?.target_grid || 'Double-click a decode');
-    text('wsjtx-tx-state', stale() ? 'TX status stale' : qso?.transmitting ? 'Transmitting' : qso?.enabled ? 'TX enabled' : 'TX off');
-    byId('wsjtx-tx-state').dataset.state = qso?.transmitting ? 'transmitting' : qso?.enabled ? 'enabled' : 'inactive';
+    text('wsjtx-tx-state', stale() ? 'TX status stale' : qso?.transmitting ? 'Transmitting'
+      : qso?.suspended ? 'TX suspended' : qso?.enabled ? 'TX enabled' : 'TX off');
+    byId('wsjtx-tx-state').dataset.state = qso?.transmitting ? 'transmitting'
+      : qso?.suspended ? 'suspended' : qso?.enabled ? 'enabled' : 'inactive';
     const tx = byId('wsjtx-tx-enable');
-    tx.textContent = qso?.enabled ? 'Disable TX' : 'Enable TX';
+    tx.textContent = qso?.suspended ? 'Resume TX' : qso?.enabled ? 'Disable TX' : 'Enable TX';
     tx.setAttribute('aria-pressed', String(qso?.enabled === true));
-    tx.disabled = disabled;
-    byId('wsjtx-halt').disabled = haltPending || !qso || !(pending || qso.enabled || qso.transmitting);
+    tx.disabled = qso?.suspended ? pending || stale() || !resumable : disabled;
+    byId('wsjtx-halt').disabled = haltPending || !qso
+      || !(pending || qso.enabled || qso.transmitting || qso.suspended);
     byId('wsjtx-cq').disabled = disabled;
     byId('wsjtx-auto').checked = qso?.auto_sequence !== false;
     byId('wsjtx-auto').disabled = disabled;
+    byId('wsjtx-tx-slot').value = qso?.tx_slot || 'auto';
+    byId('wsjtx-tx-slot').disabled = disabled;
     text('wsjtx-retries', `Retries ${qso?.retries || 0} / ${qso?.max_retries ?? 3}`);
     text('wsjtx-qso-detail', actionError || (stale() ? 'Backend status is stale. Waiting for fresh QSO state.' : qso?.detail || 'Start RX to begin a QSO.'));
     text('wsjtx-next-slot', qso?.enabled && qso?.next_slot_utc ? `Next TX slot ${utc({ time_utc: qso.next_slot_utc })} UTC` : '');
@@ -236,7 +250,6 @@
   function renderSpectrum() {
     const qso = snapshot?.qso;
     const spectrum = qso?.spectrum;
-    const oldSpan = spectrumSpan;
     spectrumSpan = Number.isFinite(spectrum?.span_hz) && spectrum.span_hz > 0 ? spectrum.span_hz : 3000;
     const estimated = !spectrum || spectrum.estimated === true;
     const filter = [1, 2, 3].includes(spectrum?.filter) ? `FIL${spectrum.filter} SSB passband` : 'SSB passband';
@@ -250,43 +263,110 @@
     for (const [id, offset] of [['wsjtx-tx-marker', qso?.tx_offset_hz], ['wsjtx-rx-marker', qso?.rx_offset_hz]]) {
       const marker = byId(id); marker.hidden = !Number.isFinite(offset); marker.style.left = `${Math.max(0, Math.min(100, (offset || 0) / spectrumSpan * 100))}%`;
     }
-    const bins = Array.isArray(spectrum?.bins) ? spectrum.bins : [];
+    const bins = Array.isArray(spectrum?.bins) && spectrum.available !== false ? spectrum.bins : [];
     const invalidSsbWidth = estimated && !incompatibleMode && spectrum?.reported_bandwidth_hz > 3600;
-    text('wsjtx-spectrum-detail', stale() ? 'Audio display is stale. Waiting for backend updates.'
+    text('wsjtx-spectrum-detail', stale() ? 'Display is stale. Waiting for backend updates.'
       : incompatibleMode ? `SUB is reporting ${spectrum.receive_mode}. FT4/FT8 needs USB or LSB; the audio span is estimated.`
         : invalidSsbWidth ? `Radio reports a ${Math.round(spectrum.reported_bandwidth_hz)} Hz filter width, which is outside the SSB range. The audio span is estimated.`
-          : bins.length ? 'Click the passband to set your held TX offset. RX is green; TX is red.' : 'Waiting for receive audio. Click the passband to set your held TX offset.');
-    const canvas = byId('wsjtx-spectrum'); const context = canvas.getContext?.('2d');
+          : bins.length ? 'Averaged signal energy above the local noise floor. Lines mark UTC transmit periods. Click to set TX offset.'
+            : spectrum?.detail || 'Waiting for receive audio. The waterfall shows signal energy; decoded messages appear below.');
+    if (page.hidden || document.hidden) return;
     const waterfall = byId('wsjtx-waterfall'); const water = waterfall.getContext?.('2d');
-    if (!context || !water) return;
-    const displayWidth = Math.max(1, Math.round(canvas.clientWidth || 1200));
-    if (canvas.width !== displayWidth) {
-      canvas.width = displayWidth;
-      waterfall.width = displayWidth;
-      spectrumGeneration = null;
+    const scale = byId('wsjtx-frequency-scale'); const axis = scale.getContext?.('2d');
+    if (!water || !axis) return;
+    const width = Math.min(1024, Math.max(1, Math.round(waterfall.clientWidth || 1200)));
+    const layout = `${width}:${spectrumSpan}:${selectedMode()}:${snapshot?.engine?.tx?.generation}`;
+    const changedLayout = spectrumLayout !== layout;
+    if (changedLayout) {
+      spectrumLayout = layout; spectrumGeneration = null; waterfallAt = null;
+      for (const image of [waterfall, scale]) image.width = width;
+      water.fillStyle = '#03081b'; water.fillRect(0, 0, width, waterfall.height);
+      axis.fillStyle = '#07131f'; axis.fillRect(0, 0, width, scale.height);
+      axis.font = '11px sans-serif'; axis.fillStyle = '#9cb9c9'; axis.strokeStyle = '#345069';
+      const step = 500 * Math.max(1, Math.ceil(spectrumSpan * 65 / width / 500));
+      for (let hz = 0; hz <= spectrumSpan; hz += step) {
+        const x = hz / spectrumSpan * width;
+        axis.beginPath(); axis.moveTo(x, scale.height - 5); axis.lineTo(x, scale.height); axis.stroke();
+        axis.fillText(`${hz}`, Math.max(2, Math.min(x + 3, width - 30)), 14);
+      }
     }
-    const width = canvas.width, height = canvas.height;
-    context.fillStyle = '#07131f'; context.fillRect(0, 0, width, height);
-    context.font = '12px sans-serif'; context.strokeStyle = '#223445'; context.fillStyle = '#8aabba';
-    const baseStep = spectrumSpan <= 3500 ? 500 : 1000;
-    const step = baseStep * Math.max(1, Math.ceil(spectrumSpan * 75 / width / baseStep));
-    for (let hz = 0; hz <= spectrumSpan; hz += step) {
-      const x = hz / spectrumSpan * width; context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height - 20); context.stroke(); context.fillText(`${hz}`, Math.min(x + 4, width - 40), height - 5);
+    const generation = !stale() && bins.length ? spectrum.generation : 'unavailable';
+    if (spectrumGeneration === generation && !changedLayout) return;
+    spectrumGeneration = generation;
+    if (generation === 'unavailable') return;
+    const levels = signalLevels(bins, spectrumSpan);
+    if (!spectrumRow) spectrumRow = document.createElement('canvas');
+    if (spectrumRow.width !== levels.length || !spectrumRowPixels) {
+      spectrumRow.width = levels.length; spectrumRow.height = 1;
+      spectrumRowPixels = spectrumRow.getContext('2d').createImageData(levels.length, 1);
     }
-    if (oldSpan !== spectrumSpan) { water.fillStyle = '#07131f'; water.fillRect(0, 0, waterfall.width, waterfall.height); spectrumGeneration = null; }
-    if (!bins.length) return;
-    const amplitude = value => Number.isFinite(value) ? Math.max(0, Math.min(1, (value + 100) / 100)) : 0;
-    context.strokeStyle = '#63d8ed'; context.lineWidth = 1.5; context.beginPath();
-    bins.forEach((value, index) => { const x = index / Math.max(1, bins.length - 1) * width; const y = (1 - amplitude(value)) * (height - 25) + 3; if (index) context.lineTo(x, y); else context.moveTo(x, y); }); context.stroke();
-    if (spectrumGeneration === spectrum.generation) return;
-    spectrumGeneration = spectrum.generation;
-    water.drawImage(waterfall, 0, 0, waterfall.width, waterfall.height - 2, 0, 2, waterfall.width, waterfall.height - 2);
-    bins.forEach((value, index) => { const level = amplitude(value); water.fillStyle = `hsl(${230 - level * 185},90%,${6 + level * 62}%)`; water.fillRect(index / bins.length * waterfall.width, 0, Math.ceil(waterfall.width / bins.length), 2); });
+    for (let i = 0; i < levels.length; i++) {
+      const color = Math.round(levels[i] * 255) * 4;
+      spectrumRowPixels.data.set(signalPalette.subarray(color, color + 4), i * 4);
+    }
+    spectrumRow.getContext('2d').putImageData(spectrumRowPixels, 0, 0);
+    const at = Number.isFinite(spectrum.timestamp_ms) ? spectrum.timestamp_ms : Date.now();
+    const elapsed = waterfallAt === null ? 1 : (at - waterfallAt) / 1000;
+    if (elapsed <= 0) return;
+    const shift = Math.min(waterfall.height, Math.max(1, Math.round(elapsed * 2)));
+    if (shift < waterfall.height) water.drawImage(waterfall, 0, 0, width, waterfall.height - shift, 0, shift, width, waterfall.height - shift);
+    water.fillStyle = '#03081b'; water.fillRect(0, 0, width, shift);
+    water.imageSmoothingEnabled = false;
+    // A gap stays empty rather than inventing continuous transmissions while disconnected.
+    water.drawImage(spectrumRow, 0, 0, levels.length, 1, 0, 0, width, Math.min(shift, 2));
+    const period = selectedMode() === 'FT4' ? 7500 : 15000;
+    const previous = waterfallAt === null ? at - 1000 : waterfallAt;
+    const boundary = Math.floor(at / period) * period;
+    if (Math.floor(previous / period) !== Math.floor(at / period)) {
+      const y = Math.min(shift - 1, Math.round((at - boundary) / 1000 * 2));
+      water.fillStyle = '#67be70'; water.fillRect(0, y, width, 1);
+      const date = new Date(boundary);
+      const label = [date.getUTCHours(), date.getUTCMinutes(), date.getUTCSeconds()].map(value => String(value).padStart(2, '0')).join(':') + (date.getUTCMilliseconds() ? '.5' : '');
+      water.fillStyle = '#d5e6ef'; water.font = '10px sans-serif'; water.fillText(label, 4, y + 11);
+    }
+    waterfallAt = at;
   }
+
+  function signalLevels(bins, span) {
+    // Broad lower-percentile anchors follow passband slope while rejecting narrow peaks.
+    const count = bins.length, block = Math.max(8, Math.round(count * 300 / span));
+    const anchors = [];
+    for (let start = 0; start < count; start += block) {
+      const group = bins.slice(start, start + block).filter(Number.isFinite).sort((a, b) => a - b);
+      anchors.push({ x: Math.min(count - 1, start + (block - 1) / 2), floor: group[Math.floor(group.length * 0.2)] ?? -100 });
+    }
+    const levels = new Float32Array(count);
+    let anchor = 0;
+    for (let i = 0; i < count; i++) {
+      while (anchor + 1 < anchors.length && anchors[anchor + 1].x < i) anchor++;
+      const a = anchors[anchor], b = anchors[Math.min(anchors.length - 1, anchor + 1)];
+      const mix = b.x > a.x ? Math.max(0, Math.min(1, (i - a.x) / (b.x - a.x))) : 0;
+      const floor = a.floor + (b.floor - a.floor) * mix;
+      levels[i] = Number.isFinite(bins[i]) ? Math.max(0, Math.min(1, (bins[i] - floor - 5) / 35)) : 0;
+    }
+    return levels;
+  }
+
+  const signalPalette = (() => {
+    const stops = [[0, 3, 8, 27], [0.25, 5, 22, 114], [0.48, 35, 112, 180], [0.65, 220, 218, 45], [0.85, 255, 105, 35], [1, 255, 236, 180]];
+    const colors = new Uint8ClampedArray(256 * 4);
+    let stop = 0;
+    for (let i = 0; i < 256; i++) {
+      const level = i / 255;
+      while (stop + 1 < stops.length - 1 && stops[stop + 1][0] < level) stop++;
+      const a = stops[stop], b = stops[stop + 1], mix = (level - a[0]) / (b[0] - a[0]);
+      for (let channel = 0; channel < 3; channel++) colors[i * 4 + channel] = Math.round(a[channel + 1] + (b[channel + 1] - a[channel + 1]) * mix);
+      colors[i * 4 + 3] = 255;
+    }
+    return colors;
+  })();
 
   async function command(path, payload, allowStale = false) {
     const halt = path === '/qso/enabled' && payload.enabled === false;
-    if ((pending && !halt) || (halt && haltPending) || !snapshot || (!allowStale && (stale() || snapshot.qso?.tx_available !== true))) return;
+    const resume = path === '/qso/enabled' && payload.enabled === true
+      && snapshot?.qso?.suspended === true && snapshot?.qso?.can_resume === true;
+    if ((pending && !halt) || (halt && haltPending) || !snapshot
+        || (!allowStale && (stale() || (snapshot.qso?.tx_available !== true && !resume)))) return;
     const action = ++actionSequence;
     if (halt) haltPending = true;
     pending = true; actionError = ''; renderEngine();
@@ -310,12 +390,17 @@
   }
 
   function renderControlsAfterCommand() {
+    byId('wsjtx-tx-slot').value = snapshot?.qso?.tx_slot || 'auto';
+    const resumable = snapshot?.qso?.suspended === true && snapshot?.qso?.can_resume === true;
     const disabled = pending || !snapshot || stale() || snapshot.qso?.tx_available !== true;
     enableButton.disabled = pending || !snapshot || stale();
     resetButton.disabled = pending || !snapshot?.engine;
-    for (const id of ['wsjtx-tx-enable', 'wsjtx-cq', 'wsjtx-auto', 'wsjtx-offset', 'wsjtx-messages']) byId(id).disabled = disabled;
+    for (const id of ['wsjtx-tx-enable', 'wsjtx-cq', 'wsjtx-auto', 'wsjtx-tx-slot', 'wsjtx-offset', 'wsjtx-messages']) byId(id).disabled = disabled;
+    byId('wsjtx-tx-enable').disabled = snapshot?.qso?.suspended
+      ? pending || !snapshot || stale() || !resumable : disabled;
     decodeDepthSelect.disabled = pending || Boolean(snapshot?.engine?.running) || !snapshot || stale();
-    byId('wsjtx-halt').disabled = haltPending || !snapshot?.qso || !(pending || snapshot.qso.enabled || snapshot.qso.transmitting);
+    byId('wsjtx-halt').disabled = haltPending || !snapshot?.qso
+      || !(pending || snapshot.qso.enabled || snapshot.qso.transmitting || snapshot.qso.suspended);
     for (const label of byId('wsjtx-messages').children) if (label.children[0]?.type === 'radio') label.children[0].disabled = disabled;
     byId('wsjtx-spectrum-hit').setAttribute('aria-disabled', String(disabled));
   }
@@ -561,6 +646,7 @@
   byId('wsjtx-halt').addEventListener('click', () => command('/qso/enabled', { enabled: false }, true));
   byId('wsjtx-cq').addEventListener('click', () => command('/qso/cq', {}));
   byId('wsjtx-auto').addEventListener('change', () => command('/qso/auto', { enabled: byId('wsjtx-auto').checked }));
+  byId('wsjtx-tx-slot').addEventListener('change', () => command('/qso/slot', { slot: byId('wsjtx-tx-slot').value }));
   function setOffset(hz) {
     if (!Number.isFinite(hz)) return;
     const limits = offsetLimits();
