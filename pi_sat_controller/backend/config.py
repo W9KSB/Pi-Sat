@@ -155,6 +155,10 @@ class IcomConfig:
     debug_logging: bool
     tuning_tone_level_percent: int = 75
 
+    def __post_init__(self) -> None:
+        if self.civ_address == self.controller_address:
+            raise ValueError("IC-9700 radio and controller CI-V addresses must be different")
+
 
 @dataclass(frozen=True)
 class AprsConfig:

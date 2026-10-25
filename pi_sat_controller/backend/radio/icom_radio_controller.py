@@ -161,6 +161,10 @@ class IcomRadioError(IcomError):
     """A CI-V command or readback failed while its transport stayed usable."""
 
 
+class _CivTransactionTimeout(IcomRadioError):
+    """A CI-V transaction received no terminal reply before its deadline."""
+
+
 class IcomRadioController:
     """Single semantic controller over one selected connectivity module."""
 
@@ -203,6 +207,8 @@ class IcomRadioController:
 
     def __init__(self, config: IcomRadioConfig, connectivity: IcomConnectivity,
                  stop_event: Event | None = None) -> None:
+        if config.civ_address == config.controller_address:
+            raise ValueError("IC-9700 radio and controller CI-V addresses must be different")
         self.config = config
         self.connectivity = connectivity
         self._lock = RLock()
@@ -444,7 +450,7 @@ class IcomRadioController:
                     self._stage = "connected"
                     self._bump_tx_audio_epoch_locked()
                     try:
-                        self._prime_frequency_state_locked()
+                        self._prime_frequency_state_locked(retry_timeout=True)
                         self._last_reconcile = monotonic()
                     except Exception as exc:
                         LOGGER.info("Icom %s connected; initial frequency read failed: %s",
@@ -477,7 +483,7 @@ class IcomRadioController:
             # this in. Ask directly: an unconfirmed key is the one state that can
             # leave the radio transmitting with nobody listening.
             try:
-                self._read_ptt_state_locked()
+                self._read_ptt_state_locked(retry_timeout=True)
             except IcomError:
                 return
         if self._state.ptt is not True:
@@ -489,7 +495,7 @@ class IcomRadioController:
             return
         self._state.ptt = None
         try:
-            if self._read_ptt_state_locked() is False:
+            if self._read_ptt_state_locked(retry_timeout=True) is False:
                 self._state.tx_unconfirmed = False
         except IcomError:
             return
@@ -1015,10 +1021,16 @@ class IcomRadioController:
                 LOGGER.warning("Could not release PTT after the audio session ended: %s", exc)
                 self._state.tx_unconfirmed = True
 
-    def _read_ptt_state_locked(self) -> bool:
-        response = self._civ_transaction_locked(self._frame(0x1C, b"\x00"))
-        if len(response) != 8 or response[6] not in (0, 1):
-            raise IcomRadioError("Invalid PTT readback")
+    def _read_ptt_state_locked(self, *, retry_timeout: bool = False) -> bool:
+        try:
+            response = self._civ_query_with_retry_locked(
+                self._frame(0x1C, b"\x00"),
+                retry_timeout=retry_timeout,
+            )
+            if len(response) != 8 or response[6] not in (0, 1):
+                raise IcomRadioError("Invalid PTT readback")
+        except IcomRadioError as exc:
+            raise IcomRadioError("PTT state is unknown: no valid CI-V readback") from exc
         self._state.ptt = bool(response[6])
         return self._state.ptt
 
@@ -1083,8 +1095,11 @@ class IcomRadioController:
                 raise IcomRadioError("Dualwatch readback did not match the request")
             return self._state.to_dict()
 
-    def _read_dualwatch_locked(self) -> None:
-        response = self._civ_transaction_locked(self._frame(0x16, b"\x59"))
+    def _read_dualwatch_locked(self, *, retry_timeout: bool = False) -> None:
+        response = self._civ_query_with_retry_locked(
+            self._frame(0x16, b"\x59"),
+            retry_timeout=retry_timeout,
+        )
         if len(response) != 8 or response[6] not in (0, 1):
             raise IcomRadioError("Invalid Dualwatch readback")
         self._state.dualwatch = bool(response[6])
@@ -1225,8 +1240,7 @@ class IcomRadioController:
     def _configure_microphone_locked(self, *, source: int | None = None,
                                      lan_mod_level: int | None = None) -> None:
         if source is not None or lan_mod_level is not None:
-            ptt = self._civ_transaction_locked(self._frame(0x1C, b"\x00"))
-            if len(ptt) != 8 or ptt[6] != 0:
+            if self._read_ptt_state_locked(retry_timeout=True):
                 raise IcomRadioError("Release PTT before changing microphone configuration")
         self._read_microphone_config_locked()
         source_change = source is not None and (
@@ -1907,8 +1921,11 @@ class IcomRadioController:
             return True, filter_number
         raise IcomRadioError("Invalid IC-9700 DATA mode/filter readback")
 
-    def _prime_frequency_state_locked(self) -> None:
-        self._read_dualwatch_locked()
+    def _prime_frequency_state_locked(self, *, retry_timeout: bool = False) -> None:
+        if retry_timeout:
+            self._read_dualwatch_locked(retry_timeout=True)
+        else:
+            self._read_dualwatch_locked()
         if self._operator_is_waiting():
             return
         previous_side = self._read_side_locked()
@@ -2128,6 +2145,8 @@ class IcomRadioController:
                 continue
             request = self._pending_civ
             if request is not None and frame[2] == self.config.controller_address:
+                if frame == request:
+                    continue
                 query = request[4] in (0x03, 0x04) or request[4:-1] in (
                     b"\x07\xd2", b"\x1c\x00", b"\x1a\x03", b"\x14\x01", b"\x14\x02",
                     b"\x14\x03", b"\x15\x01", b"\x15\x02", b"\x15\x11", b"\x15\x12", b"\x15\x14",
@@ -2140,13 +2159,26 @@ class IcomRadioController:
                     matched = matched and frame[6:7] == request[6:7]
                 if query and request[4:6] == b"\x1a\x05":
                     matched = matched and frame[6:8] == request[6:8]
-                if frame[4] == 0xFA or matched:
+                if frame[4] == 0xFA:
+                    if self._civ_response is None:
+                        self._civ_response = frame
+                    continue
+                if matched and self._civ_query_reply_is_usable_locked(request, frame):
+                    if self._civ_response is not None:
+                        continue
                     self._civ_response = frame
                     continue
             if frame[4] in (0x00, 0x01):
                 self._classify_transceive_locked(frame)
         if len(self._serial_buffer) > 4096:
             self._serial_buffer.clear()
+
+    @staticmethod
+    def _civ_query_reply_is_usable_locked(request: bytes, frame: bytes) -> bool:
+        """Validate readbacks whose shortened request would otherwise match."""
+        if request[4:-1] in (b"\x16\x59", b"\x1c\x00"):
+            return len(frame) == 8 and frame[6] in (0, 1)
+        return True
 
     def _scope_count_locked(self, side: int, key: str, *, maximum: int | None = None,
                             current: int | None = None) -> None:
@@ -2247,12 +2279,24 @@ class IcomRadioController:
             self._debug("CI-V timeout bytes=%d command=%02x data=%s", len(frame),
                         frame[4] if len(frame) > 4 else 0,
                         " ".join(f"{byte:02x}" for byte in frame[5:-1]))
-            raise IcomRadioError("Timed out waiting for IC-9700 CI-V response")
+            raise _CivTransactionTimeout("Timed out waiting for IC-9700 CI-V response")
         finally:
             self._pending_civ = None
             self._civ_response = None
             if self._state.connected:
                 self._stage = "connected"
+
+    def _civ_query_with_retry_locked(self, frame: bytes, *, retry_timeout: bool) -> bytes:
+        attempts = 2 if retry_timeout else 1
+        for attempt in range(attempts):
+            try:
+                return self._civ_transaction_locked(frame)
+            except _CivTransactionTimeout:
+                if attempt + 1 >= attempts or self._stop.is_set():
+                    raise
+                # A partial frame cannot contribute to the retried query.
+                self._serial_buffer.clear()
+        raise AssertionError("unreachable CI-V retry state")
 
     # --- Transceive routing, targeted refresh and transport diagnostics -------
     # The radio pushes untagged CI-V 0x00 (frequency) and 0x01 (mode) frames.
