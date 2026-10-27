@@ -161,6 +161,10 @@ class IcomRadioError(IcomError):
     """A CI-V command or readback failed while its transport stayed usable."""
 
 
+class IcomTransmitStreamRevoked(IcomRadioError):
+    """An owned transmit claim was withdrawn by an explicit operator unkey."""
+
+
 class _CivTransactionTimeout(IcomRadioError):
     """A CI-V transaction received no terminal reply before its deadline."""
 
@@ -264,6 +268,7 @@ class IcomRadioController:
         # modulator). Silence fill must never insert frames into that stream.
         self._transmit_paced = False
         self._transmit_stream_claim: tuple[str, str] | None = None
+        self._operator_revoked_transmit_token: str | None = None
         self._tuning_tone_token: str | None = None
         self._tuning_tone_stop: Event | None = None
         self._tuning_tone_thread: Thread | None = None
@@ -525,6 +530,7 @@ class IcomRadioController:
         with self._operator_operation():
             self._ensure_connected_locked()
             previous_side = self._read_side_locked()
+            read_error: Exception | None = None
             try:
                 self._select_locked(side, None)
                 frequency = self._decode_frequency_response(
@@ -536,8 +542,16 @@ class IcomRadioController:
                     raise IcomRadioError("MAIN/SUB changed during frequency readback")
                 self._set_frequency_state(side, getattr(self._state, f"{side.lower()}_vfo"), frequency)
                 return frequency
+            except Exception as exc:
+                read_error = exc
+                raise
             finally:
-                self._select_locked(previous_side, None)
+                try:
+                    self._select_locked(previous_side, None)
+                except IcomError as exc:
+                    if read_error is None:
+                        raise
+                    LOGGER.warning("Could not restore MAIN/SUB selection after failed frequency read: %s", exc)
 
     def set_frequency(self, physical_side: str, vfo: str | None, frequency_hz: int) -> dict[str, Any]:
         physical_side = self._normalize_side(physical_side)
@@ -657,6 +671,7 @@ class IcomRadioController:
             token = uuid4().hex
             with self._tx_audio_lock:
                 self._transmit_stream_claim = (owner.strip(), token)
+                self._operator_revoked_transmit_token = None
                 self._bump_tx_audio_epoch_locked()
             self._discard_transmit_audio()
             return token
@@ -677,6 +692,14 @@ class IcomRadioController:
             if token != claim[1]:
                 raise IcomRadioError(f"Transmit stream is owned by {claim[0]}")
         elif token is not None:
+            if (
+                token == self._operator_revoked_transmit_token
+                and self._state.connected
+                and not self._ptt_commanded
+            ):
+                raise IcomTransmitStreamRevoked(
+                    "Transmit stream was stopped by the operator"
+                )
             raise IcomRadioError("Transmit stream token is no longer active")
 
     def _invalidate_transmit_stream_locked(self) -> None:
@@ -867,6 +890,9 @@ class IcomRadioController:
             self._ensure_connected_locked()
             if not enabled and transmit_token is None:
                 # Operator unkey cancels digital work even if the radio command fails.
+                claim = self._transmit_stream_claim
+                if claim is not None:
+                    self._operator_revoked_transmit_token = claim[1]
                 self._invalidate_transmit_stream_locked()
             else:
                 self._check_transmit_stream_token(transmit_token)
@@ -1030,7 +1056,7 @@ class IcomRadioController:
             if len(response) != 8 or response[6] not in (0, 1):
                 raise IcomRadioError("Invalid PTT readback")
         except IcomRadioError as exc:
-            raise IcomRadioError("PTT state is unknown: no valid CI-V readback") from exc
+            raise IcomRadioError(f"PTT state is unknown: {exc}") from exc
         self._state.ptt = bool(response[6])
         return self._state.ptt
 
@@ -2269,7 +2295,19 @@ class IcomRadioController:
                 self._service_once(0.005)
                 if self._civ_response is not None:
                     if self._civ_response[4] == 0xFA:
-                        raise IcomRadioError("IC-9700 returned CI-V NAK")
+                        command = frame[4:6] if frame[4] in (0x07, 0x16, 0x1A, 0x1C, 0x27) else frame[4:5]
+                        operation = {
+                            b"\x03": "read frequency",
+                            b"\x07\xd0": "select MAIN band",
+                            b"\x07\xd1": "select SUB band",
+                            b"\x07\xd2": "read MAIN/SUB selection",
+                            b"\x16\x59": "read Dualwatch",
+                            b"\x1c\x00": "read PTT",
+                        }.get(frame[4:-1])
+                        detail = f" ({operation})" if operation else ""
+                        raise IcomRadioError(
+                            f"IC-9700 returned CI-V NAK for command {command.hex(' ').upper()}{detail}"
+                        )
                     return self._civ_response
                 # poll() already waits for transport input. A short yield keeps
                 # this loop from spinning when the transport returns early.
@@ -2643,6 +2681,7 @@ class IcomRadioController:
         self._state.ptt = None
         self._state.ptt_pending = None
         self._ptt_commanded = False
+        self._operator_revoked_transmit_token = None
         self._invalidate_transmit_stream_locked()
         self._ptt_idle_since = None
         self._ptt_release_deadline = None

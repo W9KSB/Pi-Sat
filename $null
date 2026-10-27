@@ -1,5 +1,0 @@
-rg: pyproject.toml: The system cannot find the file specified. (os error 2)
-rg: setup.cfg: The system cannot find the file specified. (os error 2)
-rg: tox.ini: The system cannot find the file specified. (os error 2)
-rg: requirements*.txt: The filename, directory name, or volume label syntax is incorrect. (os error 123)
-rg: .github: The system cannot find the file specified. (os error 2)

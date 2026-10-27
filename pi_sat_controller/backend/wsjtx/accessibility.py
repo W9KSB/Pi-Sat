@@ -11,12 +11,20 @@ import sys
 import time
 
 _READBACK_SECONDS = 1.0
+_DISCOVERY_SECONDS = 5.0
 _CONTROL_NAMES = {
     'auto_sequence': ('check box', 'Auto Seq', ''),
     'tx_even': ('check box', 'Tx even/1st', ''),
     'tx_enabled': ('check box', 'Enable Tx', ''),
     'tx_df_hz': ('spin button', '', 'Audio Tx frequency'),
     'rx_df_hz': ('spin button', '', 'Audio Rx frequency'),
+}
+_CONTROL_LABELS = {
+    'auto_sequence': 'Auto Seq',
+    'tx_even': 'Tx even/1st',
+    'tx_enabled': 'Enable Tx',
+    'tx_df_hz': 'Audio Tx frequency',
+    'rx_df_hz': 'Audio Rx frequency',
 }
 
 class _Rect(ctypes.Structure):
@@ -218,21 +226,27 @@ class _OwnedControls:
                 self.api.unref(node)
 
     def __enter__(self):
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + _DISCOVERY_SECONDS
+        observed = set()
+        saw_application = saw_owned_application = saw_owned_window = False
         while True:
             candidates = []
             self.api.clear_cache(self.api.desktop)
             applications = self.api.children(self.api.desktop)
+            saw_application = saw_application or bool(applications)
             try:
                 for application in applications:
                     if self.api.process_id(application) != self.pid:
                         continue
+                    saw_owned_application = True
                     windows = self.api.children(application)
                     try:
                         for window in windows:
                             if self.api.info(window)['role'] not in ('frame', 'dialog'):
                                 continue
+                            saw_owned_window = True
                             found = self._scan(window)
+                            observed.update(key for key, nodes in found.items() if nodes)
                             if all(found.values()):
                                 candidates.append((self.api.ref(window), found))
                             else:
@@ -257,7 +271,21 @@ class _OwnedControls:
                     self.api.unref(window)
                     self._release(candidate)
             if time.monotonic() >= deadline:
-                raise RuntimeError('Owned WSJT-X is missing the required transmit controls')
+                if not saw_application:
+                    raise RuntimeError('Linux accessibility has no registered applications')
+                if not saw_owned_application:
+                    raise RuntimeError(
+                        f'No accessible application matched owned WSJT-X PID {self.pid}'
+                    )
+                if not saw_owned_window:
+                    raise RuntimeError(
+                        f'Owned WSJT-X PID {self.pid} exposed no accessible window'
+                    )
+                missing = [_CONTROL_LABELS[key] for key in _CONTROL_NAMES if key not in observed]
+                if missing:
+                    raise RuntimeError('Owned WSJT-X is missing required transmit controls: '
+                                       + ', '.join(missing))
+                raise RuntimeError('Owned WSJT-X transmit controls were not available in one window')
             time.sleep(0.05)
 
     def __exit__(self, *_):

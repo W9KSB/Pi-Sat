@@ -10,6 +10,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from pi_sat_controller.backend.radio.icom_radio_controller import IcomTransmitStreamRevoked
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -78,6 +80,7 @@ class WsjtxTxAudioBridge:
         self._onset_generation = 0
         self._onset_poll_sequence = 0
         self._pending_fault: WsjtxTxAudioError | None = None
+        self._published_fault: WsjtxTxAudioError | None = None
         self._fault_sequence = 0
         self._fault_category = ""
         self._status_poll_max_ms = 0.0
@@ -152,11 +155,14 @@ class WsjtxTxAudioBridge:
     def _classified(error: Exception, category: str) -> WsjtxTxAudioError:
         if isinstance(error, WsjtxTxAudioError):
             return error
+        if isinstance(error, IcomTransmitStreamRevoked):
+            category = "operator_stop"
         message = str(error) or type(error).__name__
         return WsjtxTxAudioError(message, category=category)
 
     def _request_fault(self, error: Exception, *, category: str = "fatal") -> None:
         fault = self._classified(error, category)
+        published = False
         with self._lock:
             if self._pending_fault is None:
                 self._pending_fault = fault
@@ -165,6 +171,14 @@ class WsjtxTxAudioBridge:
                 self._audio_accepting = False
                 self._onset_generation = 0
                 self._onset_poll_sequence = 0
+                if fault.category == "operator_stop":
+                    self._fault_sequence += 1
+                    self._fault_category = fault.category
+                    self._state, self._detail = "error", str(fault)
+                    self._published_fault = fault
+                    published = True
+        if published:
+            LOGGER.info("WSJT-X transmit stopped (%s): %s", fault.category, fault)
         self._stop.set()
 
     @staticmethod
@@ -206,6 +220,7 @@ class WsjtxTxAudioBridge:
             self._onset_poll_sequence = 0
             self._audio_accepting = False
             self._pending_fault = None
+            self._published_fault = None
             self._fault_category = ""
             self._status_poll_max_ms = 0.0
             self._control_operation_max_ms = 0.0
@@ -283,8 +298,8 @@ class WsjtxTxAudioBridge:
         for _ in range(3):
             try:
                 # An operator unkey can revoke the token before this worker
-                # cleans up. Confirm an idle radio without reusing that token.
-                if controller.transmit_active or not controller.wait_for_ptt(False, 0):
+                # cleans up. An already idle radio needs no stale-token call.
+                if not controller.wait_for_ptt(False, 0):
                     controller.set_ptt(False, transmit_token=token)
                 if controller.wait_for_ptt(False, 0.8):
                     with self._lock:
@@ -768,7 +783,7 @@ class WsjtxTxAudioBridge:
                     process.wait(timeout=1)
             with self._lock:
                 fault = cleanup_fault or self._pending_fault
-                if fault is not None:
+                if fault is not None and fault is not self._published_fault:
                     self._fault_sequence += 1
                     self._fault_category = fault.category
                     self._state, self._detail = "error", str(fault)

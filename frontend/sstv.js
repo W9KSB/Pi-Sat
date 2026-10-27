@@ -13,6 +13,7 @@
   let enabled = false;
   let socket = null;
   let reconnectTimer = null;
+  let eventWatchdogTimer = null;
   let currentSequence = 0;
   let lastLoggedState = null;
   let lastLoggedEnabled = null;
@@ -75,6 +76,10 @@
   }
 
   function stateDetail(status) {
+    if (status.health === 'recovering') {
+      return `Automatic recovery is running: ${status.recovery_reason || status.error || 'decoder stopped responding'}. SSTV remains enabled and will retry automatically.`;
+    }
+    if (status.health === 'starting') return 'Starting the decoder and checking that it processes radio audio.';
     if (status.error) return status.error;
     const details = {
       Disabled: 'Decoder is off. Radio audio continues normally.',
@@ -286,7 +291,7 @@
       renderStatus(status);
       if (status.current_image) await loadCurrentImage();
     } catch (_) {
-      byId('sstv-detail').textContent = 'SSTV backend is unavailable.';
+      showStatusUnavailable();
     }
   }
 
@@ -355,20 +360,46 @@
     }
   }
 
+  function showStatusUnavailable() {
+    stateNode.textContent = 'Status unavailable';
+    stateNode.dataset.state = 'error';
+    byId('sstv-detail').textContent = 'Connection to the SSTV backend was lost. Reconnecting to verify decoder health.';
+    byId('sstv-active-indicator').hidden = true;
+  }
+
   function connectEvents() {
     clearTimeout(reconnectTimer);
     const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    socket = new WebSocket(`${scheme}//${location.host}/api/sstv/events`);
-    socket.onopen = () => appendDebug('info', 'Connected to live decoder event stream.');
-    socket.onmessage = message => {
+    const connection = new WebSocket(`${scheme}//${location.host}/api/sstv/events`);
+    socket = connection;
+    const watchEvents = () => {
+      clearTimeout(eventWatchdogTimer);
+      eventWatchdogTimer = setTimeout(() => {
+        if (socket !== connection) return;
+        showStatusUnavailable();
+        connection.close();
+      }, 10000);
+    };
+    connection.onopen = () => {
+      if (socket !== connection) return;
+      currentSequence = 0;
+      appendDebug('info', 'Connected to live decoder event stream.');
+      watchEvents();
+    };
+    connection.onmessage = message => {
+      if (socket !== connection) return;
+      watchEvents();
       try { handleEvent(JSON.parse(message.data)); } catch (_) { /* Ignore malformed events. */ }
     };
-    socket.onclose = () => {
+    connection.onclose = () => {
+      if (socket !== connection) return;
+      clearTimeout(eventWatchdogTimer);
+      showStatusUnavailable();
       appendDebug('warn', 'Decoder event stream disconnected; reconnecting.');
       socket = null;
       reconnectTimer = setTimeout(connectEvents, 1500);
     };
-    socket.onerror = () => socket?.close();
+    connection.onerror = () => connection.close();
   }
 
   enableButton.addEventListener('click', async () => {

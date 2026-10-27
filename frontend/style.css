@@ -786,6 +786,8 @@ dd {
 
 .log-list {
   display: grid;
+  align-content: start;
+  grid-auto-rows: max-content;
   gap: 0;
   height: 150px;
   overflow-y: auto;
@@ -804,6 +806,93 @@ dd {
   gap: 0.9rem;
 }
 
+.monitor-filter-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.monitor-all-filter[aria-pressed="true"] {
+  color: #062117;
+  background: #68d7aa;
+  border-color: #68d7aa;
+}
+
+.monitor-filter-summary,
+.monitor-log-status {
+  color: var(--app-muted);
+  font-size: 0.76rem;
+}
+
+.monitor-log-status {
+  min-height: 1.1rem;
+  margin: -0.15rem 0 0.55rem;
+  color: #f1bd62;
+}
+
+.monitor-debug-settings,
+.monitor-sstv-downloads {
+  border-top: 1px solid #2b3b49;
+  padding-top: 0.8rem;
+}
+
+.monitor-debug-settings > summary,
+.monitor-sstv-downloads > summary {
+  width: fit-content;
+  cursor: pointer;
+  list-style: none;
+}
+
+.monitor-debug-settings > summary::-webkit-details-marker,
+.monitor-sstv-downloads > summary::-webkit-details-marker {
+  display: none;
+}
+
+.monitor-debug-settings > summary {
+  color: #b8c8d7;
+  font-size: 0.8rem;
+}
+
+.monitor-debug-settings > summary::after {
+  content: "+";
+  display: inline-block;
+  min-width: 1rem;
+  margin-left: 0.4rem;
+  color: var(--app-muted);
+  text-align: center;
+}
+
+.monitor-debug-settings[open] > summary::after {
+  content: "-";
+}
+
+.monitor-sstv-downloads > summary {
+  display: inline-flex;
+  align-items: center;
+}
+
+.monitor-download-menu {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+  padding-left: 0.7rem;
+  border-left: 2px solid #355067;
+}
+
+.monitor-download-menu a {
+  color: #a9d8ee;
+  font-size: 0.78rem;
+  text-decoration: none;
+}
+
+.monitor-download-menu a:hover,
+.monitor-download-menu a:focus-visible {
+  color: #ffffff;
+  text-decoration: underline;
+}
+
 .monitor-label-general {
   color: #f6f8fb;
 }
@@ -816,22 +905,16 @@ dd {
   color: #ce9cf7;
 }
 
-.log-message-wsjtx, .log-message-sstv {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
+.monitor-label-aprs, .log-message-aprs {
+  color: #f1d46a;
 }
 
-.monitor-label-rx {
-  color: #ff8e8e;
+.monitor-label-icom, .log-message-icom {
+  color: #f3a866;
 }
 
-.monitor-label-tx {
-  color: #79d98d;
-}
-
-.monitor-label-rotator {
-  color: #7fb7ff;
+.monitor-label-system, .log-message-system {
+  color: #aab8c5;
 }
 
 .log-item {
@@ -850,16 +933,37 @@ dd {
   color: #f6f8fb;
 }
 
-.log-message-rx {
+.log-message-general,
+.log-message-wsjtx,
+.log-message-sstv,
+.log-message-aprs,
+.log-message-rx,
+.log-message-tx,
+.log-message-rotator,
+.log-message-icom,
+.log-message-system {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.monitor-label-rx, .log-message-rx {
   color: #ff8e8e;
 }
 
-.log-message-tx {
+.monitor-label-tx, .log-message-tx {
   color: #79d98d;
 }
 
-.log-message-rotator {
+.monitor-label-rotator, .log-message-rotator {
   color: #7fb7ff;
+}
+
+.log-list-empty {
+  padding: 1rem 0;
+  color: var(--app-muted);
+  font-family: inherit;
+  font-size: 0.8rem;
 }
 
 .command-status {

@@ -84,6 +84,7 @@
 
 #modules-page .module-status-chip[data-state="sstv-detected"],
 #modules-page .module-status-chip[data-state="decoding"],
+#modules-page .module-status-chip[data-state="recovering-decoder"],
 #modules-page .module-status-chip[data-state="decode-complete"],
 #modules-page .module-status-chip[data-state="enabled"],
 #modules-page .module-status-chip[data-state="transmitting"] {

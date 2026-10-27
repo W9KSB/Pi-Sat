@@ -52,6 +52,8 @@ class _DisplayApi:
                                ctypes.POINTER(integer), ctypes.POINTER(integer),
                                ctypes.POINTER(unsigned)], integer),
             'XRaiseWindow': ([pointer, window], integer),
+            'XChangeProperty': ([pointer, window, window, window, integer, integer,
+                                 ctypes.c_char_p, integer], integer),
             'XSync': ([pointer, integer], integer),
             'XFree': ([pointer], integer),
             'XSetErrorHandler': ([pointer], pointer),
@@ -95,6 +97,23 @@ class _DisplayApi:
                 ctypes.byref(screen_y), ctypes.byref(child)):
             return None
         return screen_x.value, screen_y.value, width.value, height.value
+
+    def property(self, display, window, atom) -> bytes | None:
+        actual_type, count, remaining = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_ulong()
+        actual_format, data = ctypes.c_int(), ctypes.c_void_p()
+        try:
+            status = self.x11.XGetWindowProperty(
+                display, window, atom, 0, 1024, 0, 0,
+                ctypes.byref(actual_type), ctypes.byref(actual_format),
+                ctypes.byref(count), ctypes.byref(remaining), ctypes.byref(data),
+            )
+            if (status != 0 or actual_format.value != 8 or remaining.value != 0
+                    or count.value > 1024 or (count.value and not data)):
+                return None
+            return ctypes.string_at(data, count.value) if data else b''
+        finally:
+            if data:
+                self.x11.XFree(data)
 
 
 def press_owned_button(display_name: str, pid: int,
@@ -178,6 +197,47 @@ def press_owned_button(display_name: str, pid: int,
     finally:
         if pressed:
             api.test.XTestFakeButtonEvent(display, 1, 0, 0)
+        api.x11.XSync(display, 0)
+        api.x11.XSetErrorHandler(previous_handler)
+        api.x11.XCloseDisplay(display)
+
+
+def set_root_property(display_name: str, name: str, value: str) -> bool:
+    """Publish one bounded STRING property on the managed display root."""
+    if (not isinstance(display_name, str) or not re.fullmatch(r':\d+(?:\.\d+)?', display_name)
+            or not isinstance(name, str) or not name.isascii() or not name.isprintable() or not name
+            or not isinstance(value, str) or not value.isascii() or not value.isprintable() or not value
+            or '\x00' in value or len(value.encode('ascii')) > 1024
+            or not available()):
+        return False
+    api = _DisplayApi()
+    display = api.x11.XOpenDisplay(display_name.encode('ascii'))
+    if not display:
+        return False
+    native_error = False
+
+    @ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    def record_error(_display, _event):
+        nonlocal native_error
+        native_error = True
+        return 0
+
+    previous_handler = api.x11.XSetErrorHandler(ctypes.cast(record_error, ctypes.c_void_p))
+    try:
+        screen = api.x11.XDefaultScreen(display)
+        root = api.x11.XRootWindow(display, screen)
+        property_atom = api.x11.XInternAtom(display, name.encode('ascii'), 0)
+        string_atom = api.x11.XInternAtom(display, b'STRING', 0)
+        data = value.encode('ascii')
+        if not property_atom or not string_atom:
+            return False
+        changed = api.x11.XChangeProperty(
+            display, root, property_atom, string_atom, 8, 0, data, len(data),
+        )
+        api.x11.XSync(display, 0)
+        return (bool(changed) and not native_error
+                and api.property(display, root, property_atom) == data)
+    finally:
         api.x11.XSync(display, 0)
         api.x11.XSetErrorHandler(previous_handler)
         api.x11.XCloseDisplay(display)

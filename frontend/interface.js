@@ -208,9 +208,7 @@
         nativeLoading = null;
       });
     }
-    document.querySelectorAll('#monitor-wsjtx-debug, #monitor-sstv-debug, #monitor-icom-debug').forEach(input => { input.closest('label').hidden = !enabled; });
-    document.querySelectorAll('#monitor-page [href^="/api/sstv/"]').forEach(link => { link.hidden = !enabled; });
-    byId('icom-log-list').closest('section').hidden = !enabled;
+    document.querySelectorAll('#monitor-page .monitor-sstv-downloads').forEach(node => { node.hidden = !enabled; });
     if (typeof globalThis.showPage === 'function' && !enabled && nativePages.has(globalThis.pageFromHash())) globalThis.showPage('home');
   }
   function showPage(page) {

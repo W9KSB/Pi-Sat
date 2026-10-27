@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Pi-Sat Controller</title>
     <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
-    <link rel="stylesheet" href="/style.css?v=20261023-signal-waterfall1">
+    <link rel="stylesheet" href="/style.css?v=20261026-monitor2">
     <link rel="stylesheet" href="/radio-console.css?v=20261009-tuning-tone1">
-    <link rel="stylesheet" href="/interface.css?v=20261023-ui1">
+    <link rel="stylesheet" href="/interface.css?v=20261026-monitor1">
     <link rel="stylesheet" href="/modules.css?v=20261023-signal-waterfall1">
     <link rel="stylesheet" href="/settings.css?v=20261023-ui1">
     <link rel="stylesheet" href="/satellites.css?v=20261023-ui1">
@@ -269,45 +269,81 @@
           <section class="col-12 col-lg-4">
             <div class="card h-100">
               <div class="card-header">
-                <h2 class="h5 mb-0">Log types</h2>
+                <h2 class="h5 mb-0">Log filters</h2>
               </div>
               <div class="card-body">
-                <div class="monitor-controls">
+                <div class="monitor-filter-toolbar">
+                  <button type="button" class="btn btn-sm btn-outline-info monitor-all-filter" id="monitor-all-logs-filter" aria-pressed="false">All logs</button>
+                  <span id="monitor-filter-summary" class="monitor-filter-summary"></span>
+                </div>
+                <div class="monitor-controls mt-3" role="group" aria-label="Log filters">
                   <label class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-general-debug" checked>
-                    <span class="form-check-label monitor-label-general">General logs</span>
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-general-filter" checked>
+                    <span class="form-check-label monitor-label-general">General</span>
                   </label>
                   <label class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-wsjtx-debug">
-                    <span class="form-check-label monitor-label-wsjtx">FT4 / FT8 logs</span>
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-rx-filter">
+                    <span class="form-check-label monitor-label-rx">RX</span>
                   </label>
                   <label class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-sstv-debug">
-                    <span class="form-check-label monitor-label-sstv">SSTV logs</span>
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-tx-filter">
+                    <span class="form-check-label monitor-label-tx">TX</span>
                   </label>
                   <label class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-rx-cat-debug">
-                    <span class="form-check-label monitor-label-rx">RX CAT debug logging</span>
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-rotator-filter">
+                    <span class="form-check-label monitor-label-rotator">Rotator</span>
                   </label>
                   <label class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-tx-cat-debug">
-                    <span class="form-check-label monitor-label-tx">TX CAT debug logging</span>
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-wsjtx-filter">
+                    <span class="form-check-label monitor-label-wsjtx">FT4 / FT8</span>
                   </label>
                   <label class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-rotator-cat-debug">
-                    <span class="form-check-label monitor-label-rotator">Rotator debug logging</span>
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-sstv-filter">
+                    <span class="form-check-label monitor-label-sstv">SSTV</span>
                   </label>
                   <label class="form-check form-switch mb-0">
-                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-icom-debug">
-                    <span class="form-check-label">Icom LAN verbose debug logging</span>
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-aprs-filter">
+                    <span class="form-check-label monitor-label-aprs">APRS</span>
+                  </label>
+                  <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-icom-filter">
+                    <span class="form-check-label monitor-label-icom">Icom LAN</span>
+                  </label>
+                  <label class="form-check form-switch mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch" id="monitor-system-filter">
+                    <span class="form-check-label monitor-label-system">System</span>
                   </label>
                 </div>
-                <p id="monitor-status" class="command-status mb-0"></p>
-                <div class="mt-3 d-flex flex-wrap gap-2" aria-label="SSTV diagnostic downloads">
-                  <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/source-audio" download="sstv-sub-source.wav" title="SUB audio before decoder gain, captured since Enable">SSTV SUB audio</a>
-                  <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/decoder-audio" download="sstv-decoder-input.wav" title="Audio supplied to the decoder after gain, captured since Enable">SSTV decoder audio</a>
-                  <a class="btn btn-sm btn-outline-secondary" href="/api/sstv/audio-diagnostics" download="sstv-audio-diagnostics.jsonl" title="Audio packet, gain, and discontinuity diagnostics">SSTV audio diagnostics</a>
-                </div>
+                <details class="monitor-debug-settings mt-3">
+                  <summary>Debug capture</summary>
+                  <div class="monitor-controls monitor-controls-debug mt-2">
+                    <label class="form-check form-switch mb-0">
+                      <input class="form-check-input" type="checkbox" role="switch" id="monitor-rx-cat-debug">
+                      <span class="form-check-label">RX CAT debug</span>
+                    </label>
+                    <label class="form-check form-switch mb-0">
+                      <input class="form-check-input" type="checkbox" role="switch" id="monitor-tx-cat-debug">
+                      <span class="form-check-label">TX CAT debug</span>
+                    </label>
+                    <label class="form-check form-switch mb-0">
+                      <input class="form-check-input" type="checkbox" role="switch" id="monitor-rotator-cat-debug">
+                      <span class="form-check-label">Rotator debug</span>
+                    </label>
+                    <label class="form-check form-switch mb-0">
+                      <input class="form-check-input" type="checkbox" role="switch" id="monitor-icom-debug">
+                      <span class="form-check-label">Icom LAN verbose</span>
+                    </label>
+                  </div>
+                  <p id="monitor-status" class="command-status mt-2 mb-0"></p>
+                </details>
+                <details class="monitor-sstv-downloads mt-3">
+                  <summary class="btn btn-sm btn-outline-secondary">SSTV diagnostics</summary>
+                  <div class="monitor-download-menu">
+                    <a href="/api/sstv/source-audio" download="sstv-sub-source.wav" title="SUB audio before decoder gain, captured since Enable">SUB audio (WAV)</a>
+                    <a href="/api/sstv/decoder-audio" download="sstv-decoder-input.wav" title="Audio supplied to the decoder after gain, captured since Enable">Decoder audio (WAV)</a>
+                    <a href="/api/sstv/audio-diagnostics" download="sstv-audio-diagnostics.jsonl" title="Audio packet, gain, and discontinuity diagnostics">Audio diagnostics (JSONL)</a>
+                  </div>
+                </details>
               </div>
             </div>
           </section>
@@ -315,17 +351,12 @@
           <section class="col-12 col-lg-8">
             <div class="card h-100">
               <div class="card-header py-2">
-                <h2 class="h6 mb-0">Logs <span class="text-body-secondary">(Last 100)</span></h2>
+                <h2 class="h6 mb-0">Journal <span id="monitor-log-count" class="text-body-secondary"></span></h2>
               </div>
               <div class="card-body">
+                <p id="monitor-log-status" class="monitor-log-status" role="status" hidden></p>
                 <div id="log-list" class="log-list log-list-tall"></div>
               </div>
-            </div>
-          </section>
-          <section class="col-12">
-            <div class="card">
-              <div class="card-header py-2"><h2 class="h6 mb-0">Icom LAN protocol log <span class="text-body-secondary">(Last 100)</span></h2></div>
-              <div class="card-body"><div id="icom-log-list" class="log-list log-list-tall"></div></div>
             </div>
           </section>
         </div>
@@ -1006,7 +1037,7 @@
     <script type="application/json" data-native-src="/sstv.js?v=20261023-ui1"></script>
     <script type="application/json" data-native-src="/aprs.js?v=20261023-ui1"></script>
     <script type="application/json" data-native-src="/wsjtx.js?v=20261023-signal-waterfall1"></script>
-    <script src="/interface.js?v=20261023-ui1"></script>
-    <script src="/app.js?v=20261023-tone-level1"></script>
+    <script src="/interface.js?v=20261026-monitor1"></script>
+    <script src="/app.js?v=20261026-monitor1"></script>
   </body>
 </html>

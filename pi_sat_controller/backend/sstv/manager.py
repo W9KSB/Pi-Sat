@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from array import array
+from collections import deque
 import base64
 from collections.abc import Callable
 import json
@@ -31,6 +32,9 @@ _MAX_REASONABLE_GAP_PACKETS = 0x7FFF
 _FILE_SAMPLE_RATE = 16_000
 _FILE_DECODE_TIMEOUT_S = 180.0
 _MAX_FILE_PCM_BYTES = 128 * 1024 * 1024
+_WATCHDOG_INTERVAL_S = 1.0
+_WORKER_STALL_S = 30.0
+_RETRY_MAX_S = 30.0
 
 
 class SstvDecodeError(RuntimeError):
@@ -48,6 +52,7 @@ class SstvManager:
     COMPLETE = "Decode complete"
     FAILED = "Decode failed"
     FINISHING = "Finishing queued audio"
+    RECOVERING = "Recovering decoder"
 
     def __init__(
         self,
@@ -108,6 +113,26 @@ class SstvManager:
         self._stop = Event()
         self._wake = Event()
         self._thread: Thread | None = None
+        self._consumer_thread: Thread | None = None
+        self._recovery_requested = Event()
+        self._supervisor_wake = Event()
+        self._pending_packets: deque[bytes] = deque()
+        self._health = "disabled"
+        self._restart_count = 0
+        self._recovery_reason: str | None = None
+        self._worker_started_at: float | None = None
+        self._worker_closing_at: float | None = None
+        self._worker_ready = False
+        self._worker_input_samples = 0
+        self._worker_sample_position = 0
+        self._worker_progress_at: float | None = None
+        self._worker_pending_since: float | None = None
+        self._write_started_at: float | None = None
+        self._consumer_progress_at: float | None = None
+        self._last_packet_at: float | None = None
+        self._radio_audio_at: float | None = None
+        self._radio_audio_count: int | None = None
+        self._radio_connected = False
         self._process: subprocess.Popen[bytes] | None = None
         self._process_generation = 0
         self._fatal_worker = False
@@ -126,7 +151,16 @@ class SstvManager:
                 }
             return {
                 "enabled": self._enabled,
-                "state": self.FINISHING if self._finish_requested else self._state,
+                "state": (self.FINISHING if self._finish_requested else
+                          self.RECOVERING if self._health == "recovering" else
+                          self.WAITING if self._enabled and self._health in {"starting", "waiting"}
+                          else self._state),
+                "health": self._health,
+                "restart_count": self._restart_count,
+                "recovery_reason": self._recovery_reason,
+                "processed_samples": self._worker_sample_position,
+                "last_processed_age_seconds": (round(monotonic() - self._worker_progress_at, 1)
+                                               if self._worker_progress_at is not None else None),
                 "error": self._error,
                 "mode": self._mode,
                 "line": self._line,
@@ -479,8 +513,19 @@ class SstvManager:
                     self._last_packet_sequence = None
                     self._dropped_packets = 0
                     self._interference_packets = 0
+                    self._pending_packets.clear()
+                    self._health = "starting"
+                    self._restart_count = 0
+                    self._recovery_reason = None
+                    self._last_audio_at = None
+                    self._last_packet_at = None
+                    self._radio_audio_at = None
+                    self._radio_audio_count = None
+                    self._radio_connected = True
+                    self._recovery_requested.clear()
+                    self._supervisor_wake.clear()
                     self._stop.clear()
-                    self._thread = Thread(target=self._run, name="sstv-decoder", daemon=True)
+                    self._thread = Thread(target=self._supervise, name="sstv-watchdog", daemon=True)
                     thread = self._thread
                 LOGGER.info("SSTV decoder enabled; starting RX audio consumer")
                 self._publish_debug("info", "SSTV decoder enabled; starting RX audio consumer.")
@@ -501,6 +546,7 @@ class SstvManager:
                 self._publish_debug("info", "Reception stopped; finishing queued SSTV audio.")
                 self._stop.set()
                 self._wake.set()
+                self._supervisor_wake.set()
                 self._publish_status()
                 if thread is not None:
                     thread.join()
@@ -511,6 +557,7 @@ class SstvManager:
                     self._enabled = False
                     self._finish_requested = False
                     self._state = self.DISABLED
+                    self._health = "disabled"
                     self._thread = None
                     self._mode = None
                     self._line = 0
@@ -522,6 +569,160 @@ class SstvManager:
 
     def shutdown(self) -> None:
         self.set_enabled(False)
+
+    def _watchdog_reason(self, now: float) -> str | None:
+        with self._lock:
+            if self._fatal_worker:
+                return self._error or "SSTV consumer failed"
+            started = self._worker_started_at
+            progress = self._worker_progress_at
+            closing_at = self._worker_closing_at
+            latest = max((value for value in (self._consumer_progress_at, progress,
+                                              self._last_audio_at, started, closing_at)
+                          if value is not None), default=now)
+            if started is None:
+                return "SSTV audio consumer stopped advancing" if now - latest >= _WORKER_STALL_S else None
+            if not self._worker_ready and now - started >= _WORKER_STALL_S:
+                return "SSTVFlow worker did not become ready"
+            last_progress = progress if progress is not None else started
+            if (self._write_started_at is not None
+                    and now - max(self._write_started_at, last_progress) >= _WORKER_STALL_S):
+                return "SSTVFlow audio input is blocked"
+            if (self._worker_pending_since is not None
+                    and now - max(self._worker_pending_since, last_progress) >= _WORKER_STALL_S):
+                return "SSTVFlow stopped processing queued audio"
+            if now - latest >= _WORKER_STALL_S:
+                return "SSTV audio consumer stopped advancing"
+            if (self._radio_connected and self._radio_audio_at is not None
+                    and now - self._radio_audio_at < 2.0
+                    and now - (self._last_packet_at if self._last_packet_at is not None else started)
+                    >= _WORKER_STALL_S):
+                return "SSTV subscription stopped receiving the radio audio stream"
+        with self._process_lock:
+            closing = self._closing_process is not None
+            if self._process is not None and self._process.poll() is not None and not closing:
+                return "SSTVFlow worker exited unexpectedly"
+        if closing and now - max(last_progress, closing_at or last_progress) >= _WORKER_STALL_S:
+            return "SSTVFlow stopped while finishing queued audio"
+        return None
+
+    def _interrupt_worker(self, previous: tuple[Any, float] | None) -> tuple[Any, float] | None:
+        # Do not wait for the writer or termination lock: either can be held
+        # while a stalled process is blocking a pipe write or an EOF drain.
+        with self._process_lock:
+            process = self._process
+            if process is None or process.poll() is not None:
+                return None
+            self._closing_process = process
+        now = monotonic()
+        try:
+            if previous is None or previous[0] is not process:
+                process.terminate()
+                return process, now
+            if now - previous[1] >= 1.0:
+                process.kill()
+        except ProcessLookupError:
+            return None
+        return previous
+
+    def _supervise(self) -> None:
+        consumer: Thread | None = None
+        retry_at = 0.0
+        retry_delay = 1.0
+        retrying = False
+        healthy_since: float | None = None
+        interrupted: tuple[Any, float] | None = None
+        try:
+            while True:
+                now = monotonic()
+                if consumer is not None and not consumer.is_alive():
+                    consumer.join()
+                    consumer = None
+                    if not self._stop.is_set() and not self._recovery_requested.is_set():
+                        with self._lock:
+                            self._recovery_reason = self._error or "SSTV audio consumer exited unexpectedly"
+                            self._health = "recovering"
+                        self._recovery_requested.set()
+                        retry_at = now + retry_delay
+                        retry_delay = min(_RETRY_MAX_S, retry_delay * 2)
+                        self._publish_debug("error", self._recovery_reason)
+                        self._publish_status()
+                    retrying = True
+                if consumer is None:
+                    if self._stop.is_set():
+                        break
+                    if now >= retry_at:
+                        with self._lock:
+                            self._fatal_worker = False
+                            self._error = None
+                            self._state = self.WAITING
+                            self._terminal_until = 0.0
+                            self._consumer_progress_at = now
+                            if retrying:
+                                self._restart_count += 1
+                                self._current = None
+                                self._mode = None
+                                self._line = self._total_lines = 0
+                                self._frequency_offset_hz = None
+                                self._holding_signal = False
+                                self._receive_seconds_remaining = None
+                            self._recovery_requested.clear()
+                            consumer = Thread(target=self._run, name="sstv-decoder", daemon=True)
+                            self._consumer_thread = consumer
+                        if retrying:
+                            self._publish_debug("warn", f"Restarting SSTV consumer (attempt {self._restart_count}): "
+                                                f"{self._recovery_reason}. Queued audio and recordings retained.")
+                        consumer.start()
+                        interrupted = None
+                        healthy_since = None
+                else:
+                    reason = self._watchdog_reason(now)
+                    if reason and not self._recovery_requested.is_set():
+                        with self._lock:
+                            self._recovery_reason = reason
+                            self._health = "recovering"
+                        self._recovery_requested.set()
+                        self._wake.set()
+                        retry_at = now + retry_delay
+                        retry_delay = min(_RETRY_MAX_S, retry_delay * 2)
+                        LOGGER.error("SSTV watchdog: %s", reason)
+                        self._publish_debug("error", f"Watchdog: {reason}; recovering automatically.")
+                        self._publish_status()
+                    if self._recovery_requested.is_set():
+                        interrupted = self._interrupt_worker(interrupted)
+                    elif not self._stop.is_set():
+                        with self._lock:
+                            if not self._radio_connected:
+                                health = "waiting"
+                            elif (self._worker_progress_at is not None
+                                  and now - self._worker_progress_at < _WORKER_STALL_S
+                                  and (self._worker_pending_since is not None or self._write_started_at is not None
+                                       or self._last_packet_at is not None and now - self._last_packet_at < 3.0)):
+                                health = "healthy"
+                            elif (self._worker_ready and self._worker_pending_since is None
+                                  and self._write_started_at is None):
+                                health = "waiting"
+                            else:
+                                health = "starting"
+                            changed = self._health != health
+                            self._health = health
+                        if changed:
+                            self._publish_status()
+                        if health == "healthy":
+                            if healthy_since is None:
+                                healthy_since = now
+                            elif now - healthy_since >= 60.0:
+                                retry_delay = 1.0
+                        else:
+                            healthy_since = None
+                self._supervisor_wake.wait(_WATCHDOG_INTERVAL_S)
+                self._supervisor_wake.clear()
+        finally:
+            self._consumer_thread = None
+            if self._audio_controller is not None and self._audio_queue is not None:
+                self._audio_controller.unsubscribe_audio(self._audio_queue)
+            self._audio_controller = self._audio_queue = None
+            self._audio_capture.close()
 
     def subscribe(self) -> Queue[dict[str, Any]]:
         subscriber: Queue[dict[str, Any]] = Queue(maxsize=1024)
@@ -640,10 +841,12 @@ class SstvManager:
 
     def _feed_audio_packets(self, packets: list[bytes], sample_rate: int, channels: int) -> int:
         wrote_samples = 0
+        self._pending_packets.extend(packets)
         with self._lock:
             self._pending_batch_samples = sum(max(0, len(packet) - 24) // (2 * channels)
-                                              for packet in packets)
-        for packet in packets:
+                                              for packet in self._pending_packets)
+        while self._pending_packets and not self._recovery_requested.is_set():
+            packet = self._pending_packets.popleft()
             pcm = self.extract_rx_pcm(packet, channels)
             if not pcm:
                 self._publish_debug("warn", "Rejected a malformed SSTV audio packet.")
@@ -662,6 +865,7 @@ class SstvManager:
                 factor = 10.0 ** (gain / 20.0)
                 clipped = sum(not -32768 <= int(value * factor) <= 32767 for value in values)
             with self._lock:
+                self._last_packet_at = monotonic()
                 self._input_level_dbfs = input_level
                 self._decoder_peak = max(peak, int(self._decoder_peak * 0.9))
                 self._clipped_samples += clipped
@@ -682,26 +886,27 @@ class SstvManager:
             if self._write_pcm(stream):
                 self._capture_decoder_pcm(stream, sample_rate)
                 wrote_samples += len(stream) // 2
+                with self._lock:
+                    self._input_samples += len(stream) // 2
+                    self._last_audio_at = monotonic()
             with self._lock:
                 self._pending_batch_samples -= len(pcm) // 2
+                failed = self._fatal_worker
+            if failed:
+                break
             capture_error = self._audio_capture.status()["error"]
             if capture_error and capture_error != self._reported_capture_error:
                 self._reported_capture_error = capture_error
                 self._publish_debug("error", capture_error)
                 self._publish_status()
-        with self._lock:
-            self._pending_batch_samples = 0
-            self._input_samples += wrote_samples
-            if wrote_samples:
-                self._last_audio_at = monotonic()
         return wrote_samples
 
     def _run(self) -> None:
         LOGGER.info("SSTV RX audio consumer thread started")
-        controller = None
-        audio_queue = None
-        sample_rate = None
-        channels = 0
+        controller = self._audio_controller
+        audio_queue = self._audio_queue
+        sample_rate = self._input_sample_rate or None
+        channels = (2 if controller.config.rx_codec == "lpcm16_stereo" else 1) if controller else 0
         connected = False
         reported_connection: bool | None = None
         debug_window_started = monotonic()
@@ -710,7 +915,9 @@ class SstvManager:
         debug_queue_drops = 0
         last_input_rms_dbfs: float | None = None
         try:
-            while not self._stop.is_set():
+            while not self._stop.is_set() and not self._recovery_requested.is_set():
+                with self._lock:
+                    self._consumer_progress_at = monotonic()
                 next_controller = self.get_controller()
                 if next_controller is not controller:
                     if controller is not None and audio_queue is not None:
@@ -724,6 +931,13 @@ class SstvManager:
                     with self._lock:
                         self._last_audio_at = None
                         self._last_packet_sequence = None
+                        self._pending_packets.clear()
+                        self._pending_batch_samples = 0
+                        self._audio_controller = None
+                        self._audio_queue = None
+                        self._radio_connected = False
+                        self._radio_audio_at = None
+                        self._radio_audio_count = None
                     if controller is not None:
                         sample_rate = int(controller.config.sample_rate)
                         channels = 2 if controller.config.rx_codec == "lpcm16_stereo" else 1
@@ -758,6 +972,12 @@ class SstvManager:
                         if radio is not None:
                             connected = bool(radio.get("connected"))
                             with self._lock:
+                                self._radio_connected = connected
+                                count = radio.get("rx_audio_packets")
+                                if isinstance(count, int) and count != self._radio_audio_count:
+                                    if self._radio_audio_count is not None:
+                                        self._radio_audio_at = monotonic()
+                                    self._radio_audio_count = count
                                 self._radio_audio_diagnostics = {
                                     key: value for key, value in radio.items()
                                     if key.startswith("rx_audio_")
@@ -789,7 +1009,7 @@ class SstvManager:
                         self._wake.clear()
                         continue
                 packets = controller.read_audio(audio_queue) if connected and audio_queue is not None else []
-                if packets:
+                if packets or self._pending_packets:
                     debug_packets += len(packets)
                     wrote_samples = self._feed_audio_packets(packets, int(sample_rate), channels)
                     last_input_rms_dbfs = self._input_level_dbfs
@@ -878,14 +1098,24 @@ class SstvManager:
             LOGGER.exception("SSTV audio consumer failed")
             self._set_failure(str(exc), fatal=True)
         finally:
-            if controller is not None and audio_queue is not None:
-                controller.unsubscribe_audio(audio_queue)
-                self._feed_audio_packets(controller.read_audio(audio_queue), int(sample_rate), channels)
-            with self._lock:
-                self._audio_queue = None
-                self._audio_controller = None
-            self._terminate_worker(drain=self._stop.is_set() and not self._fatal_worker)
-            self._audio_capture.close()
+            try:
+                if self._stop.is_set() and controller is not None and audio_queue is not None:
+                    controller.unsubscribe_audio(audio_queue)
+                    if not self._fatal_worker and not self._recovery_requested.is_set():
+                        self._feed_audio_packets(controller.read_audio(audio_queue), int(sample_rate), channels)
+                # A stale subscription must be replaced; ordinary worker failures
+                # keep the subscription and unattempted packets for the retry.
+                if (self._recovery_requested.is_set() and self._recovery_reason
+                        == "SSTV subscription stopped receiving the radio audio stream"):
+                    if controller is not None and audio_queue is not None:
+                        controller.unsubscribe_audio(audio_queue)
+                    with self._lock:
+                        self._audio_queue = self._audio_controller = None
+            finally:
+                self._terminate_worker(drain=self._stop.is_set() and not self._fatal_worker
+                                       and not self._recovery_requested.is_set())
+                if self._thread is None:
+                    self._audio_capture.close()
 
     def _decoder_command(self, sample_rate: int) -> list[str]:
         override = os.environ.get("PI_SAT_SSTV_DECODER")
@@ -896,7 +1126,7 @@ class SstvManager:
 
     def _ensure_worker(self, sample_rate: int) -> bool:
         with self._lock:
-            if self._fatal_worker:
+            if self._fatal_worker or self._recovery_requested.is_set():
                 return False
         with self._process_lock:
             exited = self._process is not None and self._process.poll() is not None
@@ -922,6 +1152,15 @@ class SstvManager:
             reader_done = self._reader_done
             self._last_worker_error = None
             self._fatal_worker = False
+            with self._lock:
+                self._worker_started_at = monotonic()
+                self._worker_closing_at = None
+                self._worker_ready = False
+                self._worker_input_samples = 0
+                self._worker_sample_position = 0
+                self._worker_progress_at = None
+                self._worker_pending_since = None
+                self._write_started_at = None
         LOGGER.info("SSTVFlow worker started (%d Hz)", sample_rate)
         self._publish_debug("info", f"SSTVFlow worker started, input rate {sample_rate} Hz.")
         Thread(target=self._read_worker_events, args=(process, generation, reader_done),
@@ -932,8 +1171,14 @@ class SstvManager:
 
     def _write_pcm(self, pcm: bytes) -> bool:
         for start in range(0, len(pcm), MAX_FRAME_BYTES):
-            if not self._write_frame(frame_pcm(pcm[start:start + MAX_FRAME_BYTES])):
+            chunk = pcm[start:start + MAX_FRAME_BYTES]
+            if not self._write_frame(frame_pcm(chunk)):
                 return False
+            with self._lock:
+                self._worker_input_samples += len(chunk) // 2
+                if (self._worker_pending_since is None and self._input_sample_rate
+                        and self._worker_input_samples - self._worker_sample_position >= self._input_sample_rate):
+                    self._worker_pending_since = monotonic()
         return True
 
     def _write_frame(self, frame: bytes) -> bool:
@@ -945,6 +1190,8 @@ class SstvManager:
                         or process.poll() is not None):
                     return False
             try:
+                with self._lock:
+                    self._write_started_at = monotonic()
                 remaining = memoryview(frame)
                 while remaining:
                     written = process.stdin.write(remaining)
@@ -959,6 +1206,9 @@ class SstvManager:
                 if active and not self._stop.is_set():
                     self._set_failure(f"SSTVFlow worker input failed: {exc}", fatal=True)
                 return False
+            finally:
+                with self._lock:
+                    self._write_started_at = None
 
     def _terminate_worker(self, *, drain: bool = False) -> None:
         with self._termination_lock:
@@ -967,6 +1217,8 @@ class SstvManager:
                 if process is None:
                     return
                 self._closing_process = process
+                with self._lock:
+                    self._worker_closing_at = monotonic()
                 reader_done = self._reader_done
             graceful = self._write_lock.acquire(timeout=0.5)
             if graceful:
@@ -1005,6 +1257,12 @@ class SstvManager:
                 if self._process is process:
                     self._process = None
                     self._process_generation += 1
+                    with self._lock:
+                        self._worker_started_at = None
+                        self._worker_closing_at = None
+                        self._worker_ready = False
+                        self._worker_progress_at = None
+                        self._worker_pending_since = None
                 self._closing_process = None
 
     def _read_worker_events(self, process: subprocess.Popen[bytes], generation: int, reader_done: Event | None = None) -> None:
@@ -1024,24 +1282,44 @@ class SstvManager:
                         raise ValueError("worker event is not an object")
                     event = adapter.adapt(event)
                     if event is not None:
+                        with self._process_lock:
+                            if generation != self._process_generation or process is not self._process:
+                                return
+                            self._record_worker_progress(event)
                         self._handle_worker_event(event)
                 except Exception as exc:
                     LOGGER.warning("Ignored invalid SSTVFlow worker event: %s", exc)
                     self._set_failure(f"SSTVFlow event handling failed: {exc}", fatal=False)
         finally:
             process.stdout.close()
-            if reader_done is not None:
-                reader_done.set()
             with self._process_lock:
                 active = generation == self._process_generation and process is self._process
-            if active and process is not self._closing_process and not self._stop.is_set():
-                exit_code = process.poll()
-                with self._lock:
-                    worker_error = self._last_worker_error
-                message = f"SSTVFlow worker exited unexpectedly (code {exit_code})"
-                if worker_error:
-                    message = f"{message}: {worker_error}"
-                self._set_failure(message, fatal=True)
+                if active and process is not self._closing_process and not self._stop.is_set():
+                    exit_code = process.poll()
+                    with self._lock:
+                        worker_error = self._last_worker_error
+                    message = f"SSTVFlow worker exited unexpectedly (code {exit_code})"
+                    if worker_error:
+                        message = f"{message}: {worker_error}"
+                    self._set_failure(message, fatal=True)
+            if reader_done is not None:
+                reader_done.set()
+
+    def _record_worker_progress(self, event: dict[str, Any]) -> None:
+        with self._lock:
+            if event.get("type") == "ready":
+                self._worker_ready = True
+            position = event.get("sample_position")
+            if (event.get("type") not in {"quality", "status"} or type(position) is not int
+                    or position <= self._worker_sample_position):
+                return
+            self._worker_sample_position = position
+            self._worker_progress_at = monotonic()
+            self._worker_pending_since = (
+                self._worker_progress_at if self._input_sample_rate
+                and self._worker_input_samples - position >= self._input_sample_rate else None)
+            if not self._recovery_requested.is_set():
+                self._health = "healthy"
 
     def _read_worker_errors(self, process: subprocess.Popen[bytes], generation: int) -> None:
         if process.stderr is None:

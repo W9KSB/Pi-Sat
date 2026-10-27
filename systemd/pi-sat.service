@@ -9,6 +9,7 @@ ExecStart=/usr/bin/python3 -m pi_sat_controller.backend.run_server
 Restart=on-failure
 RestartSec=5
 User=REPLACE_WITH_INSTALL_USER
+SupplementaryGroups=systemd-journal
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 

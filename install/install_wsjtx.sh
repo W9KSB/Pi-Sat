@@ -6,12 +6,12 @@ if [ "$(id -u)" -eq 0 ]; then
   exit 1
 fi
 if ! command -v apt-get >/dev/null 2>&1; then
-  echo "Install stock WSJT-X, pulseaudio-utils, Xvfb, libx11-6, libxtst6, at-spi2-core, and dbus with your distribution's package manager."
+  echo "Install stock WSJT-X, pulseaudio-utils, Xvfb, x11-utils, libx11-6, libxtst6, at-spi2-core, and dbus with your distribution's package manager."
   exit 1
 fi
 
 sudo apt-get update
-sudo apt-get install -y --no-remove wsjtx pulseaudio-utils xvfb libx11-6 libxtst6 at-spi2-core dbus
+sudo apt-get install -y --no-remove wsjtx pulseaudio-utils xvfb x11-utils libx11-6 libxtst6 at-spi2-core dbus
 
 if pactl info >/dev/null 2>&1; then
   echo "WSJT-X dependencies are installed and this user can reach the audio server."

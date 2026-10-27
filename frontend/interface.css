@@ -166,6 +166,8 @@ a { color: var(--station-blue); text-underline-offset: 3px; }
 #monitor-page .monitor-controls > label:has(input:checked) { background: #204c3f; border-color: #57967f; color: #a8f2d0; }
 #monitor-page .monitor-controls input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; margin: 0; cursor: pointer; }
 #monitor-page .monitor-controls label:focus-within { outline: 2px solid var(--station-blue); outline-offset: 3px; }
+#monitor-page .monitor-controls-debug > label { padding: 6px 9px; }
+#monitor-page .monitor-filter-toolbar { margin-bottom: 2px; }
 #monitor-page .log-list { max-height: 520px; }
 .station-icon-definitions { position: absolute; width: 0; height: 0; overflow: hidden; }
 .station-shell svg { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }

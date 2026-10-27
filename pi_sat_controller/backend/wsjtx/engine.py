@@ -19,14 +19,19 @@ from typing import Any
 from .audio_rx import WsjtxRxAudioBridge
 from .audio_tx import WsjtxTxAudioBridge
 from .control import WsjtxControl, WsjtxControlCancelled
+from .display import set_root_property
 from .rx_doppler import WsjtxRxDoppler
 from .spectrum import WsjtxAudioSpectrum
 
 LOGGER = logging.getLogger(__name__)
 
 _DECODE_DEPTH_VALUES = {"fast": 1, "normal": 2, "deep": 3}
+_TX_PREFLIGHT_SECONDS = 30.0
+_TX_PREFLIGHT_INITIAL_DELAY_SECONDS = 2.0
+_TX_PREFLIGHT_RETRY_SECONDS = 1.0
 _RECOVERABLE_TX_FAULTS = frozenset({
     "capture_backlog", "capture_stall", "capture_closed", "capture_exit",
+    "operator_stop",
 })
 _TX_LOCKOUT_FAULTS = frozenset({
     "control", "format", "transport",
@@ -68,6 +73,8 @@ class WsjtxEngine:
         self._log_file = None
         self._environment: dict[str, str] | None = None
         self._pulse_detail = ""
+        self._tx_control_ready = False
+        self._tx_control_detail = ""
         self._started_at = 0.0
         self._generation = 0
         self._mode = "FT8"
@@ -181,7 +188,7 @@ class WsjtxEngine:
             if ((current is not None and current["sequence"] >= fault["sequence"])
                     or (seen is not None and fault["sequence"] <= seen)):
                 return
-            # An eligible capture fault remains provisionally recoverable until
+            # An eligible TX interruption remains provisionally recoverable until
             # containment has safely halted stock transmit and released PTT.
             # The QSO retains its in-flight context until that verdict is known.
             candidate = fault["category"] in _RECOVERABLE_TX_FAULTS
@@ -285,6 +292,9 @@ class WsjtxEngine:
                     self._pending_tx = None
                     self._state = "running"
                     self._detail = (
+                        "WSJT-X transmit stopped by the operator; receive remains active. "
+                        "Select Resume TX to transmit again."
+                        if fault["category"] == "operator_stop" else
                         f"WSJT-X transmit aborted ({fault['category']}); receive remains active. "
                         + (
                             "Explicit capture recovery is required before re-arming."
@@ -468,7 +478,16 @@ class WsjtxEngine:
                 self._tx_epoch += 1
                 epoch = self._tx_epoch
                 self._pending_tx = None
-            self._configure_tx_epoch(epoch, message, offset_hz, tx_even)
+            try:
+                self._configure_tx_epoch(epoch, message, offset_hz, tx_even)
+            except Exception as error:
+                with self._state_lock:
+                    self._tx_control_ready = False
+                    self._tx_control_detail = str(error)
+                raise
+            with self._state_lock:
+                self._tx_control_ready = True
+                self._tx_control_detail = ""
 
     def set_tx_enabled(
         self, enabled: bool, *, cancelled: Callable[[], bool] | None = None,
@@ -496,7 +515,13 @@ class WsjtxEngine:
                 if superseded():
                     raise WsjtxControlCancelled("Transmit request was superseded")
                 self._arm_stock(epoch, cancelled)
-            except Exception:
+                with self._state_lock:
+                    self._tx_control_ready = True
+                    self._tx_control_detail = ""
+            except Exception as error:
+                with self._state_lock:
+                    self._tx_control_ready = False
+                    self._tx_control_detail = str(error)
                 self._tx_audio.set_enabled(False)
                 raise
 
@@ -658,6 +683,50 @@ class WsjtxEngine:
         self._environment["DBUS_SESSION_BUS_ADDRESS"] = value
         self._environment.pop("AT_SPI_BUS_ADDRESS", None)
 
+    def _start_accessibility_bus(self) -> None:
+        if self._environment is None or not self._display:
+            raise RuntimeError("The managed private control session is unavailable")
+        command = self._executable("dbus-send")
+        result = subprocess.run(
+            [command, "--session", "--print-reply", "--dest=org.a11y.Bus",
+             "/org/a11y/bus", "org.a11y.Bus.GetAddress"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=5, check=False, env=self._environment,
+        )
+        if result.returncode:
+            detail = result.stderr.strip()[:300] or f"exit code {result.returncode}"
+            raise RuntimeError(f"Linux accessibility bus startup failed: {detail}")
+        match = re.search(r'string "(unix:(?:path|abstract)=[^"]+)"', result.stdout)
+        if not match:
+            raise RuntimeError("Linux accessibility bus did not return a local address")
+        address = match.group(1)
+        self._environment["AT_SPI_BUS_ADDRESS"] = address
+        xlib_published = set_root_property(self._display, "AT_SPI_BUS", address)
+        environment = {**self._environment, "DISPLAY": self._display}
+        command = shutil.which("xprop")
+        if command is None:
+            if xlib_published:
+                return
+            raise RuntimeError("The private accessibility X root property could not be published")
+        set_result = subprocess.run(
+            [command, "-root", "-f", "AT_SPI_BUS", "8s",
+             "-set", "AT_SPI_BUS", address],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=5, check=False, env=environment,
+        )
+        if set_result.returncode:
+            detail = set_result.stderr.strip()[:300] or f"exit code {set_result.returncode}"
+            raise RuntimeError(f"Could not publish the private accessibility bus address: {detail}")
+        result = subprocess.run(
+            [command, "-root", "AT_SPI_BUS"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=5, check=False, env=environment,
+        )
+        if result.returncode or address not in result.stdout:
+            detail = result.stderr.strip()[:300] or "property readback did not match"
+            raise RuntimeError(f"Could not publish the private accessibility bus address: {detail}")
+        LOGGER.info("Managed WSJT-X accessibility bus published on the private X root.")
+
     def _settings(self) -> tuple[str, str, str, int, str, str]:
         settings = self._get_settings()
         executable = settings.get("executable", "wsjtx")
@@ -737,8 +806,11 @@ class WsjtxEngine:
     def _start_display(self, executable: str) -> None:
         read_fd, write_fd = os.pipe()
         try:
+            # Root properties must survive gaps while setup clients disconnect
+            # before WSJT-X opens its long-lived X connection.
             self._display_process = subprocess.Popen(
-                [executable, "-displayfd", str(write_fd), "-screen", "0", "1280x800x24", "-nolisten", "tcp"],
+                [executable, "-noreset", "-displayfd", str(write_fd),
+                 "-screen", "0", "1280x800x24", "-nolisten", "tcp"],
                 stdin=subprocess.DEVNULL, stdout=self._log_file, stderr=self._log_file,
                 pass_fds=(write_fd,), start_new_session=True,
                 env=self._environment,
@@ -810,6 +882,8 @@ class WsjtxEngine:
             self._log_file.close()
             self._log_file = None
         self._display = ""
+        self._tx_control_ready = False
+        self._tx_control_detail = ""
         self.spectrum.reset()
         self._spectrum_failed = False
         self._rx_doppler.reset("Managed receive engine stopped")
@@ -889,6 +963,8 @@ class WsjtxEngine:
             "audio": {**self._audio.snapshot(), "doppler": self._rx_doppler.snapshot()},
             "tx": {**tx, "available": self._tx_available(), "connected": stock.get("connected", False),
                    "offset_hz": stock.get("tx_df_hz", 1500), "mode": mode,
+                   "control_ready": self._tx_control_ready,
+                   "control_detail": self._tx_control_detail,
                    "generation": generation,
                    "client_key": stock.get("client_key") or fault_client_key,
                    "stock_transmitting": stock.get("transmitting", False),
@@ -948,8 +1024,15 @@ class WsjtxEngine:
                 self._tx_module_id = tx_module
                 self._write_profile(callsign, grid, port, mode, decode_depth)
                 self._log_file = (self._root / "engine.log").open("ab")
+                self._tx_control_ready = False
+                self._tx_control_detail = ""
                 self._start_bus()
                 self._start_display(xvfb)
+                try:
+                    self._start_accessibility_bus()
+                except Exception as error:
+                    self._tx_control_detail = str(error)
+                    LOGGER.warning("Managed WSJT-X accessibility startup failed: %s", error)
                 env = self._environment.copy()
                 env.update({
                     "DISPLAY": self._display, "XDG_CONFIG_HOME": str(self._root / "config"),
@@ -971,9 +1054,31 @@ class WsjtxEngine:
                 controller = self._get_controller()
                 sample_rate = int(controller.config.sample_rate) if controller is not None else 48000
                 self._tx_audio.start(sample_rate)
+                preflight = getattr(self._control, "preflight", None)
+                self._tx_control_ready = (
+                    not callable(preflight) and not bool(self._tx_control_detail)
+                )
                 self._state = "running"
-                self._detail = "Stock WSJT-X is running in receive mode; waiting for native radio audio and UDP status."
                 self._monitor_stop = threading.Event()
+                if self._tx_control_detail:
+                    self._detail = (
+                        "Stock WSJT-X is running in receive mode; transmit is unavailable: "
+                        + self._tx_control_detail
+                    )
+                elif callable(preflight):
+                    self._detail = (
+                        "Stock WSJT-X is running in receive mode; "
+                        "checking transmit controls."
+                    )
+                    threading.Thread(
+                        target=self._preflight_tx_controls, args=(self._monitor_stop,),
+                        name="wsjtx-tx-preflight", daemon=True,
+                    ).start()
+                else:
+                    self._detail = (
+                        "Stock WSJT-X is running in receive mode; "
+                        "waiting for native radio audio and UDP status."
+                    )
                 threading.Thread(target=self._monitor, args=(self._monitor_stop,), name="wsjtx-engine", daemon=True).start()
             except Exception as error:
                 failures = self._cleanup()
@@ -991,6 +1096,53 @@ class WsjtxEngine:
         except Exception as error:
             self._spectrum_failed = True
             LOGGER.warning("Receive visualization disabled; decoder audio continues: %s", error)
+
+    def _preflight_tx_controls(self, stop: threading.Event) -> None:
+        deadline = time.monotonic() + _TX_PREFLIGHT_SECONDS
+        last_error = "WSJT-X transmit controls are not ready"
+        if stop.wait(_TX_PREFLIGHT_INITIAL_DELAY_SECONDS):
+            return
+        first_attempt = True
+        while not stop.is_set():
+            if not first_attempt and time.monotonic() >= deadline:
+                break
+            first_attempt = False
+            with self._state_lock:
+                process = self._process
+            if process is None or process.poll() is not None:
+                return
+            try:
+                self._control.preflight()
+            except Exception as error:
+                last_error = str(error) or error.__class__.__name__
+                LOGGER.debug("Managed WSJT-X transmit controls not ready: %s", error)
+            else:
+                if stop.is_set():
+                    return
+                with self._state_lock:
+                    self._tx_control_ready = True
+                    self._tx_control_detail = ""
+                    self._detail = (
+                        "Stock WSJT-X is running in receive mode; "
+                        "waiting for native radio audio and UDP status."
+                    )
+                LOGGER.info("Managed WSJT-X transmit controls verified.")
+                return
+            if stop.wait(_TX_PREFLIGHT_RETRY_SECONDS):
+                return
+        if stop.is_set():
+            return
+        with self._state_lock:
+            self._tx_control_ready = False
+            self._tx_control_detail = (
+                "WSJT-X transmit controls could not be preverified: " + last_error
+            )
+            self._detail = (
+                "Stock WSJT-X is running in receive mode; transmit will re-check controls "
+                "when requested. Preflight detail: "
+                + self._tx_control_detail
+            )
+        LOGGER.warning("Managed WSJT-X transmit preflight did not confirm controls: %s", last_error)
 
     def _monitor(self, stop: threading.Event) -> None:
         while not stop.wait(0.25):

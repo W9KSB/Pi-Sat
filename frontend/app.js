@@ -65,10 +65,29 @@ let activeModuleName = MODULE_NAV[0].id;
 let activeSettingsSection = SETTINGS_NAV[0].id;
 let activePrimaryPageName = '';
 const MAP_REFRESH_TIMEOUT_MS = 5000;
-const MONITOR_GENERAL_DEBUG_STORAGE_KEY = 'pi-sat.monitor.general-debug';
-const MONITOR_MODULE_DEBUG_STORAGE_KEYS = {
+const MONITOR_LOG_LIMIT = 1000;
+const MONITOR_FILTER_STORAGE_KEYS = {
+  general: 'pi-sat.monitor.general-debug',
   wsjtx: 'pi-sat.monitor.wsjtx-debug',
   sstv: 'pi-sat.monitor.sstv-debug',
+  aprs: 'pi-sat.monitor.filter.aprs',
+  rx: 'pi-sat.monitor.filter.rx',
+  tx: 'pi-sat.monitor.filter.tx',
+  rotator: 'pi-sat.monitor.filter.rotator',
+  icom: 'pi-sat.monitor.filter.icom',
+  system: 'pi-sat.monitor.filter.system',
+};
+const MONITOR_FILTER_KINDS = Object.keys(MONITOR_FILTER_STORAGE_KEYS);
+const MONITOR_FILTER_LABELS = {
+  general: 'PI-SAT',
+  wsjtx: 'FT4/FT8',
+  sstv: 'SSTV',
+  aprs: 'APRS',
+  rx: 'RX',
+  tx: 'TX',
+  rotator: 'ROTATOR',
+  icom: 'ICOM',
+  system: 'SYSTEM',
 };
 const DASHBOARD_MOBILE_MAX_WIDTH = 1100;
 const NATIVE_ICOM_DEVICE_ID = 'native-ic9700';
@@ -227,11 +246,17 @@ function renderLogs() {
   }
   list.replaceChildren();
   const filters = getMonitorLogFilters();
-  const entries = [...backendLogMessages, ...frontendLogMessages,
+  const loadedEntries = [...backendLogMessages, ...frontendLogMessages,
     ...moduleMonitorLogMessages.wsjtx, ...moduleMonitorLogMessages.sstv]
-    .sort((left, right) => (right.timestampMs || 0) - (left.timestampMs || 0))
-    .filter((entry) => shouldDisplayLogEntry(entry, filters))
-    .slice(0, 100);
+    .sort((left, right) => (right.timestampMs || 0) - (left.timestampMs || 0));
+  const matchingEntries = loadedEntries
+    .filter((entry) => shouldDisplayLogEntry(entry, filters));
+  const entries = matchingEntries.slice(0, MONITOR_LOG_LIMIT);
+  syncMonitorFilterSummary();
+  const count = document.getElementById('monitor-log-count');
+  if (count) {
+    count.textContent = `(${entries.length} shown of ${loadedEntries.length} loaded)`;
+  }
   entries.forEach((entry) => {
     const category = classifyLogEntry(entry);
     const item = document.createElement('div');
@@ -245,100 +270,115 @@ function renderLogs() {
     item.append(time, message);
     list.appendChild(item);
   });
-  renderIcomLogs();
-}
-
-function renderIcomLogs() {
-  const list = document.getElementById('icom-log-list');
-  if (!list) return;
-  list.replaceChildren();
-  const entries = [...backendLogMessages, ...frontendLogMessages]
-    .filter((entry) => String(entry.source || '').includes('.radio.icom_') || String(entry.message || '').includes('icom_debug'))
-    .sort((left, right) => (right.timestampMs || 0) - (left.timestampMs || 0))
-    .slice(0, 100);
   if (!entries.length) {
     const empty = document.createElement('div');
-    empty.className = 'text-body-secondary small';
-    empty.textContent = 'No native Icom entries yet.';
+    empty.className = 'log-list-empty';
+    empty.textContent = 'No log entries match the enabled filters.';
     list.appendChild(empty);
-    return;
   }
-  entries.forEach((entry) => {
-    const item = document.createElement('div');
-    item.className = 'log-item';
-    const time = document.createElement('span');
-    time.className = 'log-time';
-    time.textContent = formatLogTime(entry.timestampMs);
-    const message = document.createElement('span');
-    message.className = 'log-message-general';
-    message.textContent = formatLogMessage(entry);
-    item.append(time, message);
-    list.appendChild(item);
-  });
 }
 
 function getMonitorLogFilters() {
-  return {
-    general: document.getElementById('monitor-general-debug')?.checked ?? true,
-    wsjtx: document.getElementById('monitor-wsjtx-debug')?.checked ?? false,
-    sstv: document.getElementById('monitor-sstv-debug')?.checked ?? false,
-  };
+  return Object.fromEntries(MONITOR_FILTER_KINDS.map((kind) => [
+    kind,
+    document.getElementById(`monitor-${kind}-filter`)?.checked ?? false,
+  ]));
+}
+
+function monitorFilterInputs() {
+  return MONITOR_FILTER_KINDS
+    .map((kind) => document.getElementById(`monitor-${kind}-filter`))
+    .filter(Boolean);
+}
+
+function persistMonitorFilterPreference(kind) {
+  try {
+    const toggle = document.getElementById(`monitor-${kind}-filter`);
+    if (toggle) {
+      window.localStorage.setItem(
+        MONITOR_FILTER_STORAGE_KEYS[kind],
+        toggle.checked ? 'true' : 'false',
+      );
+    }
+  } catch (error) {
+    // Display filtering still works when browser storage is unavailable.
+  }
+}
+
+function setAllMonitorFilters(enabled) {
+  MONITOR_FILTER_KINDS.forEach((kind) => {
+    const toggle = document.getElementById(`monitor-${kind}-filter`);
+    if (toggle) toggle.checked = enabled;
+    persistMonitorFilterPreference(kind);
+  });
+  renderLogs();
+}
+
+function toggleAllMonitorFilters() {
+  const inputs = monitorFilterInputs();
+  setAllMonitorFilters(!inputs.every((toggle) => toggle.checked));
+}
+
+function syncMonitorFilterSummary() {
+  const inputs = monitorFilterInputs();
+  const activeCount = inputs.filter((toggle) => toggle.checked).length;
+  const summary = document.getElementById('monitor-filter-summary');
+  if (summary) {
+    summary.textContent = `${activeCount} of ${MONITOR_FILTER_KINDS.length} filters active`;
+  }
+  const allButton = document.getElementById('monitor-all-logs-filter');
+  if (allButton) {
+    allButton.setAttribute(
+      'aria-pressed',
+      activeCount === MONITOR_FILTER_KINDS.length ? 'true' : 'false',
+    );
+  }
 }
 
 function loadMonitorPreferences() {
   try {
-    const preferences = {
-      general: MONITOR_GENERAL_DEBUG_STORAGE_KEY,
-      ...MONITOR_MODULE_DEBUG_STORAGE_KEYS,
-    };
-    Object.entries(preferences).forEach(([kind, storageKey]) => {
+    Object.entries(MONITOR_FILTER_STORAGE_KEYS).forEach(([kind, storageKey]) => {
       const stored = window.localStorage.getItem(storageKey);
-      const toggle = document.getElementById(`monitor-${kind}-debug`);
+      const toggle = document.getElementById(`monitor-${kind}-filter`);
       if (stored !== null && toggle) toggle.checked = stored === 'true';
     });
   } catch (error) {
     // Ignore local storage failures and keep defaults.
   }
-}
-
-function persistGeneralMonitorDebugPreference() {
-  try {
-    const toggle = document.getElementById('monitor-general-debug');
-    if (!toggle) {
-      return;
-    }
-    window.localStorage.setItem(
-      MONITOR_GENERAL_DEBUG_STORAGE_KEY,
-      toggle.checked ? 'true' : 'false',
-    );
-  } catch (error) {
-    // Ignore local storage failures and keep in-memory UI behavior.
-  }
+  syncMonitorFilterSummary();
 }
 
 function classifyLogEntry(entry) {
   const message = String(entry?.message || '').toLowerCase();
   const source = String(entry?.source || '').toLowerCase();
+  const unit = String(entry?.unit || '').toLowerCase();
+  const userUnit = String(entry?.userUnit || '').toLowerCase();
+  const identifier = String(entry?.identifier || '').toLowerCase();
+  const command = String(entry?.comm || '').toLowerCase();
+  const text = `${message} ${source} ${unit} ${userUnit} ${identifier} ${command}`;
   if (source === 'module.wsjtx' || source.includes('.wsjtx.')) return 'wsjtx';
   if (source === 'module.sstv' || source.includes('.sstv.')) return 'sstv';
-  if (message.includes('role=rotator') || message.includes('rotator') || message.includes('rotctld')) {
-    return 'rotator';
+  if (text.includes('wsjtx') || text.includes('wsjt-x')) return 'wsjtx';
+  if (text.includes('sstv')) return 'sstv';
+  if (text.includes('aprs') || command.includes('direwolf')) return 'aprs';
+  if (text.includes('icom')) return 'icom';
+  if (text.includes('rotator') || text.includes('rotctld')) return 'rotator';
+  if (text.includes('role=rx') || message.startsWith('rx ') || message.includes('rx polling') || source.includes('polling_sdr')) return 'rx';
+  if (text.includes('role=tx') || message.startsWith('tx ') || message.includes('tx polling')) return 'tx';
+  if (
+    text.includes('pi_sat_controller')
+    || text.includes('pi-sat')
+    || source === 'backend'
+    || source === 'ui'
+  ) {
+    return 'general';
   }
-  if (message.includes('role=tx') || message.includes(' tx ') || message.startsWith('tx ') || message.includes('tx polling')) {
-    return 'tx';
-  }
-  if (message.includes('role=rx') || message.includes('rx ') || message.startsWith('rx ') || source.includes('polling_sdr')) {
-    return 'rx';
-  }
-  return 'general';
+  return 'system';
 }
 
 function shouldDisplayLogEntry(entry, filters) {
   const category = classifyLogEntry(entry);
-  if (['general', 'wsjtx', 'sstv'].includes(category)) {
-    return Boolean(filters[category]);
-  }
-  return true;
+  return Boolean(filters[category]);
 }
 
 function formatLogTime(timestampMs) {
@@ -356,8 +396,12 @@ function formatLogTime(timestampMs) {
 function formatLogMessage(entry) {
   const level = entry.level ? `[${entry.level}] ` : '';
   const category = classifyLogEntry(entry);
-  const moduleLabel = category === 'wsjtx' ? '[FT4/FT8] ' : category === 'sstv' ? '[SSTV] ' : '';
-  return `${moduleLabel}${level}${entry.message || ''}`;
+  const label = MONITOR_FILTER_LABELS[category] || category.toUpperCase();
+  const source = String(entry.source || '');
+  const sourcePrefix = source && source !== 'ui' && !source.startsWith('module.')
+    ? `${entry.identifier || entry.unit || entry.userUnit || source}: `
+    : '';
+  return `[${label}] ${level}${sourcePrefix}${entry.message || ''}`;
 }
 
 async function fetchJson(url, fallback) {
@@ -431,8 +475,13 @@ function renderStandardPageHeaders() {
 }
 
 async function refreshMonitorLogs() {
-  const result = await fetchJson('/api/monitor/logs', null);
+  const result = await fetchJson(`/api/monitor/logs?limit=${MONITOR_LOG_LIMIT}`, null);
+  const status = document.getElementById('monitor-log-status');
   if (!result) {
+    if (status) {
+      status.textContent = 'The journal feed could not be reached.';
+      status.hidden = false;
+    }
     return;
   }
   backendLogMessages = Array.isArray(result.entries)
@@ -441,8 +490,18 @@ async function refreshMonitorLogs() {
       message: entry.message || '',
       level: entry.level || '',
       source: entry.source || 'backend',
+      identifier: entry.identifier || '',
+      unit: entry.unit || '',
+      userUnit: entry.user_unit || '',
+      comm: entry.comm || '',
+      cursor: entry.cursor || '',
+      pid: Number(entry.pid) || 0,
     }))
     : [];
+  if (status) {
+    status.textContent = String(result.warning || '').trim();
+    status.hidden = !status.textContent;
+  }
   renderLogs();
 }
 
@@ -6227,22 +6286,15 @@ document
 document
   .getElementById('auto-track-toggle')
   .addEventListener('change', updateAutotrackSetting);
-document
-  .getElementById('monitor-general-debug')
-  .addEventListener('change', () => {
-    persistGeneralMonitorDebugPreference();
-    renderLogs();
-  });
-Object.entries(MONITOR_MODULE_DEBUG_STORAGE_KEYS).forEach(([kind, storageKey]) => {
-  document.getElementById(`monitor-${kind}-debug`).addEventListener('change', event => {
-    try {
-      window.localStorage.setItem(storageKey, event.target.checked ? 'true' : 'false');
-    } catch (_) {
-      // Display filtering still works when browser storage is unavailable.
-    }
+MONITOR_FILTER_KINDS.forEach((kind) => {
+  document.getElementById(`monitor-${kind}-filter`).addEventListener('change', () => {
+    persistMonitorFilterPreference(kind);
     renderLogs();
   });
 });
+document
+  .getElementById('monitor-all-logs-filter')
+  .addEventListener('click', toggleAllMonitorFilters);
 loadMonitorPreferences();
 document
   .getElementById('monitor-rx-cat-debug')

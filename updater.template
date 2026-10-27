@@ -136,6 +136,7 @@ if ! command -v openssl >/dev/null 2>&1; then
 fi
 
 sudo usermod -aG dialout "$(id -un)"
+sudo usermod -aG systemd-journal "$(id -un)"
 
 if [ "${dependency_mode}" = "migrate" ]; then
   pi_sat_verify_environment "${VENV_PYTHON}"

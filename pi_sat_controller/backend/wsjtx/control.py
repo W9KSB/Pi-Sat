@@ -121,10 +121,11 @@ class WsjtxControl:
             time.sleep(0.02)
         raise RuntimeError("WSJT-X did not confirm the requested control state")
 
-    def _native_control(self, operation: str, value: bool | int) -> dict[str, Any]:
-        if operation not in ("options", "offset", "enabled"):
+    def _native_control(self, operation: str, value: bool | int | None = None) -> dict[str, Any]:
+        if operation not in ("inspect", "options", "offset", "enabled"):
             raise ValueError("Invalid managed native control")
-        self._require_client()
+        if operation != "inspect":
+            self._require_client()
         pid = self._get_pid()
         if type(pid) is not int or pid <= 0 or self._get_environment is None:
             raise RuntimeError("The managed private control session is unavailable")
@@ -132,15 +133,22 @@ class WsjtxControl:
         if not environment.get("DBUS_SESSION_BUS_ADDRESS", "").startswith(("unix:path=", "unix:abstract=")):
             raise RuntimeError("The managed private session bus is unavailable")
         # Native failures remain isolated from the long-running radio controller.
-        result = subprocess.run([sys.executable, "-m", "pi_sat_controller.backend.wsjtx.accessibility",
-                                 str(pid), operation, str(int(value))], capture_output=True,
-                                text=True, timeout=8, check=False, env=environment)
+        command = [sys.executable, "-m", "pi_sat_controller.backend.wsjtx.accessibility",
+                   str(pid), operation]
+        if operation != "inspect":
+            command.append(str(int(value)))
+        result = subprocess.run(command, capture_output=True, text=True, timeout=8,
+                                check=False, env=environment)
         if result.returncode:
             raise RuntimeError("Managed WSJT-X native control failed: " + result.stderr.strip()[:500])
         state = json.loads(result.stdout)
         if not isinstance(state, dict):
             raise RuntimeError("Managed WSJT-X native controls returned invalid state")
         return state
+
+    def preflight(self) -> dict[str, Any]:
+        """Verify the owned stock controls before TX can become available."""
+        return self._native_control("inspect")
 
     @staticmethod
     def _check_cancelled(cancelled: Callable[[], bool] | None) -> None:

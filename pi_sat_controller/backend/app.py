@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pi_sat_controller.backend.api_qso import register_qso_api
 from pi_sat_controller.backend.api_dashboard import register_dashboard_api
+from pi_sat_controller.backend.journal_logs import JournalLogReader
 from pi_sat_controller.backend.api_satellites import register_satellites_api
 from pi_sat_controller.backend.api_settings import register_settings_api
 from pi_sat_controller.backend.api_system import register_system_api
@@ -137,6 +138,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 monitor_log_entries = deque(maxlen=100)
 monitor_log_lock = Lock()
+journal_log_reader = JournalLogReader()
 
 
 class MonitorLogHandler(logging.Handler):
@@ -1822,6 +1824,7 @@ register_system_api(
     app,
     get_monitor_entries=lambda: monitor_log_entries,
     monitor_log_lock=monitor_log_lock,
+    get_journal_logs=journal_log_reader.read,
     build_status=_build_status_payload,
     get_hamlib_radio_models_payload=_build_hamlib_radio_models_payload,
     get_hamlib_rotator_models_payload=_build_hamlib_rotator_models_payload,

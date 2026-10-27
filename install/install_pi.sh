@@ -214,6 +214,8 @@ log_info "Installing host-level Python, Git, Hamlib, ffmpeg, and Dire Wolf"
 sudo apt install -y python3 python3-venv git ffmpeg libhamlib-utils direwolf openssl
 log_info "Granting the service user serial-device access"
 sudo usermod -aG dialout "${RUN_USER}"
+log_info "Granting the service user read access to the system journal"
+sudo usermod -aG systemd-journal "${RUN_USER}"
 
 if [ -d "${INSTALL_DIR}/.git" ]; then
   log_step "Updating existing Pi-Sat checkout"
@@ -322,6 +324,7 @@ ExecStart=${PYTHON_BIN} -m pi_sat_controller.backend.run_server
 Restart=on-failure
 RestartSec=5
 User=${RUN_USER}
+SupplementaryGroups=systemd-journal
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
