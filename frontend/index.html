@@ -10,7 +10,7 @@
     <link rel="stylesheet" href="/interface.css?v=20261026-monitor1">
     <link rel="stylesheet" href="/modules.css?v=20261023-signal-waterfall1">
     <link rel="stylesheet" href="/settings.css?v=20261023-ui1">
-    <link rel="stylesheet" href="/satellites.css?v=20261023-ui1">
+    <link rel="stylesheet" href="/satellites.css?v=20261028-satellite-search1">
   </head>
   <body>
     <main class="container-fluid py-3 app-shell">
@@ -369,16 +369,36 @@
           <section class="card satellite-control-card">
             <div class="card-body">
               <div class="satellite-toolbar">
-                <details id="add-satellite-container" class="satellite-add-container">
-                  <summary class="btn btn-primary">+ Add Satellite</summary>
+                <div id="add-satellite-container" class="satellite-add-container">
                   <form id="my-satellite-form" class="satellite-add-form">
-                    <label class="form-label" for="my-satellite-norad">NORAD ID</label>
-                    <input id="my-satellite-norad" class="form-control" name="norad_id" inputmode="numeric" placeholder="44909">
-                    <label class="form-label" for="my-satellite-name">Custom name</label>
-                    <input id="my-satellite-name" class="form-control" name="name" placeholder="Optional">
-                    <button type="submit" class="btn btn-primary">Add</button>
+                    <div class="satellite-search">
+                      <label class="form-label" for="my-satellite-query">Satellite</label>
+                      <div class="satellite-search-control">
+                        <input
+                          id="my-satellite-query"
+                          class="form-control"
+                          name="satellite"
+                          type="search"
+                          role="combobox"
+                          aria-autocomplete="list"
+                          aria-controls="my-satellite-suggestions"
+                          aria-expanded="false"
+                          autocomplete="off"
+                          placeholder="Satellite name or NORAD ID"
+                        >
+                        <div
+                          id="my-satellite-suggestions"
+                          class="satellite-suggestions"
+                          role="listbox"
+                          aria-label="Satellite catalog matches"
+                          hidden
+                        ></div>
+                      </div>
+                    </div>
+                    <button id="my-satellite-add-btn" type="submit" class="btn btn-primary" disabled>Add Satellite</button>
+                    <p id="my-satellite-catalog-status" class="satellite-catalog-status mb-0" role="status"></p>
                   </form>
-                </details>
+                </div>
 
                 <form id="my-satellite-options" class="satellite-options-form">
                   <label class="form-label" for="min-pass-elevation">Minimum pass elevation</label>
@@ -1038,6 +1058,6 @@
     <script type="application/json" data-native-src="/aprs.js?v=20261023-ui1"></script>
     <script type="application/json" data-native-src="/wsjtx.js?v=20261023-signal-waterfall1"></script>
     <script src="/interface.js?v=20261026-monitor1"></script>
-    <script src="/app.js?v=20261026-monitor1"></script>
+    <script src="/app.js?v=20261028-satellite-search1"></script>
   </body>
 </html>

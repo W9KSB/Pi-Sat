@@ -263,6 +263,25 @@ def register_satellites_api(
             "autotrack_norad_ids": sorted(autotrack_norads),
         }
 
+    @app.get("/api/my-satellites/catalog")
+    def get_my_satellite_catalog() -> dict[str, object]:
+        engine = build_orbital_engine()
+        return {
+            "satellites": sorted(
+                (
+                    {
+                        "name": str(getattr(satellite, "name", "") or norad_id),
+                        "norad_id": int(norad_id),
+                    }
+                    for norad_id, satellite in engine.satellites.items()
+                ),
+                key=lambda satellite: (
+                    satellite["name"].casefold(),
+                    satellite["norad_id"],
+                ),
+            )
+        }
+
     @app.post("/api/my-satellites")
     def add_my_satellite(payload: dict[str, Any] = Body(...)) -> dict[str, object]:
         try:

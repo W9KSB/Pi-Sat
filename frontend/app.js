@@ -7,6 +7,11 @@ let selectedManagedSatelliteNorad = null;
 let latestPasses = [];
 let satellitesCache = [];
 let managedSatellitesCache = [];
+let orbitalCatalogCache = [];
+let orbitalCatalogState = 'idle';
+let selectedOrbitalCatalogNorad = null;
+let activeOrbitalSuggestionIndex = -1;
+let orbitalCatalogRequestId = 0;
 let managedSatelliteProfilesByNorad = new Map();
 let managedSatellitePassesByNorad = new Map();
 let trackedSatelliteNorads = new Set();
@@ -1246,6 +1251,7 @@ function showPage(pageName) {
     setActiveSettingsSection(settingsSectionFromHash());
     if (primaryPageChanged || !document.querySelector('[data-settings-panel]')) loadSettings();
   } else if (selectedPage === 'satellites') {
+    loadOrbitalCatalog();
     loadMySatellites();
   } else if (selectedPage === 'monitor') {
     loadMonitor();
@@ -4416,20 +4422,284 @@ async function updateFrequencyProfiles(noradId) {
   }
 }
 
+function satelliteSuggestionText(satellite) {
+  const name = String(satellite?.name || satellite?.norad_id || '').trim();
+  return `${name} - NORAD ID: ${satellite?.norad_id ?? ''}`;
+}
+
+function normalizeOrbitalCatalog(satellites) {
+  const byNorad = new Map();
+  (Array.isArray(satellites) ? satellites : []).forEach((satellite) => {
+    const noradId = Number(satellite?.norad_id);
+    if (!Number.isInteger(noradId) || noradId <= 0) {
+      return;
+    }
+    const name = String(satellite?.name || noradId).trim() || String(noradId);
+    byNorad.set(noradId, { name, norad_id: noradId });
+  });
+  return Array.from(byNorad.values()).sort((left, right) => {
+    return left.name.localeCompare(right.name, undefined, { sensitivity: 'base' })
+      || left.norad_id - right.norad_id;
+  });
+}
+
+function searchOrbitalCatalog(catalog, query, limit = 20) {
+  const term = String(query ?? '').trim().toLowerCase();
+  if (!term) {
+    return [];
+  }
+  const matches = catalog.filter((satellite) => {
+    return satellite.name.toLowerCase().includes(term)
+      || String(satellite.norad_id).includes(term);
+  });
+  return matches.slice(0, Math.max(0, limit));
+}
+
+function findOrbitalCatalogRecord(catalog, value, selectedNoradId = null) {
+  const selected = catalog.find(
+    (satellite) => Number(satellite.norad_id) === Number(selectedNoradId)
+  );
+  if (selected) {
+    return selected;
+  }
+  const term = String(value ?? '').trim();
+  if (!term) {
+    return null;
+  }
+  if (/^\d+$/.test(term)) {
+    const byNorad = catalog.find(
+      (satellite) => Number(satellite.norad_id) === Number(term)
+    );
+    if (byNorad) {
+      return byNorad;
+    }
+  }
+  const normalized = term.toLowerCase();
+  const byLabel = catalog.find(
+    (satellite) => satelliteSuggestionText(satellite).toLowerCase() === normalized
+  );
+  if (byLabel) {
+    return byLabel;
+  }
+  const byName = catalog.filter(
+    (satellite) => satellite.name.toLowerCase() === normalized
+  );
+  return byName.length === 1 ? byName[0] : null;
+}
+
+function setSatelliteCatalogStatus(message) {
+  const status = document.getElementById('my-satellite-catalog-status');
+  if (status) {
+    status.textContent = message;
+  }
+}
+
+function updateSatelliteAddControl() {
+  const input = document.getElementById('my-satellite-query');
+  const button = document.getElementById('my-satellite-add-btn');
+  if (!input || !button) {
+    return;
+  }
+  const form = document.getElementById('my-satellite-form');
+  button.disabled = orbitalCatalogState !== 'ready'
+    || !input.value.trim()
+    || form?.dataset.saving === 'true';
+}
+
+function closeOrbitalSatelliteSuggestions() {
+  const input = document.getElementById('my-satellite-query');
+  const list = document.getElementById('my-satellite-suggestions');
+  activeOrbitalSuggestionIndex = -1;
+  input?.removeAttribute('aria-activedescendant');
+  input?.setAttribute('aria-expanded', 'false');
+  if (list) {
+    list.hidden = true;
+  }
+}
+
+function setActiveOrbitalSatelliteSuggestion(index) {
+  const input = document.getElementById('my-satellite-query');
+  const list = document.getElementById('my-satellite-suggestions');
+  if (!input || !list) {
+    return;
+  }
+  const options = Array.from(list.querySelectorAll('[role="option"]'));
+  if (!options.length) {
+    activeOrbitalSuggestionIndex = -1;
+    input.removeAttribute('aria-activedescendant');
+    return;
+  }
+  activeOrbitalSuggestionIndex = Math.max(0, Math.min(index, options.length - 1));
+  options.forEach((option, optionIndex) => {
+    const active = optionIndex === activeOrbitalSuggestionIndex;
+    option.classList.toggle('is-active', active);
+    option.setAttribute('aria-selected', String(active));
+  });
+  input.setAttribute(
+    'aria-activedescendant',
+    options[activeOrbitalSuggestionIndex].id
+  );
+}
+
+function selectOrbitalSatellite(noradId) {
+  const satellite = orbitalCatalogCache.find(
+    (item) => Number(item.norad_id) === Number(noradId)
+  );
+  if (!satellite) {
+    return;
+  }
+  selectedOrbitalCatalogNorad = satellite.norad_id;
+  const input = document.getElementById('my-satellite-query');
+  if (input) {
+    input.value = satelliteSuggestionText(satellite);
+  }
+  setSatelliteCatalogStatus('');
+  closeOrbitalSatelliteSuggestions();
+  updateSatelliteAddControl();
+}
+
+function renderOrbitalSatelliteSuggestions() {
+  const input = document.getElementById('my-satellite-query');
+  const list = document.getElementById('my-satellite-suggestions');
+  if (!input || !list || orbitalCatalogState !== 'ready') {
+    closeOrbitalSatelliteSuggestions();
+    return;
+  }
+  const query = input.value.trim();
+  const selected = orbitalCatalogCache.find(
+    (satellite) => Number(satellite.norad_id) === Number(selectedOrbitalCatalogNorad)
+  );
+  if (!query || (selected && input.value === satelliteSuggestionText(selected))) {
+    closeOrbitalSatelliteSuggestions();
+    return;
+  }
+
+  list.replaceChildren();
+  activeOrbitalSuggestionIndex = -1;
+  input.removeAttribute('aria-activedescendant');
+  const matches = searchOrbitalCatalog(orbitalCatalogCache, query);
+  if (!matches.length) {
+    const empty = document.createElement('div');
+    empty.className = 'satellite-suggestions-empty';
+    empty.textContent = 'No matching satellites.';
+    list.appendChild(empty);
+  } else {
+    matches.forEach((satellite) => {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.id = `my-satellite-suggestion-${satellite.norad_id}`;
+      option.className = 'satellite-suggestion';
+      option.setAttribute('role', 'option');
+      option.setAttribute('aria-selected', 'false');
+      option.textContent = satelliteSuggestionText(satellite);
+      option.addEventListener('pointerdown', (event) => event.preventDefault());
+      option.addEventListener('click', () => selectOrbitalSatellite(satellite.norad_id));
+      list.appendChild(option);
+    });
+  }
+  list.hidden = false;
+  input.setAttribute('aria-expanded', 'true');
+}
+
+function handleOrbitalSatelliteKeydown(event) {
+  const input = document.getElementById('my-satellite-query');
+  const list = document.getElementById('my-satellite-suggestions');
+  if (!input || !list) {
+    return;
+  }
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    if (list.hidden) {
+      renderOrbitalSatelliteSuggestions();
+    }
+    const optionCount = list.querySelectorAll('[role="option"]').length;
+    if (!optionCount) {
+      return;
+    }
+    event.preventDefault();
+    const nextIndex = event.key === 'ArrowDown'
+      ? (activeOrbitalSuggestionIndex + 1) % optionCount
+      : activeOrbitalSuggestionIndex <= 0
+        ? optionCount - 1
+        : activeOrbitalSuggestionIndex - 1;
+    setActiveOrbitalSatelliteSuggestion(nextIndex);
+  } else if (event.key === 'Enter' && !list.hidden && activeOrbitalSuggestionIndex >= 0) {
+    const option = list.querySelectorAll('[role="option"]')[activeOrbitalSuggestionIndex];
+    if (option) {
+      event.preventDefault();
+      option.click();
+    }
+  } else if (event.key === 'Escape') {
+    closeOrbitalSatelliteSuggestions();
+  }
+}
+
+async function loadOrbitalCatalog() {
+  const requestId = ++orbitalCatalogRequestId;
+  orbitalCatalogState = 'loading';
+  setSatelliteCatalogStatus('Loading satellite catalog...');
+  updateSatelliteAddControl();
+  try {
+    const response = await fetch('/api/my-satellites/catalog');
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.detail || 'Satellite catalog load failed.');
+    }
+    if (requestId !== orbitalCatalogRequestId) {
+      return;
+    }
+    orbitalCatalogCache = normalizeOrbitalCatalog(result.satellites);
+    orbitalCatalogState = 'ready';
+    selectedOrbitalCatalogNorad = null;
+    const input = document.getElementById('my-satellite-query');
+    if (input) {
+      input.value = '';
+    }
+    closeOrbitalSatelliteSuggestions();
+    setSatelliteCatalogStatus('');
+  } catch (error) {
+    if (requestId !== orbitalCatalogRequestId) {
+      return;
+    }
+    orbitalCatalogCache = [];
+    orbitalCatalogState = 'error';
+    selectedOrbitalCatalogNorad = null;
+    closeOrbitalSatelliteSuggestions();
+    setSatelliteCatalogStatus(error.message || 'Satellite catalog load failed.');
+  }
+  updateSatelliteAddControl();
+}
+
 async function addMySatellite(event) {
   event.preventDefault();
   const status = document.getElementById('my-satellite-status');
-  const noradId = Number(document.getElementById('my-satellite-norad').value);
-  const name = document.getElementById('my-satellite-name').value.trim();
-  if (!Number.isInteger(noradId) || noradId <= 0) {
-    status.textContent = 'Enter a valid NORAD ID.';
+  const form = document.getElementById('my-satellite-form');
+  const input = document.getElementById('my-satellite-query');
+  const satellite = findOrbitalCatalogRecord(
+    orbitalCatalogCache,
+    input?.value,
+    selectedOrbitalCatalogNorad
+  );
+  if (form?.dataset.saving === 'true') {
+    return;
+  }
+  if (orbitalCatalogState !== 'ready') {
+    status.textContent = 'Satellite catalog is not available.';
+    return;
+  }
+  if (!satellite) {
+    status.textContent = 'Select a satellite from the suggestions.';
     return;
   }
   try {
+    if (form) {
+      form.dataset.saving = 'true';
+    }
+    updateSatelliteAddControl();
+    status.textContent = 'Adding satellite...';
     const response = await fetch('/api/my-satellites', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ norad_id: noradId, name }),
+      body: JSON.stringify({ norad_id: satellite.norad_id }),
     });
     const result = await response.json();
     if (!response.ok) {
@@ -4437,13 +4707,21 @@ async function addMySatellite(event) {
       return;
     }
     status.textContent = 'Satellite added.';
-    document.getElementById('my-satellite-norad').value = '';
-    document.getElementById('my-satellite-name').value = '';
+    if (input) {
+      input.value = '';
+    }
+    selectedOrbitalCatalogNorad = null;
+    closeOrbitalSatelliteSuggestions();
     await loadMySatellites();
     await loadSatellites();
     await loadPasses();
   } catch (error) {
     status.textContent = 'Satellite add failed.';
+  } finally {
+    if (form) {
+      delete form.dataset.saving;
+    }
+    updateSatelliteAddControl();
   }
 }
 
@@ -6265,6 +6543,26 @@ document
 document
   .getElementById('my-satellite-form')
   .addEventListener('submit', addMySatellite);
+document
+  .getElementById('my-satellite-query')
+  .addEventListener('input', () => {
+    selectedOrbitalCatalogNorad = null;
+    setSatelliteCatalogStatus('');
+    updateSatelliteAddControl();
+    renderOrbitalSatelliteSuggestions();
+  });
+document
+  .getElementById('my-satellite-query')
+  .addEventListener('focus', renderOrbitalSatelliteSuggestions);
+document
+  .getElementById('my-satellite-query')
+  .addEventListener('keydown', handleOrbitalSatelliteKeydown);
+document.addEventListener('pointerdown', (event) => {
+  const container = document.getElementById('add-satellite-container');
+  if (container && !container.contains(event.target)) {
+    closeOrbitalSatelliteSuggestions();
+  }
+});
 document
   .getElementById('custom-transponder-form')
   .addEventListener('submit', addCustomTransponder);

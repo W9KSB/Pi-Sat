@@ -16,63 +16,82 @@
 
 .satellite-add-container {
   position: relative;
-}
-
-.satellite-add-container[open] {
   flex: 1 0 100%;
-}
-
-.satellite-add-container > summary {
-  list-style: none;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.satellite-add-container > summary::-webkit-details-marker {
-  display: none;
-}
-
-.satellite-add-container > summary::marker {
-  content: "";
 }
 
 .satellite-add-form {
   display: grid;
-  grid-template-columns: minmax(8.5rem, 0.6fr) minmax(14rem, 1fr) auto;
-  grid-template-rows: auto auto;
+  grid-template-columns: minmax(16rem, 1fr) auto;
   align-items: end;
   gap: 0.35rem 0.75rem;
   width: 100%;
-  margin-top: 0.85rem;
   padding: 0.9rem;
   border: 1px solid #344658;
   border-radius: 0.45rem;
   background: #0d151e;
 }
 
-.satellite-add-form label[for="my-satellite-norad"] {
-  grid-column: 1;
-  grid-row: 1;
+.satellite-search {
+  display: grid;
+  min-width: 0;
+  gap: 0.35rem;
 }
 
-.satellite-add-form #my-satellite-norad {
-  grid-column: 1;
-  grid-row: 2;
+.satellite-search-control {
+  position: relative;
+  min-width: 0;
 }
 
-.satellite-add-form label[for="my-satellite-name"] {
-  grid-column: 2;
-  grid-row: 1;
+.satellite-suggestions {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 0.3rem);
+  right: 0;
+  left: 0;
+  max-height: 18rem;
+  overflow-y: auto;
+  border: 1px solid #45627d;
+  border-radius: 0.4rem;
+  background: #08111a;
+  box-shadow: 0 0.75rem 1.75rem rgb(0 0 0 / 45%);
 }
 
-.satellite-add-form #my-satellite-name {
-  grid-column: 2;
-  grid-row: 2;
+.satellite-suggestion {
+  display: block;
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  border: 0;
+  border-bottom: 1px solid #223447;
+  color: #edf4fb;
+  background: transparent;
+  overflow-wrap: anywhere;
+  text-align: left;
 }
 
-.satellite-add-form button {
-  grid-column: 3;
-  grid-row: 2;
+.satellite-suggestion:last-child {
+  border-bottom: 0;
+}
+
+.satellite-suggestion:hover,
+.satellite-suggestion.is-active {
+  background: #18314a;
+}
+
+.satellite-suggestion:focus-visible {
+  outline: 2px solid #69a5de;
+  outline-offset: -2px;
+}
+
+.satellite-suggestions-empty {
+  padding: 0.65rem 0.7rem;
+  color: var(--app-muted);
+}
+
+.satellite-catalog-status {
+  grid-column: 1 / -1;
+  min-height: 1.2em;
+  color: var(--app-muted);
+  font-size: 0.8rem;
 }
 
 .satellite-options-form {
@@ -328,20 +347,14 @@
 
   .satellite-add-form {
     grid-template-columns: 1fr;
-    grid-template-rows: none;
-  }
-
-  .satellite-add-form label[for="my-satellite-norad"],
-  .satellite-add-form #my-satellite-norad,
-  .satellite-add-form label[for="my-satellite-name"],
-  .satellite-add-form #my-satellite-name,
-  .satellite-add-form button {
-    grid-column: 1;
-    grid-row: auto;
   }
 
   .satellite-add-form button {
     justify-self: start;
+  }
+
+  .satellite-catalog-status {
+    grid-column: 1;
   }
 
   .satellite-refresh-actions > .btn {
