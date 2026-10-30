@@ -91,9 +91,24 @@
   pointer-events: none; text-shadow: 0 1px 2px #000;
 }
 .rc-deck { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 10px; align-items: stretch; }
-.rc-center-controls { display: flex; flex-direction: column; gap: 8px; width: 48px; align-self: center; justify-self: center; }
+.rc-center-controls { display: flex; flex-direction: column; gap: 8px; width: 64px; align-self: center; justify-self: center; }
 .rc-center-controls .rc-button { align-self: stretch; min-width: 0; padding: 6px 3px; font-size: 12px;
   font-weight: 700; letter-spacing: 0; line-height: 1.15; white-space: nowrap; }
+.rc-record-audio { white-space: normal !important; font-size: 11px !important; }
+.radio-console .rc-record-audio.is-recording {
+  color: white;
+  border-color: #ff6370;
+  background: linear-gradient(#d91c31, #8b0a18);
+  box-shadow: 0 0 12px #f22a3855;
+  animation: rc-recording-pulse 1.15s ease-in-out infinite;
+}
+@keyframes rc-recording-pulse {
+  50% {
+    border-color: #ffb1b8;
+    background: linear-gradient(#ff2c43, #a30d1d);
+    box-shadow: 0 0 20px #ff304866;
+  }
+}
 .rc-center-action.is-transmitting { color: white; border-color: #ff4859; background: linear-gradient(#ff4249, #c41222);
   box-shadow: 0 0 12px #f22a3844; }
 /* Sized to its label and centred in the row; the deck stretches its children,
@@ -271,6 +286,9 @@
 @media (max-width: 620px) {
   .rc-deck { grid-template-columns: minmax(0, 1fr); }
   .rc-scope-axis { font-size: 8px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .radio-console .rc-record-audio.is-recording { animation: none; }
 }
 @media (max-width: 740px) {
   .rc-session { gap: 6px; flex-wrap: wrap; }

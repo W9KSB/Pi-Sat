@@ -84,6 +84,8 @@
       </div>
     </section>
     <div class="rc-deck">${pathPanel('MAIN', 'TX')}<div class="rc-center-controls" role="group" aria-label="Radio and tracking actions">
+      <button type="button" id="rc-record-audio" class="rc-button rc-center-action rc-record-audio" data-action="record-audio"
+        aria-pressed="false" title="Record receive audio on the Pi">Record Audio</button>
       <button type="button" id="rc-swap" class="rc-button rc-swap"
         data-action="swap-bands" title="Exchange the MAIN and SUB bands, the same operation as the radio's front-panel M&lt;&gt;S button">M&lt;-&gt;S</button>
       <button type="button" id="rc-reset-offset" class="rc-button rc-center-action" data-action="reset-offset"
@@ -174,6 +176,61 @@
   let lastScopeSequence = null;
   let lastScopeTime = 0;
   let scopeWaitSince = 0;
+  let audioRecordingState = { recording: false };
+  let recordingSaving = false;
+  let recordingPollAt = 0;
+  let recordingStateSequence = 0;
+
+  function renderAudioRecordingControl() {
+    const button = $('rc-record-audio');
+    if (!button) return;
+    const active = audioRecordingState.recording === true;
+    button.textContent = active ? 'Stop Recording' : 'Record Audio';
+    button.classList.toggle('is-recording', active);
+    button.setAttribute('aria-pressed', String(active));
+    button.setAttribute('aria-busy', String(recordingSaving));
+    button.disabled = recordingSaving || (!active && (!state.connected || state.audio_available === false));
+    button.title = active
+      ? 'Recording receive audio on the Pi; click to stop'
+      : 'Record receive audio on the Pi';
+  }
+
+  async function refreshAudioRecordingState() {
+    const api = window.AudioRecordings;
+    if (!api?.readState || document.visibilityState === 'hidden') return;
+    const sequence = ++recordingStateSequence;
+    try {
+      const next = await api.readState();
+      if (sequence !== recordingStateSequence) return;
+      audioRecordingState = next && typeof next === 'object' ? next : { recording: false };
+      consoleApi.render({});
+    } catch {
+      // A transient endpoint outage must not interfere with radio control or
+      // the established browser receive-audio path.
+    }
+  }
+
+  async function toggleAudioRecording() {
+    if (recordingSaving) return;
+    const enabled = audioRecordingState.recording !== true;
+    const api = window.AudioRecordings;
+    if (!api?.setEnabled) {
+      consoleApi.error('Audio recording is unavailable.');
+      return;
+    }
+    recordingSaving = true;
+    consoleApi.error('');
+    consoleApi.render({});
+    try {
+      const result = await api.setEnabled(enabled);
+      audioRecordingState = result && typeof result === 'object' ? result : { recording: enabled };
+    } catch (error) {
+      consoleApi.error(`${enabled ? 'Start' : 'Stop'} recording failed: ${error.message || error}`);
+    } finally {
+      recordingSaving = false;
+      consoleApi.render({});
+    }
+  }
   let scopeRepairAfter = 0;
   let socket;
   let scope = null;
@@ -515,6 +572,7 @@
       $('rc-ptt').classList.toggle('is-transmitting', connected && transmitting);
       // Unknown PTT is not an invitation to transmit blindly.
       $('rc-ptt').disabled ||= state.ptt == null && state.ptt_pending == null;
+      renderAudioRecordingControl();
       // Capture now starts with the session rather than from its own button, so
       // locking the list while capture ran left the device unchangeable for the
       // whole connection. Only a change already in flight disables it.
@@ -771,6 +829,7 @@
       await command('scope-sweep', { physical_side: listeningScopeSide(), speed: value });
     }
     if (action === 'audio-transport') setAudioTransport(value);
+    if (action === 'record-audio') await toggleAudioRecording();
     if (action === 'swap-bands') await command('swap-main-sub', {});
     if (action === 'reset-offset') await resetTrackingOffset();
     if (action === 'tuning-tone') await tuningTone();
@@ -1412,10 +1471,15 @@
   consoleApi.render({});
   renderTrackingSummary();
   void refreshStateFromRest();
+  void refreshAudioRecordingState();
   // Age indicators and audio recovery remain active while other tabs are shown.
   // REST is a low-rate control-state fallback; spectrum still requires WebSocket.
   setInterval(() => {
     renderTrackingSummary();
+    if (Date.now() - recordingPollAt >= 1500) {
+      recordingPollAt = Date.now();
+      void refreshAudioRecordingState();
+    }
     if (Date.now() - lastStateTime > 6000) {
       streamHealthy = false;
       void refreshStateFromRest();

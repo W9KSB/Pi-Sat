@@ -51,7 +51,7 @@ let groundTrackFetchedAtMs = 0;
 let qsoFinderResult = null;
 let qsoOpportunities = [];
 let selectedQsoOpportunityIndex = -1;
-const PAGE_NAMES = ['home', 'radio', 'satellites', 'modules', 'monitor', 'settings'];
+const PAGE_NAMES = ['home', 'radio', 'satellites', 'audio-recordings', 'modules', 'monitor', 'settings'];
 const MODULE_NAV = [
   { id: 'audio-stream', label: 'External DATA Decode' },
   { id: 'sstv-decoder', label: 'SSTV Decoder' },
@@ -160,6 +160,7 @@ const STANDARD_PAGE_NAV = PAGE_NAMES.map((page) => {
     home: 'Home',
     radio: 'Radio',
     satellites: 'Satellites',
+    'audio-recordings': 'Audio Recordings',
     modules: 'Modules',
     monitor: 'Monitor',
     settings: 'Settings',
@@ -1253,6 +1254,8 @@ function showPage(pageName) {
   } else if (selectedPage === 'satellites') {
     loadOrbitalCatalog();
     loadMySatellites();
+  } else if (selectedPage === 'audio-recordings') {
+    window.AudioRecordings?.load();
   } else if (selectedPage === 'monitor') {
     loadMonitor();
   } else if (selectedPage === 'qso-finder') {

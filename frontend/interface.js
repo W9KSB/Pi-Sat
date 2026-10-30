@@ -16,7 +16,7 @@
       ${navigation('home', 'Home', 'home')}
       <div data-native-only hidden><button type="button" id="station-modules-toggle" class="station-nav-link" aria-expanded="false" aria-controls="station-module-menu">${icon('packet')}<span>Modules</span>${icon('chevron')}</button><div id="station-module-menu" class="station-module-menu" hidden>
         <button type="button" data-module="sstv-decoder" id="modules-nav-sstv-decoder">SSTV Decoder</button><button type="button" data-module="aprs" id="modules-nav-aprs">APRS</button><button type="button" data-module="ft4-ft8" id="modules-nav-ft4-ft8">FT4 / FT8</button><button type="button" data-module="audio-stream" id="modules-nav-audio-stream">External DATA Decode</button>
-      </div></div><div class="station-nav-divider"></div>${navigation('satellites', 'Satellites', 'satellite')}${navigation('map', 'Map', 'map')}${navigation('qso-finder', 'QSO Finder', 'search')}
+      </div></div><div class="station-nav-divider"></div>${navigation('satellites', 'Satellites', 'satellite')}${navigation('audio-recordings', 'Audio Recordings', 'record')}${navigation('map', 'Map', 'map')}${navigation('qso-finder', 'QSO Finder', 'search')}
       </div><div class="station-nav-bottom">${navigation('monitor', 'Station Monitor', 'monitor')}${navigation('settings', 'Settings', 'settings')}<div class="station-identity"><span id="station-experience">Legacy / Dual radio</span><small id="station-location"></small></div></div></nav>
     <div class="station-main"></div>
     <aside class="station-pass-sidebar"><button type="button" id="station-sidebar-toggle" aria-expanded="true" aria-controls="station-pass-content">${icon('chevron')}<span>Pass settings</span></button><div id="station-pass-content"><h2>Pass data</h2><div id="station-selection"></div><div id="station-profile"></div><div id="station-passes"></div><details class="station-rotator-details"><summary>Rotator controls</summary><div id="station-rotator-controls"></div></details></div></aside>`;
@@ -32,6 +32,7 @@
     <symbol id="ui-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2"/><path d="M12 1v4m0 14v4M1 12h4m14 0h4"/></symbol>
     <symbol id="ui-rotator" viewBox="0 0 24 24"><path d="M7 3a8 8 0 0 0 11 11L7 3Zm6 6 6-6M9 16l-2 5m5-5 2 5M4 21h13M18 3h3v3"/></symbol>
     <symbol id="ui-satellite" viewBox="0 0 24 24"><path d="m9 8 7 7-5 5-7-7zM7 6 4 3 1 6l3 3m11 8 3 3 3-3-3-3M14 4a6 6 0 0 1 6 6M9 15l-4 4"/></symbol>
+    <symbol id="ui-record" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></symbol>
     <symbol id="ui-packet" viewBox="0 0 24 24"><path d="m3 7 9-4 9 4-9 5zM3 7v10l9 4 9-4V7M12 12v9"/></symbol>
     <symbol id="ui-map" viewBox="0 0 24 24"><path d="m3 5 6-2 6 2 6-2v16l-6 2-6-2-6 2zM9 3v16M15 5v16"/></symbol>
     <symbol id="ui-search" viewBox="0 0 24 24"><circle cx="10" cy="10" r="7"/><path d="m15 15 6 6"/></symbol>

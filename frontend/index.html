@@ -6,8 +6,8 @@
     <title>Pi-Sat Controller</title>
     <link rel="stylesheet" href="/vendor/bootstrap/bootstrap.min.css">
     <link rel="stylesheet" href="/style.css?v=20261026-monitor2">
-    <link rel="stylesheet" href="/radio-console.css?v=20261009-tuning-tone1">
-    <link rel="stylesheet" href="/interface.css?v=20261026-monitor1">
+    <link rel="stylesheet" href="/radio-console.css?v=20261029-recording1">
+    <link rel="stylesheet" href="/interface.css?v=20261029-recording1">
     <link rel="stylesheet" href="/modules.css?v=20261023-signal-waterfall1">
     <link rel="stylesheet" href="/settings.css?v=20261023-ui1">
     <link rel="stylesheet" href="/satellites.css?v=20261028-satellite-search1">
@@ -31,6 +31,7 @@
                 <nav class="nav nav-pills gap-2" aria-label="Primary navigation">
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="home">Home</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="satellites">Satellites</button>
+                  <button type="button" class="btn btn-outline-primary nav-button" data-page="audio-recordings">Audio Recordings</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="modules">Modules</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="monitor">Monitor</button>
                   <button type="button" class="btn btn-outline-primary nav-button" data-page="settings">Settings</button>
@@ -547,6 +548,23 @@
         </div>
       </section>
 
+      <section class="page-view" id="audio-recordings-page" data-page-view="audio-recordings" hidden>
+        <header class="card app-header mb-3 standard-page-header" data-page-title="Audio Recordings" data-page-subtitle="Recent receiver audio saved on Pi-Sat"></header>
+
+        <section class="card audio-recordings-card" aria-labelledby="audio-recordings-title">
+          <div class="card-header d-flex align-items-center justify-content-between gap-3">
+            <h2 class="h5 mb-0" id="audio-recordings-title">Recent recordings</h2>
+            <span class="small text-body-secondary">Latest 10</span>
+          </div>
+          <div class="card-body">
+            <div id="audio-recordings-list" class="audio-recordings-list">
+              <p class="audio-recordings-empty">No recordings saved.</p>
+            </div>
+            <audio id="audio-recordings-player" preload="none" hidden></audio>
+          </div>
+        </section>
+      </section>
+
       <section class="page-view" id="modules-page" data-page-view="modules" hidden>
         <header class="card app-header mb-3 standard-page-header" data-page-title="Modules" data-page-subtitle="Pi-Sat utilities and operating tools" data-subnav="modules"></header>
 
@@ -1052,12 +1070,13 @@
       <a href="https://github.com/w9ksb" target="_blank" rel="noopener noreferrer">github.com/w9ksb</a>
     </footer>
     <script src="/vendor/bootstrap/bootstrap.bundle.min.js"></script>
-    <script type="application/json" data-native-src="/radio-console.js?v=20261023-tone-level1"></script>
+    <script src="/audio-recordings.js?v=20261029-recording1"></script>
+    <script type="application/json" data-native-src="/radio-console.js?v=20261029-recording1"></script>
     <script type="application/json" data-native-src="/audio-stream.js?v=20261023-ui1"></script>
     <script type="application/json" data-native-src="/sstv.js?v=20261023-ui1"></script>
     <script type="application/json" data-native-src="/aprs.js?v=20261023-ui1"></script>
     <script type="application/json" data-native-src="/wsjtx.js?v=20261023-signal-waterfall1"></script>
-    <script src="/interface.js?v=20261026-monitor1"></script>
-    <script src="/app.js?v=20261028-satellite-search1"></script>
+    <script src="/interface.js?v=20261029-recording1"></script>
+    <script src="/app.js?v=20261029-recording1"></script>
   </body>
 </html>

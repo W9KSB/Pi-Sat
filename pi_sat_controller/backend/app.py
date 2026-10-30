@@ -32,6 +32,7 @@ from pi_sat_controller.backend.api_settings import register_settings_api
 from pi_sat_controller.backend.api_system import register_system_api
 from pi_sat_controller.backend.api_tracking import register_tracking_api
 from pi_sat_controller.backend.api_audio_stream import register_audio_stream_api
+from pi_sat_controller.backend.api_audio_recordings import register_audio_recordings_api
 from pi_sat_controller.backend.automation_scripts import (
     list_automation_scripts,
     run_automation_script,
@@ -123,6 +124,7 @@ from pi_sat_controller.backend.sdr.polling_sdr import (
 )
 from pi_sat_controller.backend.aprs.manager import AprsManager
 from pi_sat_controller.backend.aprs.transmit import AprsTransmitter
+from pi_sat_controller.backend.audio_recordings import AudioRecordingManager
 from pi_sat_controller.backend.sstv.manager import SstvManager
 from pi_sat_controller.backend.wsjtx.manager import WsjtxManager
 from pi_sat_controller.backend.wsjtx.engine import WsjtxEngine
@@ -246,6 +248,11 @@ sstv_manager = SstvManager(
     on_image_saved=sstv_discord_notifier.enqueue,
 )
 
+audio_recording_manager = AudioRecordingManager(
+    PROJECT_ROOT / "data" / "audio_recordings",
+    get_controller=lambda: icom_controller,
+)
+
 
 aprs_manager = AprsManager(
     project_root=PROJECT_ROOT,
@@ -331,6 +338,7 @@ async def lifespan(app: FastAPI):
         _stop_pass_refresh_scheduler()
         _stop_autotrack_scheduler()
         _stop_transponder_refresh_scheduler()
+        audio_recording_manager.shutdown()
         sstv_manager.shutdown()
         sstv_discord_notifier.shutdown()
         aprs_manager.shutdown()
@@ -1882,6 +1890,10 @@ register_wsjtx_api(app, get_manager=lambda: wsjtx_manager, get_engine=lambda: ws
 register_audio_stream_api(
     app, get_status=_audio_stream_status, set_enabled=_set_audio_stream_enabled,
     set_demodulation=_set_audio_stream_demodulation,
+)
+register_audio_recordings_api(
+    app,
+    get_manager=lambda: audio_recording_manager,
 )
 register_sstv_api(
     app,

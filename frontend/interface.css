@@ -75,6 +75,23 @@ a { color: var(--station-blue); text-underline-offset: 3px; }
 .btn-primary:hover { background: #2d5980; border-color: #86bded; }
 .btn-outline-primary { color: #9acfff; border-color: #345674; }
 .btn-outline-primary.active { background: #254866; border-color: #5586ad; }
+.audio-recordings-list { display: grid; }
+.audio-recording-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 2px;
+  border-bottom: 1px solid var(--station-line);
+}
+.audio-recording-row:first-child { padding-top: 2px; }
+.audio-recording-row:last-child { border-bottom: 0; padding-bottom: 2px; }
+.audio-recording-details { display: grid; min-width: 0; gap: 3px; }
+.audio-recording-details strong { font-size: 13px; font-weight: 600; }
+.audio-recording-details span,
+.audio-recordings-empty { color: var(--station-muted); font-size: 11px; }
+.audio-recording-action { min-width: 72px; }
+.audio-recordings-empty { margin: 0; }
 .form-control, .form-select { color: #e4edf5; background-color: #101c28; border-color: #3a5167; font-size: 12px; min-height: 33px; }
 .form-control:focus, .form-select:focus { color: #fff; background-color: #152739; border-color: #7dbaff; box-shadow: none; }
 .station-pass-sidebar { display: none; min-width: 0; position: sticky; top: 130px; height: calc(100dvh - 130px); align-self: start; overflow-y: auto; padding-left: 30px; background: #111c28; border-left: 1px solid var(--station-line); }
