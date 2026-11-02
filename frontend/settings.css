@@ -297,7 +297,7 @@
 }
 
 #settings-page .cat-device-body {
-  grid-template-columns: minmax(0, 1fr) minmax(10rem, 14rem) max-content;
+  grid-template-columns: minmax(0, 1fr) minmax(10rem, 14rem) 120px;
   gap: 0.8rem;
 }
 
@@ -320,11 +320,18 @@
 }
 
 #settings-page .cat-device-actions-column {
-  min-width: max-content;
+  min-width: 0;
 }
 
 #settings-page .cat-device-action-buttons {
+  width: 120px;
+  max-width: 100%;
   gap: 0.45rem;
+}
+
+#settings-page .cat-device-actions-column .settings-section-status {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 #settings-page .settings-footer {

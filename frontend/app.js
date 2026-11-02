@@ -115,17 +115,41 @@ let radioAudioGeneration = 0;
 let radioAudioWorklet = null;
 let radioAudioWorkletLoading = null;
 let radioMicDeviceId = '';
-let radioMicGain = 1;
+const RADIO_MIC_GAIN_STORAGE_KEY = 'pi-sat.radio.mic-gain.v2';
+const RADIO_MIC_GAIN_LEGACY_STORAGE_KEY = 'pi-sat.radio.mic-gain.v1';
+function loadRadioMicGain() {
+  try {
+    const stored = window.localStorage?.getItem(RADIO_MIC_GAIN_STORAGE_KEY);
+    const percent = stored === null || stored === undefined ? NaN : Number(stored);
+    if (Number.isFinite(percent) && percent >= 0 && percent <= 200) return percent / 50;
+    const legacyStored = window.localStorage?.getItem(RADIO_MIC_GAIN_LEGACY_STORAGE_KEY);
+    const legacyPercent = (
+      legacyStored === null || legacyStored === undefined ? NaN : Number(legacyStored)
+    );
+    if (Number.isFinite(legacyPercent) && legacyPercent >= 0 && legacyPercent <= 400) {
+      return legacyPercent / 100;
+    }
+  } catch { /* Browser storage can be unavailable. */ }
+  return 2;
+}
+let radioMicGain = loadRadioMicGain();
 let radioMicSocket = null;
 let radioMicWorklet = null;
 let radioMicWorkletLoading = null;
+let radioMicWorker = null;
+let radioMicWorkerStatus = null;
+let radioMicWorkerErrorAt = 0;
+let radioMicWorkletPortTransferred = false;
+let radioMicCompatibilityMode = false;
+let radioMicPttActive = false;
+let radioMicTxGeneration = 0;
 let radioMicMeterAt = 0;
 let radioMicUplinkHealthy = false;
 let radioMicUplinkRetryAt = 0;
 let radioSampleRate = 16000;
 let radioRxChannels = 2;
 const hiddenSettingsKeys = {
-  icom: new Set(['tuning_tone_level_percent']),
+  icom: new Set(['tuning_tone_level_percent', 'scope_enabled']),
   server: new Set(['host', 'port', 'gui_resources_caching', 'https_enabled', 'https_port',
     'tls_certfile', 'tls_keyfile', 'tls_names']),
   station: new Set(['latitude_deg', 'longitude_deg']),
@@ -547,9 +571,10 @@ function renderRadioState(result) {
     radioSampleRate = reportedRate;
     // The capture worklet converts to the radio's rate, so a renegotiated rate
     // has to reach the audio thread rather than only the main-thread path.
-    radioMicWorklet?.port.postMessage({ type: 'config', outputRate: radioSampleRate });
+    radioMicWorker?.postMessage({ type: 'config', outputRate: radioSampleRate });
   }
   if ([1, 2].includes(Number(result?.rx_channels))) radioRxChannels = Number(result.rx_channels);
+  syncRadioMicTransportState(result);
   window.RadioConsole?.render(result);
 }
 
@@ -578,7 +603,14 @@ async function radioAction(path, body = {}) {
 }
 
 async function prepareRadioAudio() {
-  radioAudioContext = radioAudioContext || new AudioContext({ latencyHint: 'interactive' });
+  if (!radioAudioContext) {
+    radioAudioContext = new AudioContext({ latencyHint: 'interactive' });
+    radioAudioContext.addEventListener?.('statechange', () => {
+      // A suspended audio clock does not advance at the same rate as a worker
+      // clock. Drop the old mapping and require a new bounded handshake.
+      radioMicWorker?.postMessage({ type: 'invalidateClock' });
+    });
+  }
   await radioAudioContext.resume();
 }
 
@@ -593,7 +625,7 @@ function stopRadioAudio() {
   stopRadioMicrophone();
   // The uplink belongs to the session, not to a capture device, so it closes
   // here rather than with every microphone restart.
-  closeRadioMicUplink();
+  shutdownRadioMicTransport();
   if (radioAudioWorklet) {
     radioAudioWorklet.port.postMessage({ type: 'stop' });
     radioAudioWorklet.port.onmessage = null;
@@ -969,7 +1001,9 @@ async function startRadioMicrophone() {
     if (generation !== radioMicGeneration || !radioAudioContext) return false;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: {
       ...(radioMicDeviceId ? { deviceId: { exact: radioMicDeviceId } } : {}),
-      channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false,
+      // Preserve the radio modulation signal instead of applying call-oriented
+      // processing before the mic meter, gain and PCM encoder receive it.
+      channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false,
     } });
     if (generation !== radioMicGeneration || !radioAudioContext) {
       stream.getTracks().forEach(track => track.stop()); return false;
@@ -979,24 +1013,43 @@ async function startRadioMicrophone() {
     // The uplink owns a connection of its own. Sharing the RX socket made the
     // two directions head-of-line coupled: a backpressured microphone stream
     // delayed listening audio on the same TCP connection.
+    ensureRadioMicTransport();
     openRadioMicUplink();
     await initializeRadioMicWorklet();
     if (generation !== radioMicGeneration || radioMicStream !== stream) return false;
     if (radioMicWorklet) {
-      radioMicWorklet.port.onmessage = (event) => {
-        if (event.data?.type === 'pcm') handleRadioMicBlock(event.data);
-      };
-      radioMicWorklet.port.postMessage({ type: 'config', gain: radioMicGain, outputRate: radioSampleRate });
       radioMicSource.connect(radioMicWorklet);
       radioMicWorklet.connect(radioAudioContext.destination);
+      if (radioMicWorker) {
+        radioMicWorker.postMessage({
+          type: 'attachWorklet',
+          port: radioMicWorklet.port,
+          capture_generation: radioMicGeneration,
+          sample_rate: radioSampleRate,
+        }, [radioMicWorklet.port]);
+        radioMicWorkletPortTransferred = true;
+      } else {
+        // A browser without module workers keeps the capture-age-unknown path
+        // visible while preserving the existing main-thread transport.
+        radioMicWorklet.port.onmessage = (event) => {
+          if (event.data?.type === 'pcm') handleRadioMicBlock(event.data);
+        };
+        radioMicWorklet.port.postMessage({ type: 'config', gain: radioMicGain, outputRate: radioSampleRate });
+        radioMicWorklet.port.postMessage({ type: 'capture_generation', capture_generation: radioMicGeneration });
+      }
     } else {
       // Without a worklet the same 20 ms encode runs on the main thread. Capture
       // keeps working; only the audio-thread resampler is missing.
       radioMicProcessor = radioAudioContext.createScriptProcessor(1024, 1, 1);
       radioMicProcessor.onaudioprocess = (event) => {
-        const { pcm, peak } = encodeMicrophonePcm(event.inputBuffer.getChannelData(0), radioAudioContext.sampleRate, radioSampleRate, radioMicGain);
+        const { pcm, peak } = encodeMicrophonePcm(
+          event.inputBuffer.getChannelData(0),
+          radioAudioContext.sampleRate,
+          radioSampleRate,
+          radioMicGain,
+        );
         updateRadioMicMeter(peak);
-        sendRadioMicBlock(pcm.buffer);
+        sendRadioMicBlock(pcm.buffer, { level: peak, peak, rms: 0, clipped: peak >= 0.999 ? 1 : 0 });
       };
       radioMicSource.connect(radioMicProcessor);
       radioMicProcessor.connect(radioAudioContext.destination);
@@ -1006,7 +1059,9 @@ async function startRadioMicrophone() {
     }));
     await refreshRadioMicrophones();
     if (generation !== radioMicGeneration || radioMicStream !== stream) return false;
-    document.getElementById('radio-audio-status').textContent = 'Microphone streaming to Pi-Sat; PTT when ready.';
+    document.getElementById('radio-audio-status').textContent = radioMicWorker
+      ? 'Microphone ready; PTT when ready.'
+      : 'Microphone ready in compatibility mode. PTT when ready.';
     return true;
   } catch (error) {
     if (generation === radioMicGeneration) stopRadioMicrophone();
@@ -1021,11 +1076,16 @@ function stopRadioMicrophone() {
   radioMicStream?.getTracks().forEach(track => track.stop());
   radioMicStream = null;
   if (radioMicWorklet) {
-    radioMicWorklet.port.postMessage({ type: 'stop' });
-    radioMicWorklet.port.onmessage = null;
+    if (radioMicWorkletPortTransferred && radioMicWorker) {
+      radioMicWorker.postMessage({ type: 'detachWorklet', capture_generation: radioMicGeneration - 1 });
+    } else if (!radioMicWorkletPortTransferred) {
+      radioMicWorklet.port.postMessage({ type: 'stop' });
+      radioMicWorklet.port.onmessage = null;
+      radioMicWorklet.port.close();
+    }
     radioMicWorklet.disconnect();
-    radioMicWorklet.port.close();
   }
+  radioMicWorkletPortTransferred = false;
   radioMicWorklet = radioMicWorkletLoading = null;
   if (radioMicProcessor) radioMicProcessor.onaudioprocess = null;
   radioMicProcessor?.disconnect(); radioMicProcessor = null;
@@ -1044,7 +1104,7 @@ function encodeMicrophonePcm(input, inputRate, outputRate, gain) {
     const start = index * input.length / count, end = (index + 1) * input.length / count;
     let total = 0;
     // Average each source interval when downsampling instead of discarding
-    // all but one sample. Browser audio processing remains enabled for speech.
+    // all but one sample.
     for (let at = Math.floor(start); at < Math.ceil(end); at++) {
       total += input[Math.min(at, input.length - 1)] * (Math.min(end, at + 1) - Math.max(start, at));
     }
@@ -1055,12 +1115,147 @@ function encodeMicrophonePcm(input, inputRate, outputRate, gain) {
   return { pcm, peak };
 }
 
-// The microphone uplink is deliberately not gated on PTT. Capture streams for as
-// long as the session is up, and the core decides what the radio should hear:
-// transmit audio only reaches the radio while a key is commanded and no paced
-// stream owns the buffer. An always-on uplink costs about 256 kbit/s upstream and
-// removes the key-up transient entirely, because there is no stream to start.
+// Capture and the uplink stay alive for the radio session. The worker only puts
+// PCM on that uplink for a confirmed key; release and re-key wait for the new
+// server generation instead of carrying an earlier frame into the new burst.
+function ensureRadioMicTransport() {
+  if (radioMicWorker) return radioMicWorker;
+  if (radioMicCompatibilityMode) return null;
+  if (typeof Worker !== 'function') {
+    radioMicCompatibilityMode = true;
+    addLog('Microphone compatibility mode is active. Live audio continues with basic timing checks.');
+    return null;
+  }
+  try {
+    const worker = new Worker('/radio-mic-worker.js?v=20261030-micworker1');
+    worker.onmessage = ({ data }) => handleRadioMicWorkerMessage(worker, data);
+    worker.onerror = () => recoverRadioMicWorker(worker);
+    worker.onmessageerror = () => recoverRadioMicWorker(worker);
+    radioMicWorker = worker;
+    radioMicWorker.postMessage({
+      type: 'config',
+      gain: radioMicGain,
+      outputRate: radioSampleRate,
+    });
+    radioMicWorker.postMessage({
+      type: 'pttState',
+      active: radioMicPttActive,
+      generation: radioMicTxGeneration,
+    });
+    return worker;
+  } catch (error) {
+    radioMicWorker = null;
+    radioMicCompatibilityMode = true;
+    addLog(`Microphone compatibility mode is active. Live audio continues with basic timing checks: ${error.message || error}`);
+    return null;
+  }
+}
+
+function handleRadioMicWorkerMessage(worker, data) {
+  if (worker !== radioMicWorker || !data) return;
+  if (data.type === 'meter') {
+    updateRadioMicMeter(data.level);
+    return;
+  }
+  if (data.type === 'uplink') {
+    const healthy = data.healthy === true;
+    if (healthy && !radioMicUplinkHealthy) addLog('Microphone uplink to Pi-Sat connected.');
+    if (!healthy && radioMicUplinkHealthy) addLog('Microphone uplink closed; it reconnects while capture is on.');
+    radioMicUplinkHealthy = healthy;
+    return;
+  }
+  if (data.type === 'status') {
+    radioMicWorkerStatus = data;
+    if (data.mode === 'fallback' && radioMicStream) {
+      const status = document.getElementById('radio-audio-status');
+      if (status) status.textContent = 'Microphone is ready in compatibility mode. PTT when ready.';
+    }
+    return;
+  }
+  if (data.type === 'degraded') {
+    addLog('Microphone compatibility mode is active. Live audio continues with basic timing checks.');
+  }
+}
+
+function recoverRadioMicWorker(worker) {
+  if (worker !== radioMicWorker) return;
+  const now = Date.now();
+  const failedGeneration = radioMicGeneration;
+  radioMicCompatibilityMode = true;
+  radioMicWorker = null;
+  radioMicWorkerStatus = null;
+  try { worker.terminate(); } catch { /* Worker already stopped. */ }
+  if (now - radioMicWorkerErrorAt < 3000) {
+    addLog('Microphone transport failed again; reconnect the radio to retry enhanced microphone transport.');
+    return;
+  }
+  radioMicWorkerErrorAt = now;
+  addLog('Microphone transport failed; restarting in compatibility mode.');
+  restartRadioMicrophoneInCompatibilityMode(failedGeneration);
+}
+
+function restartRadioMicrophoneInCompatibilityMode(failedGeneration, deadline = Date.now() + 5000) {
+  const restart = () => {
+    // A later disconnect or device change invalidates this recovery attempt.
+    if (failedGeneration !== radioMicGeneration || !radioAudioContext) return;
+    if (radioMicStarting) {
+      if (Date.now() < deadline) window.setTimeout(restart, 25);
+      return;
+    }
+    if (!radioMicStream) return;
+    stopRadioMicrophone();
+    const restartedGeneration = radioMicGeneration;
+    window.setTimeout(() => {
+      if (restartedGeneration !== radioMicGeneration || !radioAudioContext) return;
+      void startRadioMicrophone();
+    }, 0);
+  };
+  window.setTimeout(restart, 0);
+}
+
+function syncRadioMicTransportState(state) {
+  if (!state) return;
+  const hasPtt = Object.prototype.hasOwnProperty.call(state, 'ptt');
+  const hasPttPending = Object.prototype.hasOwnProperty.call(state, 'ptt_pending');
+  const hasGeneration = Object.prototype.hasOwnProperty.call(state, 'transmit_generation')
+    || Object.prototype.hasOwnProperty.call(state, 'transport_diagnostics');
+  // Scope-only and other partial state frames must not look like a PTT release.
+  if (!hasPtt && !hasPttPending && !hasGeneration) return;
+  const previousActive = radioMicPttActive;
+  const previousGeneration = radioMicTxGeneration;
+  const reportedGeneration = Number(
+    state.transmit_generation ?? state.transport_diagnostics?.tx_audio_epoch,
+  );
+  let nextGeneration = previousGeneration;
+  if (hasGeneration && Number.isFinite(reportedGeneration) && reportedGeneration > 0) {
+    nextGeneration = reportedGeneration;
+  } else if ((hasPtt && state.ptt !== true) || (hasPttPending && state.ptt_pending === false)) {
+    nextGeneration = 0;
+  }
+  const active = (hasPttPending && state.ptt_pending === false ? false : (hasPtt ? state.ptt === true : radioMicPttActive))
+    && state.ptt_pending !== false
+    && state.tuning_tone !== true
+    && nextGeneration > 0;
+  if (active === previousActive && nextGeneration === previousGeneration) return;
+  radioMicPttActive = active;
+  radioMicTxGeneration = active ? nextGeneration : 0;
+  radioMicWorker?.postMessage({
+    type: 'pttState',
+    active: radioMicPttActive,
+    generation: radioMicTxGeneration,
+  });
+}
+
+function prepareRadioMicPttRelease() {
+  radioMicPttActive = false;
+  radioMicTxGeneration = 0;
+  radioMicWorker?.postMessage({ type: 'pttState', active: false, generation: 0 });
+}
+
+window.prepareRadioMicPttRelease = prepareRadioMicPttRelease;
+
 function openRadioMicUplink() {
+  if (radioMicWorker) return;
   const current = radioMicSocket;
   if (current && [WebSocket.OPEN, WebSocket.CONNECTING].includes(current.readyState)) return;
   // Each capture frame calls in here while the uplink is down, so a failed
@@ -1104,13 +1299,41 @@ function closeRadioMicUplink() {
   socket.close();
 }
 
+function shutdownRadioMicTransport() {
+  const worker = radioMicWorker;
+  radioMicWorker = null;
+  radioMicWorkerStatus = null;
+  radioMicPttActive = false;
+  radioMicTxGeneration = 0;
+  radioMicCompatibilityMode = false;
+  if (worker) {
+    try { worker.postMessage({ type: 'shutdown' }); } catch { /* Worker already stopped. */ }
+    window.setTimeout(() => {
+      try { worker.terminate(); } catch { /* Worker already stopped. */ }
+    }, 100);
+  }
+  closeRadioMicUplink();
+}
+
 function handleRadioMicBlock(data) {
   updateRadioMicMeter(data.level);
   sendRadioMicBlock(data.pcm);
 }
 
-function sendRadioMicBlock(pcm) {
+function sendRadioMicBlock(pcm, metrics = {}) {
   if (!(pcm instanceof ArrayBuffer) || !pcm.byteLength || pcm.byteLength % 2) return;
+  if (radioMicWorker) {
+    radioMicWorker.postMessage({
+      type: 'fallbackPcm',
+      pcm,
+      level: metrics.level,
+      peak: metrics.peak,
+      rms: metrics.rms,
+      clipped: metrics.clipped,
+      sample_rate: radioSampleRate,
+    }, [pcm]);
+    return;
+  }
   let socket = radioMicSocket;
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     // Capture is running, so the uplink is expected to exist. A dropped
@@ -1137,8 +1360,17 @@ function updateRadioMicMeter(level) {
 }
 
 function applyRadioMicGain(gain) {
-  radioMicGain = gain;
-  radioMicWorklet?.port.postMessage({ type: 'config', gain });
+  const value = Number(gain);
+  if (!Number.isFinite(value)) return;
+  radioMicGain = Math.max(0, Math.min(4, value));
+  radioMicWorker?.postMessage({ type: 'config', gain: radioMicGain });
+  if (!radioMicWorker) radioMicWorklet?.port.postMessage({ type: 'config', gain: radioMicGain });
+  try {
+    window.localStorage?.setItem(
+      RADIO_MIC_GAIN_STORAGE_KEY,
+      String(Math.round(radioMicGain * 50)),
+    );
+  } catch { /* The applied gain still works without persistent storage. */ }
 }
 
 async function initializeRadioMicWorklet() {
@@ -1147,7 +1379,7 @@ async function initializeRadioMicWorklet() {
   if (radioMicWorkletLoading) return radioMicWorkletLoading;
   const generation = radioMicGeneration;
   const pending = (async () => {
-    await context.audioWorklet.addModule('/radio-mic-worklet.js?v=20260916-uplink1');
+    await context.audioWorklet.addModule('/radio-mic-worklet.js?v=20261030-clock1');
     if (generation !== radioMicGeneration || context !== radioAudioContext) return;
     radioMicWorklet = new AudioWorkletNode(context, 'radio-mic', {
       numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
@@ -2752,12 +2984,7 @@ function buildSettingsExperienceSelector(mode) {
 }
 
 function settingsExperienceModeFromSettings(settings = {}) {
-  if (Object.hasOwn(settings?.icom || {}, 'enabled')) {
-    return String(settings.icom.enabled).toLowerCase() === 'true' ? 'native' : 'legacy';
-  }
-  const nativeRole = [settings?.rx?.device_id, settings?.tx?.device_id]
-    .some((deviceId) => String(deviceId || '') === NATIVE_ICOM_DEVICE_ID);
-  return nativeRole ? 'native' : 'legacy';
+  return String(settings?.icom?.enabled).toLowerCase() === 'true' ? 'native' : 'legacy';
 }
 
 function settingsExperienceModeFromForm(form = document.getElementById('settings-form')) {
@@ -2796,6 +3023,12 @@ function applySettingsExperienceDraft(settings, mode) {
   }
   settings.icom.enabled = mode === 'native' ? 'true' : 'false';
   if (mode !== 'native') {
+    ['rx', 'tx'].forEach((role) => {
+      if (settings[role]?.device_id === NATIVE_ICOM_DEVICE_ID) {
+        settings[role].device_id = '';
+        settings[role].target_vfo = '';
+      }
+    });
     return;
   }
   settings.rx = {
@@ -3827,6 +4060,24 @@ function refreshRoleDeviceSelectors() {
       return;
     }
     const currentValue = select.value;
+    const storedValue = currentSettingsState?.[section]?.device_id || '';
+    const nativeEnabled = settingsExperienceModeFromForm() === 'native';
+    const clearLegacyNative = (
+      !nativeEnabled
+      && (
+        currentValue === NATIVE_ICOM_DEVICE_ID
+        || storedValue === NATIVE_ICOM_DEVICE_ID
+      )
+    );
+    if (clearLegacyNative) {
+      currentSettingsState[section] = {
+        ...(currentSettingsState[section] || {}),
+        device_id: '',
+        target_vfo: '',
+      };
+      const target = document.querySelector(`select[name="${section}.target_vfo"]`);
+      if (target) target.value = '';
+    }
     const otherSection = section === 'rx' ? 'tx' : 'rx';
     const otherSelectedDeviceId = document.querySelector(`select[name="${otherSection}.device_id"]`)?.value || '';
     const replacement = buildCatDeviceSelect(currentValue, {
@@ -3854,7 +4105,7 @@ function refreshRoleTargetSelectors() {
     if (!select) {
       return;
     }
-    const currentValue = select.value;
+    const currentValue = select.value || 'current';
     const deviceId = document.querySelector(`select[name="${section}.device_id"]`)?.value
       || currentSettingsState?.[section]?.device_id
       || '';
@@ -5057,15 +5308,17 @@ function buildCatDeviceSelect(value, options = {}) {
   blank.textContent = 'Select device';
   control.appendChild(blank);
 
-  const selectedValue = String(value || '');
-  const nativeOption = document.createElement('option');
-  nativeOption.value = NATIVE_ICOM_DEVICE_ID;
   const nativeEnabled = settingsExperienceModeFromForm() === 'native';
-  nativeOption.textContent = nativeEnabled
-    ? 'Icom IC-9700 (Native Pi-Sat)'
-    : 'Icom IC-9700 (Native Pi-Sat - choose Native above)';
-  nativeOption.disabled = !nativeEnabled;
-  control.appendChild(nativeOption);
+  const requestedValue = String(value || '');
+  const selectedValue = (
+    nativeEnabled || requestedValue !== NATIVE_ICOM_DEVICE_ID
+  ) ? requestedValue : '';
+  if (nativeEnabled) {
+    const nativeOption = document.createElement('option');
+    nativeOption.value = NATIVE_ICOM_DEVICE_ID;
+    nativeOption.textContent = 'Icom IC-9700 (Native Pi-Sat)';
+    control.appendChild(nativeOption);
+  }
   const selectableDevices = catDevicesCache.filter((device) => {
     const connectivity = String(device.connectivity || '').toLowerCase();
     if (!allowNetwork && connectivity !== 'local') {
@@ -5308,6 +5561,7 @@ async function saveSettings(event) {
     settings[section][key] = element.value;
   });
   const experienceMode = settingsExperienceModeFromForm(form);
+  applySettingsExperienceDraft(settings, experienceMode);
   const experienceError = settingsExperienceValidationError(settings, experienceMode);
   if (experienceError) {
     status.textContent = experienceError;
@@ -5317,7 +5571,6 @@ async function saveSettings(event) {
     form.querySelector(`select[name="${role}.device_id"]`)?.focus();
     return;
   }
-  applySettingsExperienceDraft(settings, experienceMode);
 
   const orbitalSourceChanged = settings.tle?.source_url !== undefined
     && settings.tle.source_url !== currentSettingsState?.tle?.source_url;
@@ -6214,7 +6467,10 @@ function drawPassArc() {
   ctx.textAlign = 'left'; ctx.fillText(`AOS  ${formatTimeOnly(new Date(aosMs), false)}`, 8, height - 2);
   ctx.textAlign = 'center';
   ctx.fillText(`${Number(pass.max_elevation_deg).toFixed(0)}° MAX`, width * peakAt, 11);
-  ctx.fillText(`MAX  ${Number.isFinite(maximumMs) ? formatTimeOnly(new Date(maximumMs), false) : '—'}`, width * peakAt, height - 2);
+  const azimuthPath = [pass.start_azimuth_deg, pass.middle_azimuth_deg, pass.end_azimuth_deg]
+    .map((value) => formatNumber(value, 0, '\u00B0'))
+    .join(' -> ');
+  ctx.fillText(`AZ Path: ${azimuthPath}`, width * peakAt, height - 2);
   ctx.textAlign = 'right'; ctx.fillText(`LOS  ${formatTimeOnly(new Date(losMs), false)}`, width - 8, height - 2);
   const secondsToLos = Math.max(0, Math.floor((losMs - nowMs) / 1000));
   if (state) state.textContent = active ? 'Pass in progress' : nowMs < aosMs ? 'Upcoming pass' : 'Pass complete';

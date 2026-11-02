@@ -9,7 +9,15 @@ import asyncio
 # times per second, forcing a full browser re-render that competed with audio
 # delivery and waterfall painting. Real state changes still send immediately,
 # and the counters ride along on those sends and the periodic heartbeat.
-_VOLATILE_STATE_KEYS = frozenset({"rx_audio_packets", "tx_audio_packets", "scope_lines"})
+_VOLATILE_STATE_KEYS = frozenset({
+    "rx_audio_packets",
+    "tx_audio_packets",
+    "scope_lines",
+    "transport_diagnostics",
+    "tx_audio_udp_packets",
+    "tx_audio_udp_spacing_min_ms",
+    "tx_audio_udp_spacing_max_ms",
+})
 
 # Scope lines are sampled at the display rate so a radio sweep is not aliased
 # away by a slower polling loop. Delivery is still latest-frame-only.

@@ -1,8 +1,21 @@
 """Keep microphone backpressure and failures isolated from RX audio delivery."""
 import asyncio
+import json
 import logging
 from contextlib import suppress
+import secrets
+from threading import Event, Lock, Thread
 from time import monotonic
+
+from pi_sat_controller.backend.radio.mic_transport import (
+    LegacyMicFrame,
+    MIC_MAX_AGE_S,
+    MicrophoneDiagnostics,
+    MicrophoneMailbox,
+    MicrophoneSessionValidator,
+    MalformedMicFrame,
+    parse_mic_message,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -71,7 +84,13 @@ async def stream_audio(websocket, controller, get_controller, *, holds_microphon
                 await asyncio.to_thread(controller.release_ptt_if_audio_source_lost)
 
 
-async def stream_microphone(websocket, controller, get_controller) -> None:
+async def stream_microphone(
+    websocket,
+    controller,
+    get_controller,
+    *,
+    debug_enabled=None,
+) -> None:
     """Receive browser microphone PCM on a socket of its own.
 
     One frame that cannot reach the radio must never end this session: the
@@ -80,23 +99,148 @@ async def stream_microphone(websocket, controller, get_controller) -> None:
     the pump keeps draining, so a recovered link recovers quietly. RX audio is
     unaffected either way because it travels on another connection.
     """
-    reported = False
+    transport_id = secrets.randbits(32) or 1
+    sample_rate = int(controller.config.sample_rate)
+    validator = MicrophoneSessionValidator(
+        transport_id=transport_id,
+        sample_rate=sample_rate,
+    )
+    enabled = debug_enabled or (lambda: False)
+    diagnostics = MicrophoneDiagnostics(debug_enabled=enabled)
+    reported_errors: set[str] = set()
+    reported_lock = Lock()
+
+    def transport_metrics() -> dict:
+        snapshot = controller.try_snapshot()
+        metrics = dict(snapshot.get("transport_diagnostics", {}))
+        for key in (
+            "tx_audio_udp_spacing_min_ms",
+            "tx_audio_udp_spacing_max_ms",
+        ):
+            if key in snapshot:
+                metrics[key] = snapshot[key]
+        return metrics
+
+    def report_worker_error(exc: Exception) -> None:
+        error_type = type(exc).__name__
+        with reported_lock:
+            first = error_type not in reported_errors
+            reported_errors.add(error_type)
+        if first:
+            LOGGER.warning("Microphone audio is not reaching the radio: %s", exc)
+
+    mailbox = MicrophoneMailbox(
+        controller=controller,
+        diagnostics=diagnostics,
+        on_error=report_worker_error,
+        is_current=lambda: controller is get_controller(),
+    )
     try:
+        await websocket.send_json({
+            "type": "mic_ready",
+            "transport_id": transport_id,
+            "sample_rate": sample_rate,
+        })
+        mailbox.start()
         while controller is get_controller():
-            incoming = await websocket.receive_bytes()
+            incoming = await websocket.receive()
+            if incoming["type"] == "websocket.disconnect":
+                break
+            text = incoming.get("text")
+            if text is not None:
+                try:
+                    message = json.loads(text)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if message.get("type") == "mic_sync":
+                    t1 = monotonic()
+                    await websocket.send_json({
+                        "type": "mic_sync",
+                        "id": message.get("id"),
+                        # The browser handshake clock uses milliseconds.
+                        "t1": t1 * 1000.0,
+                        "t2": monotonic() * 1000.0,
+                    })
+                elif message.get("type") == "mic_diagnostics":
+                    counters = message.get("counters")
+                    if isinstance(counters, dict):
+                        diagnostics.update_client(counters)
+                        diagnostics.maybe_emit(
+                            monotonic(),
+                            transport_diagnostics=transport_metrics,
+                        )
+                continue
+            payload = incoming.get("bytes")
+            if payload is None:
+                continue
+            received_at = monotonic()
             try:
-                # The microphone path is gated by the controller's own transmit
-                # state and never waits on the CI-V controller lock, so browser
-                # audio keeps flowing while tracking work is in progress.
-                await asyncio.to_thread(controller.send_microphone_audio, incoming)
-            except Exception as exc:
-                if not reported:
-                    reported = True
-                    LOGGER.warning("Microphone audio is not reaching the radio: %s", exc)
+                frame = parse_mic_message(payload)
+            except MalformedMicFrame:
+                diagnostics.drop("malformed")
+                continue
+            if isinstance(frame, LegacyMicFrame):
+                if (
+                    len(frame.pcm) < 2
+                    or len(frame.pcm) % 2
+                    or len(frame.pcm) > round(sample_rate * MIC_MAX_AGE_S) * 2
+                ):
+                    diagnostics.drop("frame_size")
+                    continue
+                frame = LegacyMicFrame(
+                    pcm=frame.pcm,
+                    received_at=received_at,
+                    tx_generation=controller.transmit_generation,
+                )
+                diagnostics.legacy()
             else:
-                reported = False
+                validation = validator.validate(frame, received_at=received_at)
+                if isinstance(validation, str):
+                    diagnostics.drop(validation)
+                    continue
+                age_s, gap_s, sequence_gap = validation
+                if sequence_gap:
+                    diagnostics.gap()
+                diagnostics.received(
+                    frame,
+                    received_at=received_at,
+                    age_s=age_s,
+                    gap_s=gap_s,
+                )
+            mailbox.submit(frame)
+            diagnostics.maybe_emit(
+                monotonic(),
+                transport_diagnostics=transport_metrics,
+            )
     finally:
-        # This socket is the only microphone path into the radio, so its end must
-        # release a key that only Pi-Sat could have been feeding.
-        if controller is get_controller():
-            await asyncio.to_thread(controller.release_ptt_if_audio_source_lost)
+        cleanup_done = Event()
+
+        def cleanup() -> None:
+            # Keep stop and release in one thread so cancellation cannot land
+            # between them and skip the safety-critical unkey.
+            try:
+                mailbox.stop()
+                if controller is get_controller():
+                    # Only the socket that supplied the active transmission may
+                    # release it; an old reconnect cannot unkey its replacement.
+                    controller.release_ptt_if_audio_source_lost(transport_id)
+            finally:
+                cleanup_done.set()
+
+        Thread(
+            target=cleanup,
+            name="icom-microphone-cleanup",
+            daemon=True,
+        ).start()
+        deadline = monotonic() + 2.0
+        while not cleanup_done.is_set() and monotonic() < deadline:
+            try:
+                # Keep yielding to RX and other WebSocket work while a blocked
+                # controller release finishes on its owned cleanup thread.
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                # Repeated cancellation cannot stop the owned cleanup thread;
+                # continue only within the bounded teardown window.
+                continue

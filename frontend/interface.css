@@ -65,6 +65,14 @@ a { color: var(--station-blue); text-underline-offset: 3px; }
 .standard-page-header > .card-body { padding: 4px 0 18px; }
 .standard-page-header h1 { font-size: 24px; margin: 0; font-weight: 600; }
 .standard-page-header p { color: var(--station-muted); font-size: 12px; margin: 5px 0 0; }
+#audio-recordings-page .standard-page-header > .card-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 430px);
+  align-items: center;
+  column-gap: 32px;
+}
+#audio-recordings-page .standard-page-header h1,
+#audio-recordings-page .standard-page-header p { grid-column: 1; }
 .app-section-nav { border-top: 0; padding: 0 0 8px; }
 .card { background: var(--station-panel); border-color: var(--station-line); border-radius: 8px; box-shadow: none; }
 .card-header { background: #182430; border-color: var(--station-line); padding: 13px 16px; }
@@ -90,7 +98,50 @@ a { color: var(--station-blue); text-underline-offset: 3px; }
 .audio-recording-details strong { font-size: 13px; font-weight: 600; }
 .audio-recording-details span,
 .audio-recordings-empty { color: var(--station-muted); font-size: 11px; }
-.audio-recording-action { min-width: 72px; }
+.audio-recording-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.audio-recording-icon-button,
+.audio-recording-transport-button {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  color: #a8c9e8;
+  background: #101c28;
+  border: 1px solid #3a5167;
+  border-radius: 5px;
+}
+.audio-recording-icon-button:hover,
+.audio-recording-transport-button:hover:not(:disabled) { background: #172b3e; border-color: #5f83a2; }
+.audio-recording-icon-button svg,
+.audio-recording-transport-button svg { width: 16px; height: 16px; fill: currentColor; stroke: none; }
+.audio-recording-transport-button:disabled { opacity: .38; cursor: default; }
+.audio-recording-play,
+.audio-recording-resume { color: #4ade80; }
+.audio-recording-play[data-active="true"] { background: #13291f; border-color: #4ade80; }
+.audio-recording-pause { color: #facc15; }
+.audio-recording-stop { color: #ef4444; }
+.audio-recording-download { color: #9fd4ff; }
+.audio-recording-download svg { fill: none; stroke: currentColor; stroke-width: 1.8; }
+.audio-recording-transport {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.audio-recording-time {
+  flex: 0 0 auto;
+  color: var(--station-muted);
+  font: 10px Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.audio-recording-range { flex: 1 1 auto; width: 100%; min-width: 48px; margin: 0; accent-color: var(--station-blue); }
+.audio-recording-range:disabled { opacity: .45; }
 .audio-recordings-empty { margin: 0; }
 .form-control, .form-select { color: #e4edf5; background-color: #101c28; border-color: #3a5167; font-size: 12px; min-height: 33px; }
 .form-control:focus, .form-select:focus { color: #fff; background-color: #152739; border-color: #7dbaff; box-shadow: none; }
@@ -262,8 +313,15 @@ a { color: var(--station-blue); text-underline-offset: 3px; }
   .operation-face svg { width: 22px; height: 22px; }
   .station-operation small { font-size: 9px; }
   .station-operation > span:not(.operation-face) { max-width: 43px; line-height: 1.2; min-height: 19px; }
+  #audio-recordings-page .standard-page-header > .card-body { grid-template-columns: minmax(0, 1fr); row-gap: 14px; }
+  #audio-recordings-page .standard-page-header p { grid-column: 1; }
+  .audio-recording-transport { grid-column: 1; grid-row: auto; width: 100%; }
+  .audio-recording-row { flex-wrap: wrap; gap: 10px; }
+  .audio-recording-details { flex: 1 1 180px; }
 }
 @media (max-width: 520px) {
+  .audio-recording-actions { width: 100%; }
+  .audio-recording-actions { justify-content: flex-start; }
   #station-pass-content { padding-inline: 12px; }
   #station-pass-content .rotator-manual-controls, #station-pass-content .rotator-manual-actions { display: grid; grid-template-columns: minmax(0, 1fr); }
   #station-pass-content .rotator-manual-controls input, #station-pass-content .rotator-manual-actions .btn { width: 100%; }

@@ -119,6 +119,7 @@ if IMPORT_ERROR is None:
             self._trimmed_frames = 0
             self._peak_backlog_ms = 0
             self._first_recv_logged = False
+            self._prerolled = False
 
         async def _wait_for_slot(self) -> None:
             target = self._next_frame_at
@@ -166,6 +167,21 @@ if IMPORT_ERROR is None:
             for packet in self._controller.read_audio(self._queue):
                 self._append_resampled(packet)
 
+        async def _wait_for_cushion(self) -> None:
+            """Build the configured playout cushion before the first frame."""
+            target = _frame_bytes(TARGET_BUFFER_MS)
+            while (
+                not self._ended
+                and self._controller is self._get_controller()
+                and len(self._audio) < target
+            ):
+                await asyncio.sleep(FRAME_MS / 4000)
+                self._fill()
+            self._prerolled = True
+            # The pre-roll is outside the RTP cadence; restart its deadline from
+            # the moment the cushion is ready instead of bursting to catch up.
+            self._next_frame_at = monotonic()
+
         async def recv(self):
             if self._ended or self.readyState != "live":
                 raise MediaStreamError
@@ -180,6 +196,9 @@ if IMPORT_ERROR is None:
                     "WebRTC RX audio track: sender started %.2fs after the track was created",
                     monotonic() - self._created_at,
                 )
+            self._fill()
+            if self._audio and not self._prerolled:
+                await self._wait_for_cushion()
             await self._wait_for_slot()
             self._fill()
             payload = bytes(self._audio[:FRAME_BYTES])
@@ -212,6 +231,7 @@ if IMPORT_ERROR is None:
                 "target_ms": TARGET_BUFFER_MS,
                 "ceiling_ms": CEILING_BUFFER_MS,
                 "first_audio_after_s": first_audio,
+                "prerolled": self._prerolled,
             }
 
         def end(self) -> None:

@@ -107,6 +107,10 @@ class IcomLanConnectivity:
         # Embedded TX-audio counter: a separate, zero-based per-fragment stream
         # counter (not the transport sequence) that rolls over through 0.
         self._audio_send_seq = 0
+        self._tx_audio_udp_packets = 0
+        self._tx_audio_last_udp_at: float | None = None
+        self._tx_audio_udp_spacing_min_s: float | None = None
+        self._tx_audio_udp_spacing_max_s = 0.0
         self._reset_rx_audio_statistics()
         self._tx_pcm_buffer = bytearray()
         self._stage = "idle"
@@ -129,6 +133,12 @@ class IcomLanConnectivity:
             "rx_audio_duplicates": self._rx_audio_duplicates,
             "rx_audio_out_of_order": self._rx_audio_out_of_order,
             "rx_audio_last_sequence": self._rx_audio_last_sequence,
+            "tx_audio_udp_packets": self._tx_audio_udp_packets,
+            "tx_audio_udp_spacing_min_ms": (
+                None if self._tx_audio_udp_spacing_min_s is None
+                else round(self._tx_audio_udp_spacing_min_s * 1000, 1)
+            ),
+            "tx_audio_udp_spacing_max_ms": round(self._tx_audio_udp_spacing_max_s * 1000, 1),
         }
 
     def connect(self) -> None:
@@ -139,6 +149,10 @@ class IcomLanConnectivity:
         self._auth_inner_seq = self._AUTH_INNER_SEQ_START
         self._civ_seq = 1
         self._audio_send_seq = 0
+        self._tx_audio_udp_packets = 0
+        self._tx_audio_last_udp_at = None
+        self._tx_audio_udp_spacing_min_s = None
+        self._tx_audio_udp_spacing_max_s = 0.0
         self._reset_rx_audio_statistics()
         self._last_keepalive = monotonic()
         self._last_ping = self._last_keepalive
@@ -654,7 +668,20 @@ class IcomLanConnectivity:
         payload.extend(pcm)
         packet = self._header(0, length=16 + len(payload),
                               seq=transport_sequence, sock=self._audio) + bytes(payload)
+        sent_at = monotonic()
         self._send_tracked(self._audio, packet, self._audio_remote_port)
+        if self._tx_audio_last_udp_at is not None:
+            spacing = max(0.0, sent_at - self._tx_audio_last_udp_at)
+            self._tx_audio_udp_spacing_min_s = (
+                spacing if self._tx_audio_udp_spacing_min_s is None
+                else min(self._tx_audio_udp_spacing_min_s, spacing)
+            )
+            self._tx_audio_udp_spacing_max_s = max(
+                self._tx_audio_udp_spacing_max_s,
+                spacing,
+            )
+        self._tx_audio_last_udp_at = sent_at
+        self._tx_audio_udp_packets += 1
 
     @classmethod
     def _passcode(cls, value: str) -> bytes:

@@ -264,6 +264,8 @@ class IcomRadioController:
         # Transmit audio is gated on this, not on the radio's readback, which
         # can lag or flicker while the transmitter is running.
         self._ptt_commanded = False
+        self._tx_generation_started_at: float | None = None
+        self._browser_mic_transport_id: int | None = None
         # Set by a caller that feeds its own real-time paced stream (the APRS
         # modulator). Silence fill must never insert frames into that stream.
         self._transmit_paced = False
@@ -286,6 +288,10 @@ class IcomRadioController:
         self._lock_wait_max_s = 0.0
         self._lock_hold_max_s = 0.0
         self._tx_audio_write_max_s = 0.0
+        self._tx_audio_lock_wait_max_s = 0.0
+        self._tx_audio_last_write_at: float | None = None
+        self._tx_audio_spacing_min_s: float | None = None
+        self._tx_audio_spacing_max_s = 0.0
         # --- Transceive handling. The radio pushes untagged timestamps 0x00
         # (frequency) and 0x01 (mode); the shared command history tells us when
         # one is the echo of a write we just made so it costs nothing to apply.
@@ -329,6 +335,7 @@ class IcomRadioController:
         payload["tx_meters"]["age_s"] = int(now - self._state.tx_meter_updated) if self._state.tx_meter_updated is not None else None
         payload.update({"sample_rate": self.config.sample_rate, "rx_codec": self.config.rx_codec, "tx_codec": "lpcm16_mono",
                         "rx_channels": 2 if self.config.rx_codec == "lpcm16_stereo" else 1,
+                        "transmit_generation": self._tx_audio_epoch,
                         "connection_stage": self._stage,
                         "connection_attempt": self._connection_attempt,
                         "retry_in_s": self._retry_in_s})
@@ -900,6 +907,9 @@ class IcomRadioController:
                 # Claim the transmit band before the key reaches the radio: the
                 # retune guard reads this flag, and the radio is keyed the moment
                 # the command is accepted.
+                self._bump_tx_audio_epoch_locked()
+                self._tx_generation_started_at = monotonic()
+                self._browser_mic_transport_id = None
                 self._ptt_commanded = True
             self._write_ptt_locked(enabled)
             if enabled:
@@ -920,6 +930,11 @@ class IcomRadioController:
         key while the radio may still be transmitting.
         """
         return self._ptt_commanded or self._state.ptt is True
+
+    @property
+    def transmit_generation(self) -> int:
+        """Return the current generation without taking the controller lock."""
+        return self._tx_audio_epoch
 
     def _write_ptt_locked(self, enabled: bool) -> None:
         # IC-9700 PTT/status command is kept in the model table rather than
@@ -947,6 +962,7 @@ class IcomRadioController:
                 # report a failed key and leave it keyed.
                 self._best_effort_unkey_command("unconfirmed key")
                 self._ptt_commanded = False
+                self._tx_generation_started_at = None
                 self._bump_tx_audio_epoch_locked()
                 raise IcomRadioError("Radio PTT readback did not match the request")
             self._hold_locked(min(self._PTT_KEY_RETRY_S, max(0.0, deadline - monotonic())))
@@ -962,6 +978,8 @@ class IcomRadioController:
         """
         self._state.ptt_pending = False
         self._ptt_commanded = False
+        self._tx_generation_started_at = None
+        self._browser_mic_transport_id = None
         self._transmit_paced = False
         # A release invalidates any microphone frame still in flight, so stale
         # PCM cannot be carried into the next transmission.
@@ -973,6 +991,7 @@ class IcomRadioController:
         # frame into the next transmission would prepend it with stale samples.
         self._discard_transmit_audio()
         self._last_tx_audio_at = None
+        self._tx_audio_last_write_at = None
 
     def _service_ptt_confirmation_locked(self, now: float) -> None:
         """Advance a pending PTT command. Runs on the transport session loop."""
@@ -1031,7 +1050,7 @@ class IcomRadioController:
                 return False
             sleep(0.02)
 
-    def release_ptt_if_audio_source_lost(self) -> None:
+    def release_ptt_if_audio_source_lost(self, transport_id: int | None = None) -> None:
         """Release PTT when the session that carried the microphone ended.
 
         The microphone only reaches the radio through that session, so leaving
@@ -1040,6 +1059,12 @@ class IcomRadioController:
         """
         with self._lock:
             if not self._ptt_commanded or self._transmit_stream_claim is not None:
+                return
+            if (
+                transport_id is not None
+                and self._browser_mic_transport_id is not None
+                and transport_id != self._browser_mic_transport_id
+            ):
                 return
             try:
                 self.set_ptt(False)
@@ -1498,7 +1523,17 @@ class IcomRadioController:
         """Feed a transmit stream this server paces itself (the APRS modulator)."""
         self._send_transmit_audio(pcm, browser_source=False, transmit_token=transmit_token)
 
-    def send_microphone_audio(self, pcm: bytes) -> None:
+    def send_microphone_audio(
+        self,
+        pcm: bytes,
+        *,
+        transport_id: int | None = None,
+        tx_generation: int | None = None,
+        capture_generation: int | None = None,
+        capture_started_monotonic: float | None = None,
+        clock_uncertainty_s: float | None = None,
+        received_monotonic: float | None = None,
+    ) -> bool:
         """Transmit browser microphone PCM.
 
         The browser streams microphone capture for as long as it holds the
@@ -1508,11 +1543,30 @@ class IcomRadioController:
         a caller paces its own stream, so an APRS burst can never pick up
         microphone samples.
         """
-        self._send_transmit_audio(pcm, browser_source=True)
+        return self._send_transmit_audio(
+            pcm,
+            browser_source=True,
+            transport_id=transport_id,
+            tx_generation=tx_generation,
+            capture_generation=capture_generation,
+            capture_started_monotonic=capture_started_monotonic,
+            clock_uncertainty_s=clock_uncertainty_s,
+            received_monotonic=received_monotonic,
+        )
 
     def _send_transmit_audio(
-        self, pcm: bytes, *, browser_source: bool, transmit_token: str | None = None,
-    ) -> None:
+        self,
+        pcm: bytes,
+        *,
+        browser_source: bool,
+        transmit_token: str | None = None,
+        transport_id: int | None = None,
+        tx_generation: int | None = None,
+        capture_generation: int | None = None,
+        capture_started_monotonic: float | None = None,
+        clock_uncertainty_s: float | None = None,
+        received_monotonic: float | None = None,
+    ) -> bool:
         """Hand PCM to the transport without taking the CI-V controller lock.
 
         The commanded key, the paced flag and the connection flag are single
@@ -1521,7 +1575,7 @@ class IcomRadioController:
         microphone audio wait behind tracking and telemetry.
         """
         if not pcm:
-            return
+            return False
         if len(pcm) % 2:
             raise ValueError("Microphone PCM must contain complete 16-bit samples")
         if self.config.tx_codec not in ("lpcm16_mono", "lpcm16_stereo"):
@@ -1533,28 +1587,64 @@ class IcomRadioController:
         if not self._ptt_commanded:
             # Nothing is keyed, so transmit PCM has nowhere to go. A browser that
             # streams continuously depends on this being a quiet no-op.
-            return
+            return False
         if browser_source and self._transmit_paced:
             # A caller that paces its own transmit stream owns the radio's
             # transmit buffer for the duration, so browser samples are never
             # mixed into a modulated burst.
-            return
+            return False
         epoch = self._tx_audio_epoch
+        lock_wait_started = monotonic()
         with self._tx_audio_lock:
+            self._tx_audio_lock_wait_max_s = max(
+                self._tx_audio_lock_wait_max_s,
+                monotonic() - lock_wait_started,
+            )
             if browser_source and self._transmit_stream_claim is not None:
-                return
+                return False
             self._check_transmit_stream_token(transmit_token)
             # A release may have landed while this frame waited for the send
             # lock; stale PCM must never reach the next transmission.
             if epoch != self._tx_audio_epoch or not self._state.connected:
-                return
+                return False
+            if browser_source and tx_generation is not None:
+                if tx_generation != self._tx_audio_epoch or not self._ptt_commanded:
+                    return False
+                if (
+                    self._browser_mic_transport_id is not None
+                    and transport_id != self._browser_mic_transport_id
+                ):
+                    return False
+                if capture_started_monotonic is not None:
+                    if (
+                        self._tx_generation_started_at is None
+                        or monotonic() - capture_started_monotonic
+                        + max(0.0, clock_uncertainty_s or 0.0) > 0.100
+                        or capture_started_monotonic - max(0.0, clock_uncertainty_s or 0.0)
+                        < self._tx_generation_started_at
+                    ):
+                        return False
+                elif received_monotonic is not None:
+                    if monotonic() - received_monotonic > 0.100:
+                        return False
+                if self._browser_mic_transport_id is None:
+                    self._browser_mic_transport_id = transport_id
             started_at = monotonic()
+            if self._tx_audio_last_write_at is not None:
+                spacing = max(0.0, started_at - self._tx_audio_last_write_at)
+                self._tx_audio_spacing_min_s = (
+                    spacing if self._tx_audio_spacing_min_s is None
+                    else min(self._tx_audio_spacing_min_s, spacing)
+                )
+                self._tx_audio_spacing_max_s = max(self._tx_audio_spacing_max_s, spacing)
             packets = self.connectivity.write_audio(pcm)
             self._last_tx_audio_at = monotonic()
+            self._tx_audio_last_write_at = self._last_tx_audio_at
         self._state.tx_audio_packets += packets
         self._tx_audio_write_max_s = max(
             self._tx_audio_write_max_s, self._last_tx_audio_at - started_at
         )
+        return True
 
     def _transmit_is_active(self) -> bool:
         """Whether Pi-Sat has commanded a key, whatever the radio reports.
@@ -2493,6 +2583,12 @@ class IcomRadioController:
             "lock_wait_max_ms": round(self._lock_wait_max_s * 1000, 1),
             "lock_hold_max_ms": round(self._lock_hold_max_s * 1000, 1),
             "tx_audio_write_max_ms": round(self._tx_audio_write_max_s * 1000, 1),
+            "tx_audio_lock_wait_max_ms": round(self._tx_audio_lock_wait_max_s * 1000, 1),
+            "tx_audio_write_call_spacing_min_ms": (
+                None if self._tx_audio_spacing_min_s is None
+                else round(self._tx_audio_spacing_min_s * 1000, 1)
+            ),
+            "tx_audio_write_call_spacing_max_ms": round(self._tx_audio_spacing_max_s * 1000, 1),
             "scope_counts": {key: dict(value) for key, value in self._scope_counts.items()},
             "tx_audio_epoch": self._tx_audio_epoch,
             "tx_audio_ptt_commanded": self._ptt_commanded,
@@ -2681,6 +2777,8 @@ class IcomRadioController:
         self._state.ptt = None
         self._state.ptt_pending = None
         self._ptt_commanded = False
+        self._tx_generation_started_at = None
+        self._browser_mic_transport_id = None
         self._operator_revoked_transmit_token = None
         self._invalidate_transmit_stream_locked()
         self._ptt_idle_since = None

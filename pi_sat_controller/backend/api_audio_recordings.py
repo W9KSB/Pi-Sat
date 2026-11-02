@@ -12,6 +12,17 @@ def register_audio_recordings_api(
     *,
     get_manager: Callable[[], Any],
 ) -> None:
+    def recording_response(recording_id: str, *, download: bool) -> FileResponse:
+        path = get_manager().recording_path(recording_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="Audio recording not found")
+        return FileResponse(
+            path,
+            media_type="audio/wav",
+            filename=path.name if download else None,
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.get("/api/audio-recordings/state")
     def audio_recording_state() -> dict[str, Any]:
         return get_manager().snapshot()
@@ -31,11 +42,8 @@ def register_audio_recordings_api(
 
     @app.get("/api/audio-recordings/{recording_id}/audio")
     def play_audio_recording(recording_id: str) -> FileResponse:
-        path = get_manager().recording_path(recording_id)
-        if path is None:
-            raise HTTPException(status_code=404, detail="Audio recording not found")
-        return FileResponse(
-            path,
-            media_type="audio/wav",
-            headers={"Cache-Control": "no-store"},
-        )
+        return recording_response(recording_id, download=False)
+
+    @app.get("/api/audio-recordings/{recording_id}/download")
+    def download_audio_recording(recording_id: str) -> FileResponse:
+        return recording_response(recording_id, download=True)

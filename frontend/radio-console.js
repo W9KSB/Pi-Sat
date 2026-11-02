@@ -4,6 +4,22 @@
   const root = document.getElementById('radio-console');
   if (!root) return;
   const $ = (id) => document.getElementById(id);
+  const MIC_GAIN_STORAGE_KEY = 'pi-sat.radio.mic-gain.v2';
+  const LEGACY_MIC_GAIN_STORAGE_KEY = 'pi-sat.radio.mic-gain.v1';
+  function loadMicGainPercent() {
+    try {
+      const stored = localStorage.getItem(MIC_GAIN_STORAGE_KEY);
+      const value = stored === null ? NaN : Number(stored);
+      if (Number.isFinite(value) && value >= 0 && value <= 200) return Math.round(value);
+      const legacyStored = localStorage.getItem(LEGACY_MIC_GAIN_STORAGE_KEY);
+      const legacy = legacyStored === null ? NaN : Number(legacyStored);
+      if (Number.isFinite(legacy) && legacy >= 0 && legacy <= 400) {
+        return Math.round(legacy / 2);
+      }
+    } catch { /* Browser storage can be unavailable. */ }
+    return 100;
+  }
+  const initialMicGainPercent = loadMicGainPercent();
   const formatFrequency = (hz) => Number.isFinite(hz) && hz > 0
     ? Math.round(hz).toString().padStart(9, '0').replace(/\B(?=(\d{3})+(?!\d))/g, '.') : '---.---.---';
   const band = (hz) => hz >= 144e6 && hz < 148e6 ? '2 m' : hz >= 420e6 && hz < 450e6 ? '70 cm'
@@ -101,7 +117,7 @@
         <div class="rc-advanced-column">
       <div class="rc-mic-settings"><label>Laptop / USB microphone<select id="rc-mic-device" title="Microphone used for transmit audio; choosing another one reopens capture on it"><option value="">System default microphone</option></select></label>
         ${button('Refresh microphones', 'mic-refresh')}
-        <label>Browser mic gain<input id="rc-mic-gain" type="range" min="0" max="200" value="100"><output id="rc-mic-gain-value">100%</output></label>
+        <label>Browser mic gain<input id="rc-mic-gain" type="range" min="0" max="200" step="5" value="${initialMicGainPercent}" title="100% is the normal calibrated level (+6 dB); the range is 0% to 200% (0 to +12 dB)"><output id="rc-mic-gain-value">${initialMicGainPercent}%</output></label>
         <label>Tuning tone level<input id="rc-tuning-tone-level" type="range" min="0" max="100" step="1" value="75" title="600 Hz transmit audio level. 0% mutes the tone without releasing PTT; voice gain is unchanged."><output id="rc-tuning-tone-level-value">75%</output></label>
         <label>Mic level<meter id="rc-mic-meter" min="0" max="1" value="0" high="0.95" optimum="0.4"></meter><output id="rc-mic-level">Mic off</output></label>
       </div><p id="rc-mic-requirements">Radio on the top toolbar starts the microphone and streams it to Pi-Sat; capture does not key PTT.</p>
@@ -154,6 +170,8 @@
       </div>
     </details>
     <div class="rc-notices"><span id="rc-status" role="status">Checking radio configuration…</span><span id="rc-command-status" role="status"></span></div>`;
+  $('rc-mic-gain').value = String(initialMicGainPercent);
+  $('rc-mic-gain-value').textContent = `${initialMicGainPercent}%`;
 
   const state = { enabled: false, connected: false, main: {}, sub: {} };
   function displayMode(data) {
@@ -258,7 +276,16 @@
   let scrollLastPaintAt = 0;
   let sweepIntervalMs = 0;
   let sweepLastAt = 0;
-  const WATERFALL_SCROLL_PAINT_MS = 50;
+  // The waterfall is a display animation, so keep it on the browser's
+  // compositor cadence. A 50 ms paint interval made otherwise healthy sweeps
+  // visibly step at roughly 20 FPS on the Pi browser.
+  const WATERFALL_SCROLL_PAINT_MS = 16;
+  let spectrumFromBins = null;
+  let spectrumInterpolatedBins = null;
+  let spectrumBlendStartAt = 0;
+  let spectrumBlendDurationMs = 0;
+  let spectrumAnimationFrame = 0;
+  let lastPassbandLabel = '';
   let scopeSyncQueued = true;
   let scopeSyncRunning = false;
   let requestedSpan = null;
@@ -550,10 +577,12 @@
       // An unhealthy state stream must never trap an active/retrying session.
       // Keep Disconnect available even when all other radio writes are gated.
       $('rc-power').disabled = !state.enabled || (!streamHealthy && !connected && !state.connecting);
-      // A commanded key or release stays visible while the radio confirms it:
-      // the radio is still transmitting until it reports that it stopped.
-      const transmitting = state.ptt === true || state.ptt_pending === true;
-      const releasing = state.ptt === true && state.ptt_pending === false;
+      // The unkey command stops the browser's transmit path immediately. The
+      // radio's PTT readback can remain stale while CI-V settles, so keep the
+      // release-confirmation guard internally without making the console look
+      // like audio is still transmitting after MAIN receive audio has resumed.
+      const releaseConfirming = state.ptt_pending === false;
+      const transmitting = !releaseConfirming && (state.ptt === true || state.ptt_pending === true);
       if (state.tx_unconfirmed) {
         // A possible stuck transmitter must never look like a normal session.
         $('rc-status').textContent = 'TX NOT CONFIRMED · the radio may still be transmitting. Check the radio, then disconnect and reconnect.';
@@ -565,13 +594,13 @@
             : 'Radio off. Use Radio on the top toolbar to start control and audio.');
       }
       $('rc-ptt-state').textContent = !connected ? 'PTT · UNKNOWN'
-        : releasing ? 'PTT · RELEASING'
+        : releaseConfirming ? 'PTT · RX'
         : transmitting ? 'TRANSMITTING'
         : state.ptt == null ? 'PTT · UNKNOWN' : 'PTT · RX';
       $('rc-ptt').textContent = transmitting ? 'RELEASE PTT' : 'PTT';
       $('rc-ptt').classList.toggle('is-transmitting', connected && transmitting);
       // Unknown PTT is not an invitation to transmit blindly.
-      $('rc-ptt').disabled ||= state.ptt == null && state.ptt_pending == null;
+      $('rc-ptt').disabled ||= releaseConfirming || (state.ptt == null && state.ptt_pending == null);
       renderAudioRecordingControl();
       // Capture now starts with the session rather than from its own button, so
       // locking the list while capture ran left the device unchangeable for the
@@ -746,6 +775,9 @@
   async function command(action, body) {
     if (busy || !state.connected || !streamHealthy) return null;
     busy = true;
+    if (action === 'ptt' && body?.enabled === false) {
+      window.prepareRadioMicPttRelease?.();
+    }
     // Busy state remains available to assistive technology, but ordinary
     // successful clicks should not fill the operator notice area with CI-V
     // implementation details. radioAction() still surfaces real failures.
@@ -784,6 +816,7 @@
     if (state.connected || state.connecting) {
       wantAudio = false;
       // Do not leave an app-issued PTT active when explicitly disconnecting.
+      window.prepareRadioMicPttRelease?.();
       if (state.ptt === true && !await radioAction('/api/radio/ptt', { enabled: false })) {
         busy = false; consoleApi.render({}); return;
       }
@@ -857,7 +890,11 @@
       if (action === 'smooth') {
         // Turning smoothing off drops the glide and shows whole rows again.
         if (display.smooth) requestScroll();
-        else { scrollOffset = 0; paintWaterfall(); }
+        else {
+          cancelSpectrumTransition();
+          scrollOffset = 0;
+          paintWaterfall();
+        }
       }
       paintSpectrum();
     }
@@ -974,8 +1011,11 @@
   });
   void refreshRadioMicrophones();
   $('rc-mic-gain').addEventListener('input', event => {
-    applyRadioMicGain(Number(event.target.value) / 100);
-    $('rc-mic-gain-value').textContent = `${event.target.value}%`;
+    const percent = Math.max(0, Math.min(200, Number(event.target.value)));
+    applyRadioMicGain(percent / 50);
+    $('rc-mic-gain-value').textContent = `${Math.round(percent)}%`;
+    try { localStorage.setItem(MIC_GAIN_STORAGE_KEY, String(Math.round(percent))); }
+    catch { /* The applied gain still works without persistent storage. */ }
   });
   $('rc-tuning-tone-level').addEventListener('input', event => {
     $('rc-tuning-tone-level-value').textContent = `${event.target.value}%`;
@@ -1184,6 +1224,46 @@
     if (state.connected) $('rc-scope-message').hidden = true;
     scheduleSpectrumPaint();
   }
+
+  function currentSpectrumBins(now = performance.now()) {
+    if (!scope?.bins) return null;
+    if (!spectrumFromBins || !spectrumBlendStartAt || !spectrumBlendDurationMs) return scope.bins;
+    const blend = Math.max(0, Math.min(1, (now - spectrumBlendStartAt) / spectrumBlendDurationMs));
+    if (blend >= 1) {
+      spectrumFromBins = null;
+      spectrumBlendStartAt = 0;
+      spectrumBlendDurationMs = 0;
+      return scope.bins;
+    }
+    const target = scope.bins;
+    if (!spectrumInterpolatedBins || spectrumInterpolatedBins.length !== target.length) {
+      spectrumInterpolatedBins = new Float32Array(target.length);
+    }
+    for (let index = 0; index < target.length; index++) {
+      spectrumInterpolatedBins[index] = spectrumFromBins[index]
+        + (target[index] - spectrumFromBins[index]) * blend;
+    }
+    return spectrumInterpolatedBins;
+  }
+
+  function requestSpectrumAnimation() {
+    if (spectrumAnimationFrame || !spectrumFromBins) return;
+    spectrumAnimationFrame = requestAnimationFrame(function animateSpectrum(now) {
+      spectrumAnimationFrame = 0;
+      if (!spectrumFromBins) return;
+      paintSpectrum(now);
+      if (spectrumFromBins) spectrumAnimationFrame = requestAnimationFrame(animateSpectrum);
+    });
+  }
+
+  function cancelSpectrumTransition() {
+    spectrumFromBins = null;
+    spectrumBlendStartAt = 0;
+    spectrumBlendDurationMs = 0;
+    if (spectrumAnimationFrame) cancelAnimationFrame(spectrumAnimationFrame);
+    spectrumAnimationFrame = 0;
+  }
+
   function scheduleSpectrumPaint() {
     if (paintRequested) return;
     paintRequested = true;
@@ -1224,7 +1304,7 @@
     if (!waterfall || !buffer) return;
     // A fractional offset with smoothing enabled is what turns discrete sweep
     // insertions into continuous motion.
-    waterfallContext ||= waterfall.getContext('2d');
+    waterfallContext ||= waterfall.getContext('2d', { desynchronized: true });
     waterfallContext.drawImage(buffer, 0, -scrollOffset);
   }
   function scrollActive() {
@@ -1264,7 +1344,9 @@
     const waterfall = $('rc-waterfall');
     const buffer = waterfallBuffer();
     if (!waterfall || !buffer) return;
-    const ctx = buffer.getContext('2d');
+    const ctx = buffer.getContext('2d', { desynchronized: true });
+    const previousScope = scope;
+    const previousBins = currentSpectrumBins();
     const changedBounds = !scope || scope.side !== next.side || scope.low !== next.low || scope.high !== next.high;
     if (changedBounds) {
       maxBins = null;
@@ -1313,6 +1395,17 @@
     const now = Date.now();
     if (sweepLastAt) sweepIntervalMs = Math.max(40, Math.min(1000, (now - sweepLastAt) * 0.25 + (sweepIntervalMs || 200) * 0.75));
     sweepLastAt = now;
+    if (display.smooth && previousScope && previousBins && !changedBounds && previousBins.length === next.bins.length) {
+      // Interpolate from the currently displayed trace, rather than from the
+      // prior raw sweep, so a new radio frame cannot cause a visible jump when
+      // the browser receives sweeps faster than the animation completes.
+      spectrumFromBins = Float32Array.from(previousBins);
+      spectrumBlendStartAt = performance.now();
+      spectrumBlendDurationMs = Math.max(40, Math.min(1000, sweepIntervalMs || 200));
+      requestSpectrumAnimation();
+    } else {
+      cancelSpectrumTransition();
+    }
     paintWaterfall();
     requestScroll();
   }
@@ -1320,7 +1413,7 @@
     const waterfall = $('rc-waterfall');
     const buffer = waterfallBuffer();
     if (!waterfall || !buffer) return;
-    const ctx = buffer.getContext('2d');
+    const ctx = buffer.getContext('2d', { desynchronized: true });
     ctx.clearRect(0, 0, waterfall.width, buffer.height);
     const rows = Math.min(waterfallRows.length, buffer.height);
     if (rows) {
@@ -1336,9 +1429,9 @@
     }
     paintWaterfall();
   }
-  function paintSpectrum() {
+  function paintSpectrum(now = performance.now()) {
     const canvas = $('rc-spectrum');
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { desynchronized: true });
     const width = canvas.width, height = canvas.height;
     ctx.clearRect(0, 0, width, height);
     if (display.grid) {
@@ -1353,7 +1446,13 @@
     const passband = passbandRange(data, scope.side === 'SUB' ? state.sub_rit : null);
     const offset = drag?.side === scope.side ? drag.delta : 0;
     const xForHz = hz => (hz - scope.low) / (scope.high - scope.low) * width;
-    $('rc-passband-label').textContent = passband ? `${scope.side} · ${data.mode} · ${(data.bandwidth_hz / 1000).toLocaleString()} kHz${drag ? ' · drag preview' : ''}` : 'Passband width unknown';
+    const passbandLabel = passband
+      ? `${scope.side} · ${data.mode} · ${(data.bandwidth_hz / 1000).toLocaleString()} kHz${drag ? ' · drag preview' : ''}`
+      : 'Passband width unknown';
+    if (passbandLabel !== lastPassbandLabel) {
+      $('rc-passband-label').textContent = passbandLabel;
+      lastPassbandLabel = passbandLabel;
+    }
     if (passband && scope.side === listeningScopeSide()) {
       const left = Math.max(0, xForHz(passband.low + offset)), right = Math.min(width, xForHz(passband.high + offset));
       if (right > left) {
@@ -1409,7 +1508,7 @@
       ctx.strokeStyle = color; ctx.lineWidth = fill ? 1 : 1.2; ctx.stroke();
     };
     if (display.hold && maxBins) trace(maxBins, '#be995b', false);
-    trace(scope.bins, '#effcff', display.fill);
+    trace(currentSpectrumBins(now), '#effcff', display.fill);
   }
   function subscribe() {
     try {

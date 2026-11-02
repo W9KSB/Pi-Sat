@@ -17,7 +17,7 @@ MANUAL_ONLY_SETTINGS: dict[str, set[str]] = {
     # offering it in the browser only invited the belief that it changed
     # something. It stays a config-file key so it can still be overridden by
     # hand, and it is preserved across settings saves.
-    "icom": {"connectivity", "tx_codec"},
+    "icom": {"connectivity", "tx_codec", "scope_enabled"},
     "tx": {"shared_local_split_mode"},
     # The listener exposes status in its module page; binding and enablement
     # remain config-file-only so a browser cannot unexpectedly open a PCM port.

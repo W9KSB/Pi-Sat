@@ -46,6 +46,7 @@ def register_radio_api(
     load_scope_settings: Callable[[], dict[str, Any]] | None = None,
     save_scope_settings: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     save_tuning_tone_level: Callable[[int], None] | None = None,
+    microphone_diagnostics_enabled: Callable[[], bool] | None = None,
 ) -> None:
     # Count microphone uplinks so closing an RX listener cannot unkey a
     # transmission another session is feeding.
@@ -441,7 +442,12 @@ def register_radio_api(
             return
         microphone_sessions += 1
         try:
-            await stream_microphone(websocket, controller, get_controller)
+            await stream_microphone(
+                websocket,
+                controller,
+                get_controller,
+                debug_enabled=microphone_diagnostics_enabled,
+            )
             await websocket.close(code=1000, reason="Radio configuration changed")
         except WebSocketDisconnect:
             return

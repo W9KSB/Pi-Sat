@@ -1883,7 +1883,8 @@ register_settings_api(
 
 register_radio_api(app, get_controller=lambda: icom_controller,
                    load_scope_settings=load_scope_settings, save_scope_settings=save_scope_settings,
-                   save_tuning_tone_level=lambda level: save_settings({"icom": {"tuning_tone_level_percent": level}}))
+                   save_tuning_tone_level=lambda level: save_settings({"icom": {"tuning_tone_level_percent": level}}),
+                   microphone_diagnostics_enabled=lambda: load_config().rx.cat_debug_logging)
 register_wsjtx_api(app, get_manager=lambda: wsjtx_manager, get_engine=lambda: wsjtx_engine,
                    get_qso=lambda: wsjtx_qso, get_spectrum=wsjtx_engine.spectrum.snapshot,
                    save_settings=lambda patch: save_settings(patch))
