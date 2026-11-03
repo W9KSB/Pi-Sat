@@ -244,6 +244,7 @@ class RxTrackingManager:
                     )
                 active = self._active
             self._set_background_polling_enabled(not active)
+            self._wake.set()
 
     def update_target(
         self,
@@ -584,9 +585,10 @@ class RxTrackingManager:
         next_update_at = 0.0
         while not self._stop.is_set():
             with self._lock:
-                active = self._active
+                radio_tracking_active = self._active
+                rotator_tracking_active = self._rotator_tracking_active()
 
-            if not active:
+            if not radio_tracking_active and not rotator_tracking_active:
                 next_update_at = 0.0
                 self._wake.wait()
                 self._wake.clear()
@@ -605,6 +607,9 @@ class RxTrackingManager:
     def update_once(self) -> None:
         with self._update_lock:
             try:
+                with self._lock:
+                    radio_tracking_active = self._active
+                    rotator_tracking_active = self._rotator_tracking_active()
                 # Orbital maths runs outside the radio batch: it can take
                 # milliseconds and must not hold the controller lock that PTT,
                 # transmit audio and telemetry all need.
@@ -614,11 +619,16 @@ class RxTrackingManager:
                 # The rotator is a separate device on its own transport, so it
                 # runs outside the batch: a slow rotctld round trip must not
                 # extend the radio lock hold that receive audio waits on.
-                self._apply_rotator(position, write_devices=True, errors=errors)
+                self._apply_rotator(
+                    position,
+                    write_devices=rotator_tracking_active,
+                    tracking_active=rotator_tracking_active,
+                    errors=errors,
+                )
                 with self._radio_operation_batch():
                     self._apply_update(
                         position,
-                        write_devices=True,
+                        write_devices=radio_tracking_active,
                         errors=errors,
                         sample_time=sample_time,
                     )
@@ -631,7 +641,13 @@ class RxTrackingManager:
                 position = self.orbital_engine.get_position(self.satellite.norad_id)
                 sample_time = monotonic()
                 errors: list[str] = []
-                self._apply_rotator(position, write_devices=False, errors=errors)
+                rotator_tracking_active = self._rotator_tracking_active()
+                self._apply_rotator(
+                    position,
+                    write_devices=False,
+                    tracking_active=rotator_tracking_active,
+                    errors=errors,
+                )
                 self._apply_update(
                     position,
                     write_devices=False,
@@ -1011,6 +1027,8 @@ class RxTrackingManager:
         position: SatellitePosition,
         write_devices: bool,
         errors: list[str],
+        *,
+        tracking_active: bool,
     ) -> None:
         """Drives the rotator outside the radio operation batch.
 
@@ -1021,8 +1039,6 @@ class RxTrackingManager:
 
         if self.rotator_manager is None:
             return
-        with self._lock:
-            tracking_active = bool(self._active)
         try:
             # One call per cycle at every elevation: the manager owns the pass
             # state, the elevation cutoff, and the update threshold. Read-only
@@ -1035,6 +1051,18 @@ class RxTrackingManager:
             )
         except Exception as exc:
             errors.append(str(exc))
+
+    def _rotator_tracking_active(self) -> bool:
+        """Whether the selected target should keep driving the rotator."""
+
+        manager = self.rotator_manager
+        if manager is None:
+            return False
+        return bool(
+            getattr(manager, "enabled", False)
+            and getattr(manager, "write_enabled", False)
+            and not getattr(manager, "error", None)
+        )
 
     def _read_rx_frequency_for_reconciliation(
         self,
